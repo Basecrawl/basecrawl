@@ -71,6 +71,14 @@ pub struct Response {
     pub headers_hash: Option<String>,
     pub body_hash: Option<String>,
     pub content_length: Option<u64>,
+    /// Terminal response `Content-Type` header. Format classification is derived from this value,
+    /// never from the requested URL path or filename extension.
+    pub content_type: Option<String>,
+    /// True when the response body exceeded the configured max-body cap and only the initial
+    /// `body_max_bytes` decoded bytes were retained.
+    pub body_truncated: bool,
+    /// Decoded response-body cap applied by the crawler for this proof.
+    pub body_max_bytes: Option<u64>,
     /// Terminal URL the response was served from after following any redirect chain. Equals the
     /// requested URL when no redirect occurred.
     pub final_url: Option<String>,

@@ -6,7 +6,7 @@
 
 use base64::Engine;
 use basecrawl_core::error::Error;
-use basecrawl_core::fetch::{parse_header, DEFAULT_TIMEOUT_SECS};
+use basecrawl_core::fetch::{parse_header, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS};
 use basecrawl_core::{
     format, scrape, screenshot, Action, Format, ScrapeOptions, DEFAULT_MAX_PAGES,
 };
@@ -41,6 +41,11 @@ struct Cli {
     /// Whole-request timeout in seconds; a slower endpoint aborts near this bound.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_name = "SECONDS")]
     timeout: u64,
+
+    /// Maximum decoded response-body bytes retained in memory [default: 10485760]. Bodies beyond
+    /// this cap are truncated and reported as response.body_truncated=true in the ScrapeProof.
+    #[arg(long, default_value_t = DEFAULT_MAX_BODY_BYTES, value_name = "BYTES")]
+    max_body_bytes: usize,
 
     /// Explicitly bypass TLS certificate validation. This is disabled by default and is intended
     /// only for diagnostic capture of an invalid-certificate endpoint.
@@ -136,6 +141,7 @@ fn run(cli: Cli) -> Result<String, Error> {
         timeout_secs: cli.timeout,
         headers,
         insecure: cli.insecure,
+        max_body_bytes: cli.max_body_bytes,
         viewport,
         screenshot_full_page: cli.screenshot_full_page,
         render_enabled: !cli.no_js,

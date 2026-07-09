@@ -7,6 +7,7 @@
 //! on by subsequent features.
 
 pub mod canonical;
+pub mod content;
 pub mod error;
 pub mod fetch;
 pub mod format;
@@ -21,7 +22,8 @@ pub mod url_validation;
 use basecrawl_proof::{
     Attestation, Egress, Request, Response, ResultBlock, SdkSignature, SCRAPE_PROOF_VERSION,
 };
-use fetch::{FetchConfig, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
+use content::ContentKind;
+use fetch::{FetchConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -54,6 +56,9 @@ pub struct ScrapeOptions {
     /// Bypass TLS certificate verification. Disabled by default and intended only for an explicit
     /// diagnostic fetch of an invalid-certificate origin.
     pub insecure: bool,
+    /// Maximum decoded response-body bytes retained in memory. Responses beyond this cap are
+    /// truncated and signaled in the ScrapeProof response block.
+    pub max_body_bytes: usize,
     /// Screenshot viewport as `(width, height)` in CSS pixels (device-scale-factor 1).
     pub viewport: (u32, u32),
     /// When true, `screenshot` captures the full scrollable page rather than just the viewport.
@@ -86,6 +91,7 @@ impl Default for ScrapeOptions {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             headers: Vec::new(),
             insecure: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             viewport: (
                 basecrawl_render::DEFAULT_VIEWPORT_WIDTH,
                 basecrawl_render::DEFAULT_VIEWPORT_HEIGHT,
@@ -119,6 +125,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         headers: options.headers.clone(),
         user_agent: DEFAULT_USER_AGENT.to_string(),
         insecure: options.insecure,
+        max_body_bytes: options.max_body_bytes,
     };
     let fetched = fetch::fetch(&url, &config)?;
 
@@ -148,48 +155,56 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let needs_render = formats
         .iter()
         .any(|f| matches!(f, Format::Markdown | Format::Html));
-    let is_html = fetched.content_type.as_deref().is_none_or(|ct| {
-        let ct = ct.to_ascii_lowercase();
-        ct.contains("html") || ct.contains("xml")
-    });
-    let rendered_html: Option<String> =
-        if options.render_enabled && needs_render && is_html && !body_str.trim().is_empty() {
-            Some(html::render_page(
-                &url,
-                &config.user_agent,
-                Duration::from_secs(options.render_timeout_secs),
-                options.wait_for.as_deref(),
-                &options.actions,
-            )?)
-        } else {
-            None
-        };
+    let content_kind = content::classify(fetched.content_type.as_deref());
+    let rendered_html: Option<String> = if options.render_enabled
+        && needs_render
+        && content_kind == ContentKind::Html
+        && !body_str.trim().is_empty()
+    {
+        Some(html::render_page(
+            &url,
+            &config.user_agent,
+            Duration::from_secs(options.render_timeout_secs),
+            options.wait_for.as_deref(),
+            &options.actions,
+        )?)
+    } else {
+        None
+    };
 
     // `rawHtml` is always the served source (no render); `html`/`markdown` use the rendered DOM when
     // available and otherwise the served source.
     let mut formats_produced: BTreeMap<String, Value> = BTreeMap::new();
     for f in &formats {
         let value = match f {
-            Format::RawHtml => Value::String(body_str.clone().into_owned()),
+            Format::RawHtml => text_surface(&body_str, content_kind),
             Format::Markdown => {
-                let source = rendered_html.as_deref().unwrap_or(&body_str);
-                Value::String(markdown::to_markdown(source, &page_base))
+                if content_kind == ContentKind::Html {
+                    let source = rendered_html.as_deref().unwrap_or(&body_str);
+                    Value::String(markdown::to_markdown(source, &page_base))
+                } else {
+                    text_surface(&body_str, content_kind)
+                }
             }
             Format::Html => {
-                let source = rendered_html
-                    .clone()
-                    .unwrap_or_else(|| body_str.clone().into_owned());
-                Value::String(source)
+                if content_kind == ContentKind::Html {
+                    let source = rendered_html
+                        .clone()
+                        .unwrap_or_else(|| body_str.clone().into_owned());
+                    Value::String(source)
+                } else {
+                    text_surface(&body_str, content_kind)
+                }
             }
-            Format::Links => serde_json::to_value(links::extract(&body_str, &page_base))
-                .expect("links surface is always serializable"),
-            Format::Metadata => metadata::extract(
+            Format::Links => links_surface(&body_str, &page_base, content_kind),
+            Format::Metadata => metadata::extract_for_content(
                 &body_str,
                 &metadata::PageMeta {
                     source_url: url.as_str(),
                     status_code: Some(fetched.status_code),
                     content_type: fetched.content_type.as_deref(),
                 },
+                content_kind == ContentKind::Html,
             ),
             Format::Screenshot => {
                 let shot = screenshot::capture(
@@ -281,6 +296,9 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             headers_hash: Some(fetched.headers_hash),
             body_hash: Some(fetched.body_hash),
             content_length: Some(fetched.content_length),
+            content_type: fetched.content_type,
+            body_truncated: fetched.body_truncated,
+            body_max_bytes: Some(options.max_body_bytes as u64),
             final_url: Some(fetched.final_url),
             redirect_chain: fetched.redirects,
         },
@@ -308,10 +326,7 @@ fn crawl_page(
     let fetched = fetch::fetch(url, config)?;
     let body_str = String::from_utf8_lossy(&fetched.body).into_owned();
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
-    let is_html = fetched.content_type.as_deref().is_none_or(|ct| {
-        let ct = ct.to_ascii_lowercase();
-        ct.contains("html") || ct.contains("xml")
-    });
+    let is_html = content::classify(fetched.content_type.as_deref()) == ContentKind::Html;
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
         html::render_page(
             url,
@@ -325,4 +340,20 @@ fn crawl_page(
     };
     let markdown = markdown::to_markdown(&source, &page_base);
     Ok((markdown, source, page_base))
+}
+
+fn text_surface(body: &str, content_kind: ContentKind) -> Value {
+    match content_kind {
+        ContentKind::Binary => Value::String(String::new()),
+        ContentKind::Html | ContentKind::Text => Value::String(body.to_owned()),
+    }
+}
+
+fn links_surface(body: &str, page_base: &Url, content_kind: ContentKind) -> Value {
+    if content_kind == ContentKind::Html {
+        serde_json::to_value(links::extract(body, page_base))
+            .expect("links surface is always serializable")
+    } else {
+        serde_json::to_value(links::Links::default()).expect("links surface is always serializable")
+    }
 }

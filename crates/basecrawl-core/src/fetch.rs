@@ -35,6 +35,18 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// of any legitimate redirect chain while still terminating pathological loops quickly.
 pub const MAX_REDIRECTS: usize = 20;
 
+/// Default upper bound for decoded response bodies, 10 MiB.
+///
+/// The fetcher stores at most this many decoded body bytes and marks the resulting proof as
+/// truncated when additional data exists. This bounds memory use for unexpectedly large origin
+/// responses while allowing callers to opt into a smaller or larger per-request cap.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Fixed allowance for an HTTP response status line and headers while applying the body cap to the
+/// in-process HTTPS parser. Headers are also bounded so a malicious origin cannot move the memory
+/// pressure from the body into an unbounded header block.
+const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+
 type Headers = Vec<(String, Vec<u8>)>;
 
 /// Configuration for a single fetch.
@@ -49,6 +61,8 @@ pub struct FetchConfig {
     /// Permit invalid TLS certificates only when the caller explicitly opts in. The secure
     /// default always uses the Mozilla root store and hostname validation.
     pub insecure: bool,
+    /// Maximum decoded response-body bytes retained in memory.
+    pub max_body_bytes: usize,
 }
 
 impl Default for FetchConfig {
@@ -58,6 +72,7 @@ impl Default for FetchConfig {
             headers: Vec::new(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             insecure: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -73,6 +88,8 @@ pub struct Fetched {
     /// The terminal response `Content-Type` header value, if any. The charset parameter it carries
     /// is the authoritative source for the metadata charset field.
     pub content_type: Option<String>,
+    /// Whether the body exceeded the configured maximum and was retained only up to that cap.
+    pub body_truncated: bool,
     /// Terminal URL the response was served from after following any redirects.
     pub final_url: String,
     /// Redirect hops followed to reach the terminal response, in order.
@@ -155,6 +172,7 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
             content_length: response.body.len() as u64,
             body: response.body,
             content_type: response.content_type,
+            body_truncated: response.body_truncated,
             final_url: current.to_string(),
             redirects,
             tls,
@@ -169,6 +187,7 @@ struct SingleResponse {
     content_type: Option<String>,
     location: Option<String>,
     body: Vec<u8>,
+    body_truncated: bool,
     tls: Option<Tls>,
 }
 
@@ -204,13 +223,14 @@ fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> 
         .get(reqwest::header::LOCATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = response.bytes().map_err(classify)?.to_vec();
+    let (body, body_truncated) = read_capped(response, config.max_body_bytes)?;
     Ok(SingleResponse {
         status_code,
         headers_hash,
         content_type,
         location,
         body,
+        body_truncated,
         tls: None,
     })
 }
@@ -256,18 +276,21 @@ fn fetch_https(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error>
     let mut stream = rustls::StreamOwned::new(connection, recorder);
     stream.write_all(&request).map_err(classify_io)?;
     stream.flush().map_err(classify_io)?;
-    let mut raw_response = Vec::new();
-    stream.read_to_end(&mut raw_response).map_err(classify_io)?;
+    let raw_limit = config
+        .max_body_bytes
+        .saturating_add(MAX_HTTP_RESPONSE_HEADER_BYTES);
+    let (raw_response, raw_truncated) = read_capped(&mut stream, raw_limit)?;
     let (status_code, headers, body) = parse_http_response(&raw_response)?;
     let content_type = header_value(&headers, "content-type");
     let location = header_value(&headers, "location");
-    let body = decode_http_body(&headers, body)?;
+    let (body, decoded_truncated) = decode_http_body(&headers, body, config.max_body_bytes)?;
     Ok(SingleResponse {
         status_code,
         headers_hash: hash_header_lines(&headers),
         content_type,
         location,
         body,
+        body_truncated: raw_truncated || decoded_truncated,
         tls: Some(tls),
     })
 }
@@ -366,6 +389,11 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Headers, Vec<u8>), Error> {
             ));
         }
     };
+    if header_length > MAX_HTTP_RESPONSE_HEADER_BYTES {
+        return Err(Error::Fetch(format!(
+            "HTTP response headers exceeded the maximum of {MAX_HTTP_RESPONSE_HEADER_BYTES} bytes"
+        )));
+    }
     let status_code = response
         .code
         .ok_or_else(|| Error::Fetch("HTTP response did not include a status code".to_string()))?;
@@ -377,9 +405,16 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Headers, Vec<u8>), Error> {
     Ok((status_code, headers, raw[header_length..].to_vec()))
 }
 
-fn decode_http_body(headers: &Headers, mut body: Vec<u8>) -> Result<Vec<u8>, Error> {
+fn decode_http_body(
+    headers: &Headers,
+    mut body: Vec<u8>,
+    max_body_bytes: usize,
+) -> Result<(Vec<u8>, bool), Error> {
+    let mut truncated = false;
     if header_contains_token(headers, "transfer-encoding", "chunked") {
-        body = decode_chunked(&body)?;
+        let (decoded, chunk_truncated) = decode_chunked(&body, max_body_bytes)?;
+        body = decoded;
+        truncated |= chunk_truncated;
     }
     let encodings = header_value(headers, "content-encoding")
         .unwrap_or_default()
@@ -388,55 +423,44 @@ fn decode_http_body(headers: &Headers, mut body: Vec<u8>) -> Result<Vec<u8>, Err
         .filter(|encoding| !encoding.is_empty() && encoding != "identity")
         .collect::<Vec<_>>();
     for encoding in encodings.iter().rev() {
-        body = match encoding.as_str() {
-            "gzip" => {
-                let mut decoded = Vec::new();
-                GzDecoder::new(Cursor::new(body))
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| {
-                        Error::Fetch(format!("could not decode gzip body: {error}"))
-                    })?;
-                decoded
-            }
+        let (decoded, decoding_truncated) = match encoding.as_str() {
+            "gzip" => read_capped(GzDecoder::new(Cursor::new(body)), max_body_bytes)?,
             "deflate" => {
                 // HTTP's historical `deflate` token is ambiguous in practice: some origins send
                 // raw DEFLATE while others send a zlib wrapper. Accept both forms, as reqwest did
                 // on this path before the in-process rustls terminator replaced HTTPS transport.
                 let compressed = body;
-                let mut decoded = Vec::new();
-                if DeflateDecoder::new(Cursor::new(&compressed))
-                    .read_to_end(&mut decoded)
-                    .is_err()
-                {
-                    decoded.clear();
-                    ZlibDecoder::new(Cursor::new(&compressed))
-                        .read_to_end(&mut decoded)
-                        .map_err(|error| {
-                            Error::Fetch(format!("could not decode deflate body: {error}"))
-                        })?;
+                match read_capped(
+                    DeflateDecoder::new(Cursor::new(&compressed)),
+                    max_body_bytes,
+                ) {
+                    Ok(decoded) => decoded,
+                    Err(_) => {
+                        read_capped(ZlibDecoder::new(Cursor::new(&compressed)), max_body_bytes)
+                            .map_err(|error| {
+                                Error::Fetch(format!("could not decode deflate body: {error}"))
+                            })?
+                    }
                 }
-                decoded
             }
-            "br" => {
-                let mut decoded = Vec::new();
-                brotli::Decompressor::new(Cursor::new(body), 4096)
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| {
-                        Error::Fetch(format!("could not decode brotli body: {error}"))
-                    })?;
-                decoded
-            }
+            "br" => read_capped(
+                brotli::Decompressor::new(Cursor::new(body), 4096),
+                max_body_bytes,
+            )?,
             unsupported => {
                 return Err(Error::Fetch(format!(
                     "unsupported Content-Encoding '{unsupported}'"
                 )));
             }
         };
+        body = decoded;
+        truncated |= decoding_truncated;
     }
-    Ok(body)
+    let (body, body_truncated) = cap_bytes(body, max_body_bytes);
+    Ok((body, truncated || body_truncated))
 }
 
-fn decode_chunked(mut encoded: &[u8]) -> Result<Vec<u8>, Error> {
+fn decode_chunked(mut encoded: &[u8], max_body_bytes: usize) -> Result<(Vec<u8>, bool), Error> {
     let mut decoded = Vec::new();
     loop {
         let Some(line_end) = encoded.windows(2).position(|bytes| bytes == b"\r\n") else {
@@ -451,15 +475,48 @@ fn decode_chunked(mut encoded: &[u8]) -> Result<Vec<u8>, Error> {
             .map_err(|_| Error::Fetch("malformed chunked response length".to_string()))?;
         encoded = &encoded[line_end + 2..];
         if size == 0 {
-            return Ok(decoded);
+            return Ok((decoded, false));
         }
         if encoded.len() < size + 2 || &encoded[size..size + 2] != b"\r\n" {
             return Err(Error::Fetch(
                 "malformed chunked response: truncated chunk".to_string(),
             ));
         }
+        let remaining = max_body_bytes.saturating_sub(decoded.len());
+        if size > remaining {
+            decoded.extend_from_slice(&encoded[..remaining]);
+            return Ok((decoded, true));
+        }
         decoded.extend_from_slice(&encoded[..size]);
         encoded = &encoded[size + 2..];
+    }
+}
+
+/// Read no more than `max_body_bytes` and probe one additional byte to distinguish an exactly
+/// sized body from a truncated one. This is the single memory boundary used by all transport and
+/// decoder paths.
+fn read_capped<R: Read>(mut reader: R, max_body_bytes: usize) -> Result<(Vec<u8>, bool), Error> {
+    let mut body = Vec::with_capacity(max_body_bytes.min(64 * 1024));
+    let mut chunk = [0_u8; 8192];
+    while body.len() < max_body_bytes {
+        let requested = (max_body_bytes - body.len()).min(chunk.len());
+        let read = reader.read(&mut chunk[..requested]).map_err(classify_io)?;
+        if read == 0 {
+            return Ok((body, false));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    let mut probe = [0_u8; 1];
+    let body_truncated = reader.read(&mut probe).map_err(classify_io)? != 0;
+    Ok((body, body_truncated))
+}
+
+fn cap_bytes(mut body: Vec<u8>, max_body_bytes: usize) -> (Vec<u8>, bool) {
+    if body.len() > max_body_bytes {
+        body.truncate(max_body_bytes);
+        (body, true)
+    } else {
+        (body, false)
     }
 }
 

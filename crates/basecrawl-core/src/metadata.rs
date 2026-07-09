@@ -33,9 +33,43 @@ pub struct PageMeta<'a> {
 }
 
 /// Extract the `metadata` surface from an HTML document plus the crawler-supplied [`PageMeta`].
+///
+/// This HTML-compatible wrapper preserves the existing public API. Call
+/// [`extract_for_content`] when the response Content-Type has already classified the body.
 pub fn extract(html: &str, page: &PageMeta) -> Value {
-    let document = Html::parse_document(html);
+    extract_for_content(html, page, true)
+}
+
+/// Extract metadata while honoring the response content classification.
+///
+/// Non-HTML bodies retain only HTTP-derived metadata. This avoids treating arbitrary JSON or
+/// plain text as a malformed HTML document while still surfacing the authoritative `contentType`,
+/// request URL, terminal status, and declared charset.
+pub fn extract_for_content(html: &str, page: &PageMeta, parse_html: bool) -> Value {
     let mut map: Map<String, Value> = Map::new();
+
+    if let Some(content_type) = page.content_type {
+        map.insert(
+            "contentType".to_string(),
+            Value::String(content_type.to_string()),
+        );
+    }
+
+    if !parse_html {
+        if let Some(charset) = page.content_type.and_then(charset_from_content_type) {
+            map.insert("charset".to_string(), Value::String(charset));
+        }
+        map.insert(
+            "sourceURL".to_string(),
+            Value::String(page.source_url.to_string()),
+        );
+        if let Some(status) = page.status_code {
+            map.insert("statusCode".to_string(), Value::Number(status.into()));
+        }
+        return Value::Object(map);
+    }
+
+    let document = Html::parse_document(html);
 
     // Every `<meta name=...>` / `<meta property=...>` tag, keyed by its raw name/property so
     // `og:*`/`twitter:*` (and description/viewport/robots/keywords/...) are preserved verbatim.
