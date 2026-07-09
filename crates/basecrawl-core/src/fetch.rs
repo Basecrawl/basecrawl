@@ -56,6 +56,9 @@ pub struct Fetched {
     pub body_hash: String,
     pub content_length: u64,
     pub body: Vec<u8>,
+    /// The terminal response `Content-Type` header value, if any. The charset parameter it carries
+    /// is the authoritative source for the metadata charset field.
+    pub content_type: Option<String>,
     /// Terminal URL the response was served from after following any redirects.
     pub final_url: String,
     /// Redirect hops followed to reach the terminal response, in order.
@@ -145,6 +148,11 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
 
         let status_code = status.as_u16();
         let headers_hash = hash_headers(response.headers());
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         // reqwest transparently decodes gzip/deflate/brotli, so these bytes are the decoded body.
         let body = response.bytes().map_err(classify)?;
         let body_hash = sha256_hex(&body);
@@ -156,6 +164,7 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
             body_hash,
             content_length,
             body: body.to_vec(),
+            content_type,
             final_url: current.to_string(),
             redirects,
         });

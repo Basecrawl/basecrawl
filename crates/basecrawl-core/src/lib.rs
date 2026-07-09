@@ -12,6 +12,7 @@ pub mod format;
 pub mod html;
 pub mod links;
 pub mod markdown;
+pub mod metadata;
 pub mod url_validation;
 
 use basecrawl_proof::{
@@ -95,6 +96,14 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             }
             Format::Links => serde_json::to_value(links::extract(&body_str, &page_base))
                 .expect("links surface is always serializable"),
+            Format::Metadata => metadata::extract(
+                &body_str,
+                &metadata::PageMeta {
+                    source_url: url.as_str(),
+                    status_code: Some(fetched.status_code),
+                    content_type: fetched.content_type.as_deref(),
+                },
+            ),
             _ => Value::Null,
         };
         formats_produced.insert(f.as_str().to_string(), value);
