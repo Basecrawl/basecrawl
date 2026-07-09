@@ -27,6 +27,9 @@ pub enum Error {
     #[error("invalid request header '{0}' (expected 'Name: Value')")]
     InvalidHeader(String),
 
+    #[error("invalid viewport '{0}' (expected WIDTHxHEIGHT, e.g. 1280x800)")]
+    InvalidViewport(String),
+
     #[error("request timed out: {0}")]
     Timeout(String),
 
@@ -44,6 +47,9 @@ pub enum Error {
 
     #[error("html render failed: {0}")]
     Render(String),
+
+    #[error("failed to write output file: {0}")]
+    Io(String),
 }
 
 impl Error {
@@ -56,12 +62,14 @@ impl Error {
             Error::UnknownFormat { .. } => "invalid_format",
             Error::UnsupportedOutput(_) => "unsupported_output",
             Error::InvalidHeader(_) => "invalid_header",
+            Error::InvalidViewport(_) => "invalid_viewport",
             Error::Timeout(_) => "timeout",
             Error::Transport(_) => "transport_error",
             Error::TooManyRedirects { .. } => "too_many_redirects",
             Error::Redirect(_) => "redirect_error",
             Error::Fetch(_) => "fetch_error",
             Error::Render(_) => "render_error",
+            Error::Io(_) => "io_error",
         }
     }
 

@@ -6,6 +6,7 @@
 //! (TLS 1.3 capture, format producers, canonicalization, egress/geo, attestation) are layered
 //! on by subsequent features.
 
+pub mod canonical;
 pub mod error;
 pub mod fetch;
 pub mod format;
@@ -13,11 +14,11 @@ pub mod html;
 pub mod links;
 pub mod markdown;
 pub mod metadata;
+pub mod screenshot;
 pub mod url_validation;
 
 use basecrawl_proof::{
-    Attestation, Egress, Request, Response, ResultBlock, ScrapeProof, SdkSignature, Tls,
-    SCRAPE_PROOF_VERSION,
+    Attestation, Egress, Request, Response, ResultBlock, SdkSignature, Tls, SCRAPE_PROOF_VERSION,
 };
 use fetch::{FetchConfig, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
 use serde_json::Value;
@@ -25,6 +26,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
+pub use basecrawl_proof::ScrapeProof;
 pub use error::Error;
 pub use format::Format;
 
@@ -44,6 +46,10 @@ pub struct ScrapeOptions {
     pub timeout_secs: u64,
     /// Extra request headers to send, as parsed `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
+    /// Screenshot viewport as `(width, height)` in CSS pixels (device-scale-factor 1).
+    pub viewport: (u32, u32),
+    /// When true, `screenshot` captures the full scrollable page rather than just the viewport.
+    pub screenshot_full_page: bool,
 }
 
 impl Default for ScrapeOptions {
@@ -54,6 +60,11 @@ impl Default for ScrapeOptions {
             nonce: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             headers: Vec::new(),
+            viewport: (
+                basecrawl_render::DEFAULT_VIEWPORT_WIDTH,
+                basecrawl_render::DEFAULT_VIEWPORT_HEIGHT,
+            ),
+            screenshot_full_page: false,
         }
     }
 }
@@ -104,10 +115,24 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                     content_type: fetched.content_type.as_deref(),
                 },
             ),
+            Format::Screenshot => {
+                let shot = screenshot::capture(
+                    &url,
+                    &config.user_agent,
+                    config.timeout,
+                    options.viewport,
+                    options.screenshot_full_page,
+                )?;
+                Value::String(shot.base64)
+            }
             _ => Value::Null,
         };
         formats_produced.insert(f.as_str().to_string(), value);
     }
+
+    // `result_hash` covers only the deterministic result surface; `screenshot` (and `json`) are
+    // excluded so a viewport tweak that changes only pixels never shifts the byte-quorum digest.
+    let result_hash = canonical::result_hash(&formats_produced);
 
     Ok(ScrapeProof {
         version: SCRAPE_PROOF_VERSION,
@@ -131,7 +156,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         },
         result: ResultBlock {
             formats_produced,
-            result_hash: None,
+            result_hash: Some(result_hash),
             completeness_manifest: Value::Object(serde_json::Map::new()),
         },
         egress: Egress::default(),

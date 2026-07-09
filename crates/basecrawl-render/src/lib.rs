@@ -12,7 +12,9 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use headless_chrome::{Browser, LaunchOptions};
+use base64::Engine;
+use headless_chrome::protocol::cdp::{Emulation, Page};
+use headless_chrome::{Browser, LaunchOptions, Tab};
 use url::Url;
 
 /// Default render timeout (seconds) when the caller does not specify one.
@@ -78,6 +80,36 @@ fn resolve_chrome() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+/// Launch a headless Chromium with the shared flag set used by every rendering path.
+///
+/// The flags beyond headless (`--force-color-profile=srgb`, `--font-render-hinting=none`,
+/// `--hide-scrollbars`) pin color management and text rasterization so that repeated renders of the
+/// same static page produce byte-identical pixels (screenshot determinism), while
+/// `--disable-dev-shm-usage`/`--disable-gpu` keep Chromium stable in a container. Sandbox is
+/// disabled because the crawler runs as root. The returned browser is killed when dropped.
+fn launch_browser(timeout: Duration, window_size: (u32, u32)) -> Result<Browser, RenderError> {
+    let chrome = resolve_chrome().ok_or(RenderError::ChromeNotFound)?;
+
+    let args: Vec<&OsStr> = vec![
+        OsStr::new("--disable-dev-shm-usage"),
+        OsStr::new("--disable-gpu"),
+        OsStr::new("--hide-scrollbars"),
+        OsStr::new("--force-color-profile=srgb"),
+        OsStr::new("--font-render-hinting=none"),
+    ];
+    let options = LaunchOptions::default_builder()
+        .path(Some(chrome))
+        .headless(true)
+        .sandbox(false)
+        .window_size(Some(window_size))
+        .args(args)
+        .idle_browser_timeout(timeout)
+        .build()
+        .map_err(|e| RenderError::Launch(e.to_string()))?;
+
+    Browser::new(options).map_err(|e| RenderError::Launch(e.to_string()))
+}
+
 /// In-page cleaning + serialization script.
 ///
 /// Executed *after* the page has loaded and its scripts have run, so any JS-injected content is
@@ -99,24 +131,7 @@ return document.documentElement.outerHTML;\
 /// DOM is serialized. The spawned browser is terminated when this function returns (its `Browser`
 /// handle is dropped), so no browser process is leaked.
 pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError> {
-    let chrome = resolve_chrome().ok_or(RenderError::ChromeNotFound)?;
-
-    let args: Vec<&OsStr> = vec![
-        OsStr::new("--disable-dev-shm-usage"),
-        OsStr::new("--disable-gpu"),
-        OsStr::new("--hide-scrollbars"),
-    ];
-    let options = LaunchOptions::default_builder()
-        .path(Some(chrome))
-        .headless(true)
-        .sandbox(false)
-        .window_size(Some((1280, 800)))
-        .args(args)
-        .idle_browser_timeout(config.timeout)
-        .build()
-        .map_err(|e| RenderError::Launch(e.to_string()))?;
-
-    let browser = Browser::new(options).map_err(|e| RenderError::Launch(e.to_string()))?;
+    let browser = launch_browser(config.timeout, (1280, 800))?;
     let tab = browser
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
@@ -141,6 +156,143 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
     }
 }
 
+/// Default screenshot viewport width (CSS px) when the caller does not specify one.
+pub const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
+/// Default screenshot viewport height (CSS px) when the caller does not specify one.
+pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
+
+/// Configuration for a single deterministic screenshot capture.
+#[derive(Debug, Clone)]
+pub struct ScreenshotConfig {
+    /// Whole-capture timeout (navigation + rasterization).
+    pub timeout: Duration,
+    /// User-Agent presented to the origin (kept in parity with the HTTP fetch path).
+    pub user_agent: String,
+    /// Layout viewport width in CSS pixels. Captured at device-scale-factor 1, so the produced
+    /// image width equals this value exactly.
+    pub width: u32,
+    /// Layout viewport height in CSS pixels.
+    pub height: u32,
+    /// When true, capture the entire scrollable page (beyond the fold) rather than just the
+    /// viewport rectangle.
+    pub full_page: bool,
+}
+
+impl Default for ScreenshotConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(DEFAULT_RENDER_TIMEOUT_SECS),
+            user_agent: String::new(),
+            width: DEFAULT_VIEWPORT_WIDTH,
+            height: DEFAULT_VIEWPORT_HEIGHT,
+            full_page: false,
+        }
+    }
+}
+
+/// The product of a capture: the PNG both decoded and in its base64 wire form.
+#[derive(Debug, Clone)]
+pub struct Screenshot {
+    /// Decoded PNG bytes.
+    pub png: Vec<u8>,
+    /// Standard base64 encoding of [`Screenshot::png`] (the form embedded in the ScrapeProof).
+    pub base64: String,
+}
+
+/// The full scrollable content height (CSS px) of the currently-loaded document.
+fn content_height(tab: &Tab) -> Result<u32, RenderError> {
+    let js = "Math.max(\
+document.documentElement.scrollHeight,\
+document.documentElement.offsetHeight,\
+document.body?document.body.scrollHeight:0,\
+document.body?document.body.offsetHeight:0)";
+    let evaluated = tab
+        .evaluate(js, false)
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+    evaluated
+        .value
+        .and_then(|v| v.as_f64())
+        .filter(|h| *h >= 1.0)
+        .map(|h| h.ceil() as u32)
+        .ok_or(RenderError::NoContent)
+}
+
+/// Capture a deterministic PNG screenshot of `url` with headless Chromium.
+///
+/// The layout viewport is pinned via `Emulation.setDeviceMetricsOverride` at device-scale-factor 1,
+/// so the produced image width matches [`ScreenshotConfig::width`] exactly (no DPR scaling). For a
+/// viewport capture the clip is the viewport rectangle; for a full-page capture the clip spans the
+/// entire scrollable content height with `captureBeyondViewport` enabled, yielding an image taller
+/// than the viewport. Rendering the same static page twice produces byte-identical PNGs (fixed
+/// color profile + font hinting, no embedded timestamps). The spawned browser is killed on return.
+pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, RenderError> {
+    let browser = launch_browser(config.timeout, (config.width, config.height))?;
+    let tab = browser
+        .new_tab()
+        .map_err(|e| RenderError::Launch(e.to_string()))?;
+    tab.set_default_timeout(config.timeout);
+    if !config.user_agent.is_empty() {
+        tab.set_user_agent(&config.user_agent, None, None)
+            .map_err(|e| RenderError::Render(e.to_string()))?;
+    }
+
+    tab.call_method(Emulation::SetDeviceMetricsOverride {
+        width: config.width,
+        height: config.height,
+        device_scale_factor: 1.0,
+        mobile: false,
+        scale: None,
+        screen_width: None,
+        screen_height: None,
+        position_x: None,
+        position_y: None,
+        dont_set_visible_size: None,
+        screen_orientation: None,
+        viewport: None,
+        display_feature: None,
+        device_posture: None,
+    })
+    .map_err(|e| RenderError::Render(e.to_string()))?;
+
+    tab.navigate_to(url.as_str())
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+    tab.wait_until_navigated()
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+
+    let clip_height = if config.full_page {
+        content_height(&tab)?.max(config.height)
+    } else {
+        config.height
+    };
+    let clip = Page::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: f64::from(config.width),
+        height: f64::from(clip_height),
+        scale: 1.0,
+    };
+
+    let data = tab
+        .call_method(Page::CaptureScreenshot {
+            format: Some(Page::CaptureScreenshotFormatOption::Png),
+            quality: None,
+            clip: Some(clip),
+            from_surface: Some(true),
+            capture_beyond_viewport: Some(config.full_page),
+            optimize_for_speed: None,
+        })
+        .map_err(|e| RenderError::Render(e.to_string()))?
+        .data;
+
+    let png = base64::prelude::BASE64_STANDARD
+        .decode(&data)
+        .map_err(|e| RenderError::Render(format!("invalid base64 screenshot: {e}")))?;
+    if png.is_empty() {
+        return Err(RenderError::NoContent);
+    }
+    Ok(Screenshot { png, base64: data })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +306,18 @@ mod tests {
     #[test]
     fn default_config_uses_default_timeout() {
         let cfg = RenderConfig::default();
+        assert_eq!(
+            cfg.timeout,
+            Duration::from_secs(DEFAULT_RENDER_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn default_screenshot_config_is_1280x800_viewport_capture() {
+        let cfg = ScreenshotConfig::default();
+        assert_eq!(cfg.width, 1280);
+        assert_eq!(cfg.height, 800);
+        assert!(!cfg.full_page);
         assert_eq!(
             cfg.timeout,
             Duration::from_secs(DEFAULT_RENDER_TIMEOUT_SECS)
