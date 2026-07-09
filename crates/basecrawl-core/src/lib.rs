@@ -108,6 +108,12 @@ impl Default for ScrapeOptions {
 pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Error> {
     let url = url_validation::validate_url(raw_url)?;
 
+    let formats = if options.formats.is_empty() {
+        format::default_set()
+    } else {
+        format::normalize(options.formats.clone())
+    };
+
     let config = FetchConfig {
         timeout: Duration::from_secs(options.timeout_secs),
         headers: options.headers.clone(),
@@ -116,11 +122,17 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     };
     let fetched = fetch::fetch(&url, &config)?;
 
-    let formats = if options.formats.is_empty() {
-        format::default_set()
-    } else {
-        format::normalize(options.formats.clone())
-    };
+    // The request-side hashes cover exactly the emitted HTTP request inputs. The empty GET body
+    // remains explicitly hashed, and the browser-like default User-Agent is included in the
+    // canonical header surface because it is sent on every request.
+    let headers_hash = canonical::headers_hash(&config.headers, &config.user_agent);
+    let body_hash = canonical::body_hash(&[]);
+    let request_hash =
+        canonical::request_hash(DEFAULT_METHOD, url.as_str(), &headers_hash, &body_hash);
+    let format_names: Vec<String> = formats
+        .iter()
+        .map(|format| format.as_str().to_string())
+        .collect();
 
     // The decoded served source, shared by the rawHtml passthrough and the links/metadata
     // producers. The resolution base is the terminal (post-redirect) URL so relative links/images
@@ -247,6 +259,9 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     // `result_hash` covers only the deterministic result surface; `screenshot` (and `json`) are
     // excluded so a viewport tweak that changes only pixels never shifts the byte-quorum digest.
     let result_hash = canonical::result_hash(&formats_produced);
+    let completeness_manifest = canonical::completeness_manifest(&format_names, &formats_produced);
+    let manifest_sha256 =
+        canonical::manifest_sha256(url.as_str(), options.nonce.as_deref(), &result_hash);
 
     Ok(ScrapeProof {
         version: SCRAPE_PROOF_VERSION,
@@ -255,9 +270,10 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         request: Request {
             method: DEFAULT_METHOD.to_string(),
             url: url.as_str().to_string(),
-            headers_hash: None,
-            body_hash: None,
-            formats: formats.iter().map(|f| f.as_str().to_string()).collect(),
+            headers_hash: Some(headers_hash),
+            body_hash: Some(body_hash),
+            request_hash: Some(request_hash),
+            formats: format_names,
         },
         tls: fetched.tls,
         response: Response {
@@ -271,7 +287,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         result: ResultBlock {
             formats_produced,
             result_hash: Some(result_hash),
-            completeness_manifest: Value::Object(serde_json::Map::new()),
+            completeness_manifest,
+            manifest_sha256: Some(manifest_sha256),
             crawled_urls,
         },
         egress: Egress::default(),

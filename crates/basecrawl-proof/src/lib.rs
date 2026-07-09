@@ -43,6 +43,9 @@ pub struct Request {
     pub url: String,
     pub headers_hash: Option<String>,
     pub body_hash: Option<String>,
+    /// SHA-256 over the canonical method, URL, request-headers digest, and body digest. This is
+    /// the request-side binding later committed into attestation report data.
+    pub request_hash: Option<String>,
     /// Requested formats in canonical (order-normalized) order.
     pub formats: Vec<String>,
 }
@@ -95,11 +98,51 @@ pub struct ResultBlock {
     /// Keyed by format name; value is the produced output (null until a format producer fills it).
     pub formats_produced: BTreeMap<String, Value>,
     pub result_hash: Option<String>,
-    pub completeness_manifest: Value,
+    /// Structured, deterministic L4 evidence for every requested output format.
+    pub completeness_manifest: CompletenessManifest,
+    /// Reconciliation digest over `(request.url, nonce, result_hash)`.
+    pub manifest_sha256: Option<String>,
     /// The ordered set of page URLs crawled when pagination following is enabled (page 1 first).
     /// Omitted when pagination was not followed, so a single-page scrape is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crawled_urls: Vec<String>,
+}
+
+/// Structured L4 completeness evidence for a scrape result.
+///
+/// The fixed fields make presence, byte size, and structural richness available to downstream
+/// completeness grading without inspecting possibly large format values. `formats` is a
+/// [`BTreeMap`] so its emitted key order is canonical and stable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletenessManifest {
+    /// Schema version for forward-compatible L4 grading.
+    pub version: u32,
+    /// Number of formats requested for this scrape.
+    pub requested_format_count: u64,
+    /// Number of requested formats that were actually populated (not JSON null).
+    pub present_format_count: u64,
+    /// Per-format presence, canonical serialized byte size, and top-level structural field count.
+    pub formats: BTreeMap<String, FormatCompleteness>,
+}
+
+impl Default for CompletenessManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            requested_format_count: 0,
+            present_format_count: 0,
+            formats: BTreeMap::new(),
+        }
+    }
+}
+
+/// Completeness evidence for one requested result format.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FormatCompleteness {
+    pub requested: bool,
+    pub present: bool,
+    pub byte_size: u64,
+    pub key_field_count: u64,
 }
 
 /// Network egress metadata (egress IP, geo landmark RTTs, timestamp, fingerprint seed).
@@ -149,6 +192,7 @@ mod tests {
                 url: "https://example.com/".into(),
                 headers_hash: None,
                 body_hash: None,
+                request_hash: None,
                 formats: vec!["markdown".into(), "metadata".into()],
             },
             tls: Tls::default(),
@@ -156,7 +200,8 @@ mod tests {
             result: ResultBlock {
                 formats_produced: BTreeMap::new(),
                 result_hash: None,
-                completeness_manifest: Value::Object(Default::default()),
+                completeness_manifest: CompletenessManifest::default(),
+                manifest_sha256: None,
                 crawled_urls: Vec::new(),
             },
             egress: Egress::default(),
@@ -228,6 +273,36 @@ mod tests {
     #[test]
     fn canonical_json_is_stable_across_runs() {
         assert_eq!(sample().to_canonical_json(), sample().to_canonical_json());
+    }
+
+    #[test]
+    fn canonical_json_includes_structured_completeness_and_digest_slots() {
+        let serialized = sample().to_canonical_json();
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+
+        assert!(value["request"]["request_hash"].is_null());
+        assert_eq!(value["result"]["completeness_manifest"]["version"], 1);
+        assert_eq!(
+            value["result"]["completeness_manifest"]["requested_format_count"],
+            0
+        );
+        assert!(
+            value["result"]["completeness_manifest"]["formats"].is_object(),
+            "manifest formats must use a stable keyed object"
+        );
+        assert!(value["result"]["manifest_sha256"].is_null());
+
+        for key in [
+            "\"formats_produced\"",
+            "\"result_hash\"",
+            "\"completeness_manifest\"",
+            "\"manifest_sha256\"",
+        ] {
+            assert!(
+                serialized.contains(key),
+                "canonical JSON must expose key {key}: {serialized}"
+            );
+        }
     }
 
     #[test]
