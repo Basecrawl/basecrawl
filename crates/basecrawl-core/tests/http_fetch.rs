@@ -7,6 +7,9 @@
 //! open-web targets named in the validation contract (`example.com`, `books.toscrape.com`,
 //! `httpbin.org`) per the mission's "real open-web targets" directive.
 
+mod common;
+
+use common::httpbin_base;
 use serde_json::Value;
 use std::process::{Command, Output};
 
@@ -95,25 +98,30 @@ fn http_404_is_recorded_with_exit_zero() {
 // VAL-CRAWL-017: 5xx status is captured faithfully (never masked as 200).
 #[test]
 fn http_503_is_captured_faithfully() {
-    let v = scrape_json(&["https://httpbin.org/status/503"]);
+    let url = format!("{}/status/503", httpbin_base());
+    let v = scrape_json(&[&url]);
     assert_eq!(v["response"]["status_code"], 503);
 }
 
 // VAL-CRAWL-022: gzip/deflate/brotli bodies are transparently decoded.
 #[test]
 fn gzip_deflate_brotli_are_transparently_decoded() {
+    let base = httpbin_base();
+    // Markers are whitespace-normalized so both pretty-printed (httpbin.org) and compact (mirror)
+    // JSON bodies match; the assertion still proves the body was decoded, not raw compressed bytes.
     for (path, marker) in [
-        ("gzip", "\"gzipped\": true"),
-        ("deflate", "\"deflated\": true"),
-        ("brotli", "\"brotli\": true"),
+        ("gzip", "\"gzipped\":true"),
+        ("deflate", "\"deflated\":true"),
+        ("brotli", "\"brotli\":true"),
     ] {
-        let url = format!("https://httpbin.org/{path}");
+        let url = format!("{base}/{path}");
         let v = scrape_json(&[&url, "--formats", "rawHtml"]);
         let body = v["result"]["formats_produced"]["rawHtml"]
             .as_str()
             .unwrap_or_else(|| panic!("rawHtml body must be surfaced for {path}"));
+        let normalized: String = body.split_whitespace().collect();
         assert!(
-            body.contains(marker),
+            normalized.contains(marker),
             "{path} body should be decoded and human-readable (expected {marker}), got: {body}"
         );
         let cl = v["response"]["content_length"]
@@ -135,7 +143,8 @@ fn gzip_deflate_brotli_are_transparently_decoded() {
 #[test]
 fn request_timeout_is_enforced() {
     let start = std::time::Instant::now();
-    let out = run(&["https://httpbin.org/delay/10", "--timeout", "3"]);
+    let url = format!("{}/delay/10", httpbin_base());
+    let out = run(&[&url, "--timeout", "3"]);
     let elapsed = start.elapsed();
     assert!(
         !out.status.success(),
@@ -153,13 +162,8 @@ fn request_timeout_is_enforced() {
 // VAL-CRAWL-024: custom request headers are sent.
 #[test]
 fn custom_request_header_is_sent_and_reflected() {
-    let v = scrape_json(&[
-        "https://httpbin.org/headers",
-        "--header",
-        "X-Probe: 1",
-        "--formats",
-        "rawHtml",
-    ]);
+    let url = format!("{}/headers", httpbin_base());
+    let v = scrape_json(&[&url, "--header", "X-Probe: 1", "--formats", "rawHtml"]);
     let body = v["result"]["formats_produced"]["rawHtml"]
         .as_str()
         .expect("rawHtml body must be surfaced");
@@ -172,7 +176,8 @@ fn custom_request_header_is_sent_and_reflected() {
 // VAL-CRAWL-025: User-Agent is a real browser-like UA, not empty/default library UA.
 #[test]
 fn user_agent_is_browser_like() {
-    let v = scrape_json(&["https://httpbin.org/user-agent", "--formats", "rawHtml"]);
+    let url = format!("{}/user-agent", httpbin_base());
+    let v = scrape_json(&[&url, "--formats", "rawHtml"]);
     let body = v["result"]["formats_produced"]["rawHtml"]
         .as_str()
         .expect("rawHtml body must be surfaced");

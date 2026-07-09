@@ -68,6 +68,24 @@ pub struct Response {
     pub headers_hash: Option<String>,
     pub body_hash: Option<String>,
     pub content_length: Option<u64>,
+    /// Terminal URL the response was served from after following any redirect chain. Equals the
+    /// requested URL when no redirect occurred.
+    pub final_url: Option<String>,
+    /// Ordered redirect hops followed to reach the terminal response, in the order they were
+    /// followed. Empty when the request was served without a redirect.
+    pub redirect_chain: Vec<RedirectHop>,
+}
+
+/// One hop in a followed HTTP redirect chain.
+///
+/// `url` is the resource that returned the redirect, `status_code` is the redirect status it
+/// returned (a 3xx), and `location` is the absolute target that its `Location` header resolved to
+/// (relative and cross-scheme `Location`s are resolved against `url` before being recorded).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RedirectHop {
+    pub status_code: u16,
+    pub url: String,
+    pub location: String,
 }
 
 /// The produced result surface: one entry per requested format plus the deterministic
@@ -196,5 +214,33 @@ mod tests {
         let json = p.to_canonical_json();
         let back: ScrapeProof = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn response_exposes_final_url_and_empty_redirect_chain_by_default() {
+        let v: Value = serde_json::from_str(&sample().to_canonical_json()).unwrap();
+        assert!(v["response"]["final_url"].is_null());
+        assert!(
+            v["response"]["redirect_chain"].is_array(),
+            "redirect_chain must serialize as an array"
+        );
+        assert_eq!(v["response"]["redirect_chain"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn redirect_hops_serialize_with_status_url_and_location() {
+        let mut p = sample();
+        p.response.final_url = Some("https://example.com/final".into());
+        p.response.redirect_chain = vec![RedirectHop {
+            status_code: 302,
+            url: "https://example.com/start".into(),
+            location: "https://example.com/final".into(),
+        }];
+        let v: Value = serde_json::from_str(&p.to_canonical_json()).unwrap();
+        let hop = &v["response"]["redirect_chain"][0];
+        assert_eq!(hop["status_code"], 302);
+        assert_eq!(hop["url"], "https://example.com/start");
+        assert_eq!(hop["location"], "https://example.com/final");
+        assert_eq!(v["response"]["final_url"], "https://example.com/final");
     }
 }

@@ -33,6 +33,12 @@ pub enum Error {
     #[error("transport error: {0}")]
     Transport(String),
 
+    #[error("too many redirects: exceeded the maximum of {max} hop(s) while fetching '{url}'")]
+    TooManyRedirects { max: usize, url: String },
+
+    #[error("invalid redirect: {0}")]
+    Redirect(String),
+
     #[error("fetch failed: {0}")]
     Fetch(String),
 }
@@ -49,6 +55,8 @@ impl Error {
             Error::InvalidHeader(_) => "invalid_header",
             Error::Timeout(_) => "timeout",
             Error::Transport(_) => "transport_error",
+            Error::TooManyRedirects { .. } => "too_many_redirects",
+            Error::Redirect(_) => "redirect_error",
             Error::Fetch(_) => "fetch_error",
         }
     }
@@ -69,6 +77,9 @@ impl Error {
             }
             Error::UnsupportedScheme(scheme) => {
                 obj.insert("scheme".into(), Value::String(scheme.clone()));
+            }
+            Error::TooManyRedirects { max, .. } => {
+                obj.insert("max_redirects".into(), Value::Number((*max).into()));
             }
             _ => {}
         }

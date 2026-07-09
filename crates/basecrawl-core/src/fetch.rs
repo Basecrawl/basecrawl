@@ -8,6 +8,7 @@
 //! replaces this transport in the TLS-capture feature.
 
 use crate::error::Error;
+use basecrawl_proof::RedirectHop;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use url::Url;
@@ -18,6 +19,13 @@ pub const DEFAULT_USER_AGENT: &str =
 
 /// Default request timeout (seconds) when the caller does not specify one.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum number of HTTP redirects followed before aborting with [`Error::TooManyRedirects`].
+///
+/// This is the documented hop cap that bounds redirect loops: a chain longer than this (including a
+/// cyclic redirect) is refused rather than followed indefinitely. It is comfortably above the depth
+/// of any legitimate redirect chain while still terminating pathological loops quickly.
+pub const MAX_REDIRECTS: usize = 20;
 
 /// Configuration for a single fetch.
 #[derive(Debug, Clone)]
@@ -48,6 +56,10 @@ pub struct Fetched {
     pub body_hash: String,
     pub content_length: u64,
     pub body: Vec<u8>,
+    /// Terminal URL the response was served from after following any redirects.
+    pub final_url: String,
+    /// Redirect hops followed to reach the terminal response, in order.
+    pub redirects: Vec<RedirectHop>,
 }
 
 /// Parse a single `Name: Value` header specification.
@@ -66,11 +78,18 @@ pub fn parse_header(spec: &str) -> Result<(String, String), Error> {
     Ok((name.to_string(), value.to_string()))
 }
 
-/// Perform a blocking HTTP GET against a validated URL.
+/// Perform a blocking HTTP GET against a validated URL, following redirects to the final resource.
+///
+/// Redirects are followed in-process (reqwest's own redirect policy is disabled) so that each hop
+/// is captured as a [`RedirectHop`] and the chain can be bounded. A relative or cross-scheme
+/// `Location` is resolved against the URL that returned it, and the chain is capped at
+/// [`MAX_REDIRECTS`]: a longer chain (including a cyclic loop) aborts with
+/// [`Error::TooManyRedirects`] rather than following forever. The per-hop request timeout is
+/// enforced on every hop, so a redirect chain cannot hang past it.
 ///
 /// Transport failures (DNS resolution, connect, timeout, body-read) are returned as structured
-/// [`Error`]s and never as a fabricated HTTP status. Any HTTP status the origin returns (including
-/// 4xx/5xx) is captured faithfully.
+/// [`Error`]s and never as a fabricated HTTP status. Any HTTP status the terminal resource returns
+/// (including 4xx/5xx) is captured faithfully.
 pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &config.headers {
@@ -85,25 +104,62 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
         .user_agent(&config.user_agent)
         .timeout(config.timeout)
         .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::Fetch(error_chain(&e)))?;
 
-    let response = client.get(url.clone()).send().map_err(classify)?;
+    let mut current = url.clone();
+    let mut redirects: Vec<RedirectHop> = Vec::new();
 
-    let status_code = response.status().as_u16();
-    let headers_hash = hash_headers(response.headers());
-    // reqwest transparently decodes gzip/deflate/brotli, so these bytes are the decoded body.
-    let body = response.bytes().map_err(classify)?;
-    let body_hash = sha256_hex(&body);
-    let content_length = body.len() as u64;
+    loop {
+        let response = client.get(current.clone()).send().map_err(classify)?;
+        let status = response.status();
 
-    Ok(Fetched {
-        status_code,
-        headers_hash,
-        body_hash,
-        content_length,
-        body: body.to_vec(),
-    })
+        if status.is_redirection() {
+            if let Some(location) = response.headers().get(reqwest::header::LOCATION) {
+                if redirects.len() >= MAX_REDIRECTS {
+                    return Err(Error::TooManyRedirects {
+                        max: MAX_REDIRECTS,
+                        url: url.to_string(),
+                    });
+                }
+                let location = location.to_str().map_err(|_| {
+                    Error::Redirect(format!(
+                        "redirect from {current} has a non-textual Location header"
+                    ))
+                })?;
+                let target = current.join(location).map_err(|_| {
+                    Error::Redirect(format!(
+                        "could not resolve redirect Location '{location}' against {current}"
+                    ))
+                })?;
+                redirects.push(RedirectHop {
+                    status_code: status.as_u16(),
+                    url: current.to_string(),
+                    location: target.to_string(),
+                });
+                current = target;
+                continue;
+            }
+        }
+
+        let status_code = status.as_u16();
+        let headers_hash = hash_headers(response.headers());
+        // reqwest transparently decodes gzip/deflate/brotli, so these bytes are the decoded body.
+        let body = response.bytes().map_err(classify)?;
+        let body_hash = sha256_hex(&body);
+        let content_length = body.len() as u64;
+
+        return Ok(Fetched {
+            status_code,
+            headers_hash,
+            body_hash,
+            content_length,
+            body: body.to_vec(),
+            final_url: current.to_string(),
+            redirects,
+        });
+    }
 }
 
 /// Classify a `reqwest` transport failure into a structured [`Error`]. Timeouts are reported

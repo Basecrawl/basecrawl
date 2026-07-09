@@ -105,6 +105,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             headers_hash: Some(fetched.headers_hash),
             body_hash: Some(fetched.body_hash),
             content_length: Some(fetched.content_length),
+            final_url: Some(fetched.final_url),
+            redirect_chain: fetched.redirects,
         },
         result: ResultBlock {
             formats_produced,
