@@ -31,6 +31,7 @@ ego-tree = "0.11"
 headless_chrome = "1"
 base64 = "0.22"
 png = "0.17"
+encoding_rs = "0.8"
 
 [profile.release]
 opt-level = 3

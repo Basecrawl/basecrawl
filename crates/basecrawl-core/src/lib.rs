@@ -7,6 +7,7 @@
 //! on by subsequent features.
 
 pub mod canonical;
+pub mod charset;
 pub mod content;
 pub mod error;
 pub mod fetch;
@@ -144,7 +145,12 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     // The decoded served source, shared by the rawHtml passthrough and the links/metadata
     // producers. The resolution base is the terminal (post-redirect) URL so relative links/images
     // resolve correctly; a document `<base href>` overrides it inside each producer.
-    let body_str = String::from_utf8_lossy(&fetched.body);
+    let content_kind = content::classify(fetched.content_type.as_deref());
+    let body_str = charset::decode_body(
+        &fetched.body,
+        fetched.content_type.as_deref(),
+        content_kind == ContentKind::Html,
+    );
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
 
     // The post-render DOM feeds `html` and `markdown` so JS-injected content is captured. It is
@@ -155,7 +161,6 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let needs_render = formats
         .iter()
         .any(|f| matches!(f, Format::Markdown | Format::Html));
-    let content_kind = content::classify(fetched.content_type.as_deref());
     let rendered_html: Option<String> = if options.render_enabled
         && needs_render
         && content_kind == ContentKind::Html
@@ -188,9 +193,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             }
             Format::Html => {
                 if content_kind == ContentKind::Html {
-                    let source = rendered_html
-                        .clone()
-                        .unwrap_or_else(|| body_str.clone().into_owned());
+                    let source = rendered_html.clone().unwrap_or_else(|| body_str.clone());
                     Value::String(source)
                 } else {
                     text_surface(&body_str, content_kind)
@@ -228,9 +231,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     if options.follow_pagination {
         crawled_urls.push(url.as_str().to_string());
         let max_pages = options.max_pages.max(1);
-        let mut current_html = rendered_html
-            .clone()
-            .unwrap_or_else(|| body_str.clone().into_owned());
+        let mut current_html = rendered_html.clone().unwrap_or_else(|| body_str.clone());
         let mut current_base = page_base.clone();
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(url.as_str().to_string());
@@ -324,9 +325,9 @@ fn crawl_page(
     config: &FetchConfig,
 ) -> Result<(String, String, Url), Error> {
     let fetched = fetch::fetch(url, config)?;
-    let body_str = String::from_utf8_lossy(&fetched.body).into_owned();
-    let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let is_html = content::classify(fetched.content_type.as_deref()) == ContentKind::Html;
+    let body_str = charset::decode_body(&fetched.body, fetched.content_type.as_deref(), is_html);
+    let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
         html::render_page(
             url,
