@@ -9,6 +9,7 @@
 pub mod canonical;
 pub mod charset;
 pub mod content;
+pub mod document;
 pub mod egress;
 pub mod error;
 pub mod fetch;
@@ -157,11 +158,25 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     // producers. The resolution base is the terminal (post-redirect) URL so relative links/images
     // resolve correctly; a document `<base href>` overrides it inside each producer.
     let content_kind = content::classify(fetched.content_type.as_deref());
-    let mut body_str = charset::decode_body(
-        &fetched.body,
-        fetched.content_type.as_deref(),
-        content_kind == ContentKind::Html,
-    );
+    let document_text = match content_kind {
+        ContentKind::Document(kind)
+            if formats
+                .iter()
+                .any(|format| matches!(format, Format::Markdown | Format::Html)) =>
+        {
+            Some(document::extract(&fetched.body, kind).map_err(Error::DocumentExtraction)?)
+        }
+        _ => None,
+    };
+    let mut body_str = if matches!(content_kind, ContentKind::Document(_)) {
+        String::new()
+    } else {
+        charset::decode_body(
+            &fetched.body,
+            fetched.content_type.as_deref(),
+            content_kind == ContentKind::Html,
+        )
+    };
     redact_sensitive_request_echoes(&mut body_str, &config.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let sitemap_urls = if formats.contains(&Format::Links) {
@@ -204,6 +219,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 if content_kind == ContentKind::Html {
                     let source = rendered_html.as_deref().unwrap_or(&body_str);
                     Value::String(markdown::to_markdown(source, &page_base))
+                } else if matches!(content_kind, ContentKind::Document(_)) {
+                    Value::String(document_text.clone().unwrap_or_default())
                 } else {
                     text_surface(&body_str, content_kind)
                 }
@@ -212,6 +229,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 if content_kind == ContentKind::Html {
                     let source = rendered_html.clone().unwrap_or_else(|| body_str.clone());
                     Value::String(source)
+                } else if matches!(content_kind, ContentKind::Document(_)) {
+                    Value::String(document_text.clone().unwrap_or_default())
                 } else {
                     text_surface(&body_str, content_kind)
                 }
@@ -370,7 +389,7 @@ fn crawl_page(
 
 fn text_surface(body: &str, content_kind: ContentKind) -> Value {
     match content_kind {
-        ContentKind::Binary => Value::String(String::new()),
+        ContentKind::Binary | ContentKind::Document(_) => Value::String(String::new()),
         ContentKind::Html | ContentKind::Text => Value::String(body.to_owned()),
     }
 }

@@ -60,6 +60,9 @@ pub enum Error {
     #[error("html render failed: {0}")]
     Render(String),
 
+    #[error("document extraction failed: {0}")]
+    DocumentExtraction(String),
+
     #[error("could not produce egress metadata: {0}")]
     EgressMetadata(String),
 
@@ -88,6 +91,7 @@ impl Error {
             Error::Redirect(_) => "redirect_error",
             Error::Fetch(_) => "fetch_error",
             Error::Render(_) => "render_error",
+            Error::DocumentExtraction(_) => "document_extraction",
             Error::EgressMetadata(_) => "egress_metadata_error",
             Error::Io(_) => "io_error",
         }

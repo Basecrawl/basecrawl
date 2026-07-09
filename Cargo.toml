@@ -35,6 +35,8 @@ encoding_rs = "0.8"
 getrandom = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 quick-xml = "0.39"
+pdf-extract = "0.12"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]
 opt-level = 3

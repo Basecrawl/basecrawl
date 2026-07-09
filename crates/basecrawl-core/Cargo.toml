@@ -37,6 +37,8 @@ encoding_rs.workspace = true
 getrandom.workspace = true
 time.workspace = true
 quick-xml.workspace = true
+pdf-extract.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 png.workspace = true

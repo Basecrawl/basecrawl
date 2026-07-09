@@ -11,8 +11,19 @@ pub enum ContentKind {
     Html,
     /// Text that is surfaced byte-for-byte as UTF-8 text, without HTML parsing.
     Text,
+    /// A supported document package whose text must be extracted before it is surfaced.
+    Document(DocumentKind),
     /// Non-text data that must not be rendered, parsed, or lossy-converted to text.
     Binary,
+}
+
+/// The document parser selected by the authoritative response media type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKind {
+    /// An `application/pdf` document.
+    Pdf,
+    /// An OOXML or OpenDocument office package.
+    Office,
 }
 
 /// Classify a response from its `Content-Type` header.
@@ -32,6 +43,25 @@ pub fn classify(content_type: Option<&str>) -> ContentKind {
 
     if matches!(media_type.as_str(), "text/html" | "application/xhtml+xml") {
         return ContentKind::Html;
+    }
+
+    if media_type == "application/pdf" {
+        return ContentKind::Document(DocumentKind::Pdf);
+    }
+
+    if matches!(
+        media_type.as_str(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.openxmlformats-officedocument.presentationml.template"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.template"
+            | "application/vnd.oasis.opendocument.text"
+            | "application/vnd.oasis.opendocument.presentation"
+            | "application/vnd.oasis.opendocument.spreadsheet"
+    ) {
+        return ContentKind::Document(DocumentKind::Office);
     }
 
     if media_type.starts_with("text/")
@@ -69,6 +99,24 @@ mod tests {
     #[test]
     fn images_are_binary() {
         assert_eq!(classify(Some("image/png")), ContentKind::Binary);
+    }
+
+    #[test]
+    fn supported_documents_are_distinguished_from_unsafe_binary_data() {
+        assert_eq!(
+            classify(Some("application/pdf")),
+            ContentKind::Document(DocumentKind::Pdf)
+        );
+        assert_eq!(
+            classify(Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )),
+            ContentKind::Document(DocumentKind::Office)
+        );
+        assert_eq!(
+            classify(Some("application/vnd.oasis.opendocument.text")),
+            ContentKind::Document(DocumentKind::Office)
+        );
     }
 
     #[test]
