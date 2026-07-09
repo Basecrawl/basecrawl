@@ -20,9 +20,22 @@ set_target_properties(
     BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/../../target/release"
 )
 
+set(BASECRAWL_CLI "${CMAKE_CURRENT_SOURCE_DIR}/../../target/release/basecrawl")
+if(NOT EXISTS "${BASECRAWL_CLI}")
+  message(FATAL_ERROR "expected release basecrawl CLI at ${BASECRAWL_CLI}; build the workspace first")
+endif()
+
 add_test(
   NAME basecrawl-c-scrapeproof-shape
   COMMAND ${CMAKE_COMMAND}
     -DPROGRAM=$<TARGET_FILE:basecrawl-c-example>
     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_scrapeproof.cmake
+)
+
+add_test(
+  NAME basecrawl-c-cross-binding-parity
+  COMMAND ${CMAKE_COMMAND}
+    -DPROGRAM=$<TARGET_FILE:basecrawl-c-example>
+    -DCLI=${BASECRAWL_CLI}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_parity.cmake
 )
