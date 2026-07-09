@@ -50,6 +50,15 @@ pub struct ScrapeOptions {
     pub viewport: (u32, u32),
     /// When true, `screenshot` captures the full scrollable page rather than just the viewport.
     pub screenshot_full_page: bool,
+    /// When true (default), the `html`/`markdown` formats are produced from the headless-Chromium
+    /// post-render DOM (JS executed). When false (`--no-js`), they are produced from the raw served
+    /// source, so no browser is launched and JS-injected content is not present.
+    pub render_enabled: bool,
+    /// Optional CSS selector that render must wait for before capturing (`--wait-for`).
+    pub wait_for: Option<String>,
+    /// Whole-render timeout in seconds bounding the JS render step independently of the fetch
+    /// timeout, so a pathological (never-idle) page is aborted rather than hanging.
+    pub render_timeout_secs: u64,
 }
 
 impl Default for ScrapeOptions {
@@ -65,6 +74,9 @@ impl Default for ScrapeOptions {
                 basecrawl_render::DEFAULT_VIEWPORT_HEIGHT,
             ),
             screenshot_full_page: false,
+            render_enabled: true,
+            wait_for: None,
+            render_timeout_secs: basecrawl_render::DEFAULT_RENDER_TIMEOUT_SECS,
         }
     }
 }
@@ -89,21 +101,51 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         format::normalize(options.formats.clone())
     };
 
-    // The decoded served source, shared by the rawHtml passthrough and the markdown/links
+    // The decoded served source, shared by the rawHtml passthrough and the links/metadata
     // producers. The resolution base is the terminal (post-redirect) URL so relative links/images
     // resolve correctly; a document `<base href>` overrides it inside each producer.
     let body_str = String::from_utf8_lossy(&fetched.body);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
 
-    // `rawHtml` is the served source (no render); `html` is the cleaned, post-render DOM. Rendering
-    // is triggered only when `html` is requested, so a rawHtml-only scrape never launches a browser.
+    // The post-render DOM feeds `html` and `markdown` so JS-injected content is captured. It is
+    // rendered at most once (shared by both formats) and only when rendering is enabled, the served
+    // body is a non-empty HTML document, and a render-dependent format was requested — so a
+    // `--no-js` run, a `rawHtml`/`links`-only run, and an empty/non-HTML response never launch a
+    // browser. When rendering is skipped, `html`/`markdown` fall back to the raw served source.
+    let needs_render = formats
+        .iter()
+        .any(|f| matches!(f, Format::Markdown | Format::Html));
+    let is_html = fetched.content_type.as_deref().is_none_or(|ct| {
+        let ct = ct.to_ascii_lowercase();
+        ct.contains("html") || ct.contains("xml")
+    });
+    let rendered_html: Option<String> =
+        if options.render_enabled && needs_render && is_html && !body_str.trim().is_empty() {
+            Some(html::render_page(
+                &url,
+                &config.user_agent,
+                Duration::from_secs(options.render_timeout_secs),
+                options.wait_for.as_deref(),
+            )?)
+        } else {
+            None
+        };
+
+    // `rawHtml` is always the served source (no render); `html`/`markdown` use the rendered DOM when
+    // available and otherwise the served source.
     let mut formats_produced: BTreeMap<String, Value> = BTreeMap::new();
     for f in &formats {
         let value = match f {
             Format::RawHtml => Value::String(body_str.clone().into_owned()),
-            Format::Markdown => Value::String(markdown::to_markdown(&body_str, &page_base)),
+            Format::Markdown => {
+                let source = rendered_html.as_deref().unwrap_or(&body_str);
+                Value::String(markdown::to_markdown(source, &page_base))
+            }
             Format::Html => {
-                Value::String(html::render_html(&url, &config.user_agent, config.timeout)?)
+                let source = rendered_html
+                    .clone()
+                    .unwrap_or_else(|| body_str.clone().into_owned());
+                Value::String(source)
             }
             Format::Links => serde_json::to_value(links::extract(&body_str, &page_base))
                 .expect("links surface is always serializable"),

@@ -40,6 +40,20 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_name = "SECONDS")]
     timeout: u64,
 
+    /// Disable JS rendering: produce html/markdown from the raw served source (no headless browser),
+    /// so JS-injected content is not present.
+    #[arg(long = "no-js", default_value_t = false)]
+    no_js: bool,
+
+    /// Block capture until an element matching this CSS selector exists (headless render only).
+    #[arg(long = "wait-for", value_name = "SELECTOR")]
+    wait_for: Option<String>,
+
+    /// Whole-render timeout in seconds bounding the JS render step; a never-idle page aborts near
+    /// this bound instead of hanging [default: the --timeout value].
+    #[arg(long = "render-timeout", value_name = "SECONDS")]
+    render_timeout: Option<u64>,
+
     /// Screenshot viewport WIDTHxHEIGHT in CSS pixels (device-scale-factor 1).
     #[arg(long, default_value = "1280x800", value_name = "WxH")]
     viewport: String,
@@ -95,6 +109,11 @@ fn run(cli: Cli) -> Result<String, Error> {
         headers,
         viewport,
         screenshot_full_page: cli.screenshot_full_page,
+        render_enabled: !cli.no_js,
+        wait_for: cli.wait_for,
+        // Bound the render by its own flag when given, else reuse the request timeout so a single
+        // --timeout still bounds a pathological render.
+        render_timeout_secs: cli.render_timeout.unwrap_or(cli.timeout),
     };
 
     let proof = scrape(&raw_url, &options)?;
