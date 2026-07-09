@@ -104,7 +104,7 @@ fn static_scrapes_have_a_stable_canonical_result_surface() {
 
     // The emitted canonical JSON key sequence must be stable. Dynamic values such as the TLS
     // transcript may differ between runs, but their enclosing key order cannot.
-    for key in [
+    let keys = [
         "\"version\"",
         "\"task_id\"",
         "\"nonce\"",
@@ -115,16 +115,18 @@ fn static_scrapes_have_a_stable_canonical_result_surface() {
         "\"egress\"",
         "\"attestation\"",
         "\"sdk_signature\"",
-    ] {
-        let first_position = first_json
-            .find(key)
-            .expect("canonical top-level key exists");
-        let second_position = second_json
-            .find(key)
-            .expect("canonical top-level key exists");
-        assert_eq!(
-            first_position, second_position,
-            "key {key} must have the same serialization position across runs"
+    ];
+    for json in [&first_json, &second_json] {
+        let positions = keys
+            .iter()
+            .map(|key| {
+                json.find(key)
+                    .unwrap_or_else(|| panic!("canonical top-level key {key} exists"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|window| window[0] < window[1]),
+            "canonical top-level key order must remain stable: {positions:?}"
         );
     }
 }

@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://basecrawl.dev/schemas/scrapeproof-1.json",
+  "title": "ScrapeProof v1",
+  "description": "Canonical non-attestation ScrapeProof envelope. Attestation and SDK-signature values remain nullable until their M2 producer is available.",
+  "type": "object",
+  "required": [
+    "version",
+    "request",
+    "tls",
+    "response",
+    "result",
+    "egress",
+    "attestation",
+    "sdk_signature"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "task_id": { "type": "string" },
+    "nonce": { "type": "string" },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "url", "headers_hash", "body_hash", "request_hash", "formats"],
+      "properties": {
+        "method": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "format": "uri" },
+        "headers_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "body_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "request_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "formats": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "negotiated_version",
+        "sni",
+        "server_cert_chain_der",
+        "cert_chain_hash",
+        "server_ephemeral_pubkey",
+        "ct_scts",
+        "ocsp",
+        "handshake_transcript_hash"
+      ],
+      "properties": {
+        "negotiated_version": { "type": ["string", "null"] },
+        "sni": { "type": ["string", "null"] },
+        "server_cert_chain_der": { "type": "array", "items": { "type": "string" } },
+        "cert_chain_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "server_ephemeral_pubkey": { "type": ["string", "null"] },
+        "ct_scts": { "type": "array", "items": { "type": "string" } },
+        "ocsp": { "type": ["string", "null"] },
+        "handshake_transcript_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status_code",
+        "headers_hash",
+        "body_hash",
+        "content_length",
+        "content_type",
+        "body_truncated",
+        "body_max_bytes",
+        "final_url",
+        "redirect_chain"
+      ],
+      "properties": {
+        "status_code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "headers_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "body_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "content_length": { "type": ["integer", "null"], "minimum": 0 },
+        "content_type": { "type": ["string", "null"] },
+        "body_truncated": { "type": "boolean" },
+        "body_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "final_url": { "type": ["string", "null"], "format": "uri" },
+        "redirect_chain": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status_code", "url", "location"],
+            "properties": {
+              "status_code": { "type": "integer", "minimum": 300, "maximum": 399 },
+              "url": { "type": "string", "format": "uri" },
+              "location": { "type": "string", "format": "uri" }
+            }
+          }
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formats_produced", "result_hash", "completeness_manifest", "manifest_sha256"],
+      "properties": {
+        "formats_produced": { "type": "object" },
+        "result_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "completeness_manifest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "requested_format_count", "present_format_count", "formats"],
+          "properties": {
+            "version": { "type": "integer", "minimum": 1 },
+            "requested_format_count": { "type": "integer", "minimum": 0 },
+            "present_format_count": { "type": "integer", "minimum": 0 },
+            "formats": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["requested", "present", "byte_size", "key_field_count"],
+                "properties": {
+                  "requested": { "type": "boolean" },
+                  "present": { "type": "boolean" },
+                  "byte_size": { "type": "integer", "minimum": 0 },
+                  "key_field_count": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          }
+        },
+        "manifest_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "crawled_urls": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "egress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["egress_ip", "landmark_rtts", "timestamp", "fingerprint_seed"],
+      "properties": {
+        "egress_ip": {
+          "type": "string",
+          "anyOf": [
+            { "format": "ipv4" },
+            { "format": "ipv6" }
+          ]
+        },
+        "landmark_rtts": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "minimum": 0 }
+        },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "fingerprint_seed": { "type": "string", "minLength": 1 }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tee_type", "quote", "measurement", "report_data"],
+      "properties": {
+        "tee_type": { "type": ["string", "null"] },
+        "quote": { "type": ["string", "null"] },
+        "measurement": { "type": ["object", "null"] },
+        "report_data": { "type": ["string", "null"] }
+      }
+    },
+    "sdk_signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enclave_pubkey", "sig"],
+      "properties": {
+        "enclave_pubkey": { "type": ["string", "null"] },
+        "sig": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "additionalProperties": false
+}

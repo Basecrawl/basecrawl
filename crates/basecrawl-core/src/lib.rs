@@ -9,6 +9,7 @@
 pub mod canonical;
 pub mod charset;
 pub mod content;
+pub mod egress;
 pub mod error;
 pub mod fetch;
 pub mod format;
@@ -21,7 +22,7 @@ pub mod screenshot;
 pub mod url_validation;
 
 use basecrawl_proof::{
-    Attestation, Egress, Request, Response, ResultBlock, SdkSignature, SCRAPE_PROOF_VERSION,
+    Attestation, Request, Response, ResultBlock, SdkSignature, SCRAPE_PROOF_VERSION,
 };
 use content::ContentKind;
 use fetch::{FetchConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
@@ -146,11 +147,12 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     // producers. The resolution base is the terminal (post-redirect) URL so relative links/images
     // resolve correctly; a document `<base href>` overrides it inside each producer.
     let content_kind = content::classify(fetched.content_type.as_deref());
-    let body_str = charset::decode_body(
+    let mut body_str = charset::decode_body(
         &fetched.body,
         fetched.content_type.as_deref(),
         content_kind == ContentKind::Html,
     );
+    redact_sensitive_request_echoes(&mut body_str, &config.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
 
     // The post-render DOM feeds `html` and `markdown` so JS-injected content is captured. It is
@@ -310,7 +312,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             manifest_sha256: Some(manifest_sha256),
             crawled_urls,
         },
-        egress: Egress::default(),
+        egress: egress::build(fetched.egress_ip, fetched.fetched_at)?,
         attestation: Attestation::default(),
         sdk_signature: SdkSignature::default(),
     })
@@ -326,7 +328,9 @@ fn crawl_page(
 ) -> Result<(String, String, Url), Error> {
     let fetched = fetch::fetch(url, config)?;
     let is_html = content::classify(fetched.content_type.as_deref()) == ContentKind::Html;
-    let body_str = charset::decode_body(&fetched.body, fetched.content_type.as_deref(), is_html);
+    let mut body_str =
+        charset::decode_body(&fetched.body, fetched.content_type.as_deref(), is_html);
+    redact_sensitive_request_echoes(&mut body_str, &config.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
         html::render_page(
@@ -357,4 +361,53 @@ fn links_surface(body: &str, page_base: &Url, content_kind: ContentKind) -> Valu
     } else {
         serde_json::to_value(links::Links::default()).expect("links surface is always serializable")
     }
+}
+
+/// Remove request-header values when an origin reflects them into a surfaced result.
+///
+/// A valid origin can echo arbitrary custom headers, not just `Authorization` or `Cookie`, in
+/// JSON/debug output. The proof commits to the original response via `response.body_hash`, but
+/// plaintext result formats must not re-emit request-header material. Matching values rather than
+/// names handles arbitrary echo-body layouts without changing unrelated response content.
+fn redact_sensitive_request_echoes(body: &mut String, headers: &[(String, String)]) {
+    for (name, value) in headers {
+        if !value.is_empty() {
+            *body = body.replace(value, "<redacted>");
+        }
+        if is_sensitive_request_header(name) {
+            for secret in sensitive_header_components(name, value) {
+                *body = body.replace(secret, "<redacted>");
+            }
+        }
+    }
+}
+
+fn is_sensitive_request_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("set-cookie")
+}
+
+/// Return credentials embedded within an authentication or cookie header.
+///
+/// Full-value replacement catches normal reflective endpoints. These smaller components close the
+/// gap for endpoints that reflect only a bearer credential or only the value side of a cookie.
+fn sensitive_header_components<'a>(name: &str, value: &'a str) -> Vec<&'a str> {
+    if name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+    {
+        return value.split_whitespace().skip(1).collect();
+    }
+
+    value
+        .split(';')
+        .filter_map(|cookie| {
+            cookie
+                .trim()
+                .split_once('=')
+                .map(|(_, secret)| secret.trim())
+        })
+        .filter(|secret| !secret.is_empty())
+        .collect()
 }

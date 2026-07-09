@@ -11,6 +11,7 @@ use basecrawl_core::{
     format, scrape, screenshot, Action, Format, ScrapeOptions, DEFAULT_MAX_PAGES,
 };
 use clap::Parser;
+use serde_json::json;
 use std::path::PathBuf;
 
 /// basecrawl: verifiable web crawler that emits a canonical ScrapeProof.
@@ -95,6 +96,11 @@ struct Cli {
     /// Output format for the emitted proof (only "json" is supported).
     #[arg(long, default_value = "json", value_name = "OUTPUT")]
     output: String,
+
+    /// Emit a redacted completion summary to stderr. The summary contains only hashes and response
+    /// metadata, never request headers, cookies, or request/response bodies.
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
 }
 
 fn run(cli: Cli) -> Result<String, Error> {
@@ -160,7 +166,30 @@ fn run(cli: Cli) -> Result<String, Error> {
         write_screenshot(&proof, path)?;
     }
 
+    if cli.verbose {
+        log_verbose_summary(&proof);
+    }
+
     Ok(proof.to_canonical_json())
+}
+
+/// Write a completion event without exposing request or response plaintext.
+fn log_verbose_summary(proof: &basecrawl_core::ScrapeProof) {
+    let summary = json!({
+        "event": "scrape_completed",
+        "request": {
+            "method": proof.request.method,
+            "headers_hash": proof.request.headers_hash,
+            "body_hash": proof.request.body_hash,
+        },
+        "response": {
+            "status_code": proof.response.status_code,
+            "headers_hash": proof.response.headers_hash,
+            "body_hash": proof.response.body_hash,
+            "content_length": proof.response.content_length,
+        },
+    });
+    eprintln!("{summary}");
 }
 
 /// Decode the base64 screenshot from the proof and write the raw PNG bytes to `path`.

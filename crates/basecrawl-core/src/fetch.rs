@@ -16,9 +16,10 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use sha2::{Digest, Sha256};
 use std::io::{self, Cursor, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use time::OffsetDateTime;
 use url::Url;
 use x509_parser::prelude::parse_x509_certificate;
 /// A browser-plausible User-Agent so origins are not served a bare library fingerprint.
@@ -96,6 +97,11 @@ pub struct Fetched {
     pub redirects: Vec<RedirectHop>,
     /// In-process TLS 1.3 evidence for the final HTTPS request (or the last HTTPS redirect hop).
     pub tls: Tls,
+    /// Source address selected for the final outbound request.
+    pub egress_ip: IpAddr,
+    /// UTC wall-clock time recorded as soon as the final response is fetched, before rendering or
+    /// other result processing can delay proof assembly.
+    pub fetched_at: OffsetDateTime,
 }
 
 /// Parse a single `Name: Value` header specification.
@@ -105,10 +111,10 @@ pub struct Fetched {
 pub fn parse_header(spec: &str) -> Result<(String, String), Error> {
     let (name, value) = spec
         .split_once(':')
-        .ok_or_else(|| Error::InvalidHeader(spec.to_string()))?;
+        .ok_or_else(|| Error::InvalidHeader("<redacted>".to_string()))?;
     let name = name.trim();
     if name.is_empty() {
-        return Err(Error::InvalidHeader(spec.to_string()));
+        return Err(Error::InvalidHeader("<redacted>".to_string()));
     }
     let value = value.strip_prefix(' ').unwrap_or(value).trim_end();
     Ok((name.to_string(), value.to_string()))
@@ -130,6 +136,7 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
     let mut current = url.clone();
     let mut redirects: Vec<RedirectHop> = Vec::new();
     let mut tls = Tls::default();
+    let mut egress_ip = None;
 
     loop {
         let response = match current.scheme() {
@@ -140,6 +147,9 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
 
         if let Some(captured) = response.tls {
             tls = captured;
+        }
+        if let Some(captured) = response.egress_ip {
+            egress_ip = Some(captured);
         }
 
         if (300..400).contains(&response.status_code) {
@@ -176,6 +186,8 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
             final_url: current.to_string(),
             redirects,
             tls,
+            egress_ip: egress_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            fetched_at: OffsetDateTime::now_utc(),
         });
     }
 }
@@ -189,6 +201,7 @@ struct SingleResponse {
     body: Vec<u8>,
     body_truncated: bool,
     tls: Option<Tls>,
+    egress_ip: Option<IpAddr>,
 }
 
 /// Preserve the existing reqwest path for plaintext HTTP. HTTPS is intentionally handled by
@@ -198,9 +211,9 @@ fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> 
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &config.headers {
         let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| Error::InvalidHeader(format!("{name}: {value}")))?;
+            .map_err(|_| Error::InvalidHeader(name.to_string()))?;
         let header_value = reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| Error::InvalidHeader(format!("{name}: {value}")))?;
+            .map_err(|_| Error::InvalidHeader(name.to_string()))?;
         headers.insert(header_name, header_value);
     }
     let client = reqwest::blocking::Client::builder()
@@ -232,6 +245,7 @@ fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> 
         body,
         body_truncated,
         tls: None,
+        egress_ip: source_ip_for(url),
     })
 }
 
@@ -247,6 +261,7 @@ fn fetch_https(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error>
         .map_err(|_| Error::InvalidUrl(format!("invalid HTTPS host '{host}'")))?;
     let address = resolve_address(host, port)?;
     let tcp = TcpStream::connect_timeout(&address, config.timeout).map_err(classify_io)?;
+    let egress_ip = tcp.local_addr().map_err(classify_io)?.ip();
     tcp.set_read_timeout(Some(config.timeout))
         .map_err(classify_io)?;
     tcp.set_write_timeout(Some(config.timeout))
@@ -292,6 +307,7 @@ fn fetch_https(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error>
         body,
         body_truncated: raw_truncated || decoded_truncated,
         tls: Some(tls),
+        egress_ip: Some(egress_ip),
     })
 }
 
@@ -301,6 +317,25 @@ fn resolve_address(host: &str, port: u16) -> Result<std::net::SocketAddr, Error>
         .map_err(classify_io)?
         .next()
         .ok_or_else(|| Error::Transport(format!("DNS resolution returned no addresses for {host}")))
+}
+
+/// Infer the source address an HTTP client uses for `url`.
+///
+/// Reqwest's blocking response API does not expose its local socket address. A connected UDP socket
+/// asks the operating system for the same route selection without sending a packet. If route
+/// introspection is unavailable, the caller emits a syntactically valid unspecified address rather
+/// than leaking or inventing a textual value.
+fn source_ip_for(url: &Url) -> Option<IpAddr> {
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let destination = (host, port).to_socket_addrs().ok()?.next()?;
+    let bind = match destination {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(destination).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
 }
 
 /// Build a rustls configuration with Mozilla roots. TLS 1.3 is preferred and fully captured, while
@@ -364,7 +399,7 @@ fn build_http_request(
     );
     for (name, value) in &config.headers {
         if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
-            return Err(Error::InvalidHeader(format!("{name}: {value}")));
+            return Err(Error::InvalidHeader(name.to_string()));
         }
         request.push_str(name);
         request.push_str(": ");
