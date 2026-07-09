@@ -15,8 +15,10 @@ use basecrawl_proof::{
     Attestation, Egress, Request, Response, ResultBlock, ScrapeProof, SdkSignature, Tls,
     SCRAPE_PROOF_VERSION,
 };
+use fetch::{FetchConfig, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub use error::Error;
 pub use format::Format;
@@ -33,6 +35,10 @@ pub struct ScrapeOptions {
     pub task_id: Option<String>,
     /// Validator-issued anti-replay nonce, echoed verbatim into the proof.
     pub nonce: Option<String>,
+    /// Whole-request timeout in seconds.
+    pub timeout_secs: u64,
+    /// Extra request headers to send, as parsed `(name, value)` pairs.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for ScrapeOptions {
@@ -41,6 +47,8 @@ impl Default for ScrapeOptions {
             formats: format::default_set(),
             task_id: None,
             nonce: None,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            headers: Vec::new(),
         }
     }
 }
@@ -51,7 +59,13 @@ impl Default for ScrapeOptions {
 /// URL is refused without a fetch and without emitting a proof.
 pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Error> {
     let url = url_validation::validate_url(raw_url)?;
-    let fetched = fetch::fetch(&url)?;
+
+    let config = FetchConfig {
+        timeout: Duration::from_secs(options.timeout_secs),
+        headers: options.headers.clone(),
+        user_agent: DEFAULT_USER_AGENT.to_string(),
+    };
+    let fetched = fetch::fetch(&url, &config)?;
 
     let formats = if options.formats.is_empty() {
         format::default_set()
@@ -59,9 +73,19 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         format::normalize(options.formats.clone())
     };
 
+    // Surface the decoded served source under `rawHtml` so header/User-Agent/decoding behavior is
+    // observable; richer html/markdown producers layer on in later features.
+    let raw_body = Value::String(String::from_utf8_lossy(&fetched.body).into_owned());
     let formats_produced: BTreeMap<String, Value> = formats
         .iter()
-        .map(|f| (f.as_str().to_string(), Value::Null))
+        .map(|f| {
+            let value = if *f == Format::RawHtml {
+                raw_body.clone()
+            } else {
+                Value::Null
+            };
+            (f.as_str().to_string(), value)
+        })
         .collect();
 
     Ok(ScrapeProof {

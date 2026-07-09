@@ -24,6 +24,15 @@ pub enum Error {
     #[error("unsupported output format '{0}' (only 'json' is supported)")]
     UnsupportedOutput(String),
 
+    #[error("invalid request header '{0}' (expected 'Name: Value')")]
+    InvalidHeader(String),
+
+    #[error("request timed out: {0}")]
+    Timeout(String),
+
+    #[error("transport error: {0}")]
+    Transport(String),
+
     #[error("fetch failed: {0}")]
     Fetch(String),
 }
@@ -37,6 +46,9 @@ impl Error {
             Error::UnsupportedScheme(_) => "unsupported_scheme",
             Error::UnknownFormat { .. } => "invalid_format",
             Error::UnsupportedOutput(_) => "unsupported_output",
+            Error::InvalidHeader(_) => "invalid_header",
+            Error::Timeout(_) => "timeout",
+            Error::Transport(_) => "transport_error",
             Error::Fetch(_) => "fetch_error",
         }
     }

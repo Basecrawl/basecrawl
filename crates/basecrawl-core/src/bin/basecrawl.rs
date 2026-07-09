@@ -5,6 +5,7 @@
 //! run never emits a partial ScrapeProof on stdout.
 
 use basecrawl_core::error::Error;
+use basecrawl_core::fetch::{parse_header, DEFAULT_TIMEOUT_SECS};
 use basecrawl_core::{format, scrape, ScrapeOptions};
 use clap::Parser;
 
@@ -29,6 +30,14 @@ struct Cli {
     #[arg(long, value_name = "NONCE")]
     nonce: Option<String>,
 
+    /// Custom request header 'Name: Value', repeatable, sent to the origin.
+    #[arg(long = "header", value_name = "HEADER")]
+    headers: Vec<String>,
+
+    /// Whole-request timeout in seconds; a slower endpoint aborts near this bound.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_name = "SECONDS")]
+    timeout: u64,
+
     /// Output format for the emitted proof (only "json" is supported).
     #[arg(long, default_value = "json", value_name = "OUTPUT")]
     output: String,
@@ -47,10 +56,19 @@ fn run(cli: Cli) -> Result<String, Error> {
         _ => format::default_set(),
     };
 
+    // Parse custom headers before any fetch so a malformed header never triggers a network request.
+    let headers = cli
+        .headers
+        .iter()
+        .map(|spec| parse_header(spec))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let options = ScrapeOptions {
         formats,
         task_id: cli.task_id,
         nonce: cli.nonce,
+        timeout_secs: cli.timeout,
+        headers,
     };
 
     let proof = scrape(&raw_url, &options)?;
