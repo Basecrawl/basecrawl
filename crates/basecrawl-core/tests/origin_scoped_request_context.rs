@@ -82,7 +82,15 @@ fn scrape_with_credentials(target: &str, formats: &str, no_js: bool) -> Value {
 /// browser coverage exercises the remaining caller-secret classes while direct coverage below also
 /// proves that proxy credentials are stripped on a cross-origin redirect.
 fn scrape_browser_with_credentials(target: &str, formats: &str) -> Value {
-    let output = run(&[
+    scrape_browser_with_options(target, formats, false)
+}
+
+fn scrape_paginated_browser_with_credentials(target: &str, formats: &str) -> Value {
+    scrape_browser_with_options(target, formats, true)
+}
+
+fn scrape_browser_with_options(target: &str, formats: &str, follow_pagination: bool) -> Value {
+    let mut args = vec![
         target,
         "--formats",
         formats,
@@ -94,7 +102,11 @@ fn scrape_browser_with_credentials(target: &str, formats: &str) -> Value {
         "Cookie: session=caller-origin-cookie",
         "--header",
         "X-Policy-Secret: caller-origin-custom-secret",
-    ]);
+    ];
+    if follow_pagination {
+        args.extend(["--follow-pagination", "--max-pages", "2"]);
+    }
+    let output = run(&args);
     assert!(
         output.status.success(),
         "credential-scoped browser scrape must succeed: {}",
@@ -213,6 +225,39 @@ fn serve_primary(
             };
             write_response(peer, "200 OK", "", &html(marker));
         }
+        "/pagination-cross-start" => {
+            let page = html(&format!(
+                "{SAME_ORIGIN_AUTHENTICATED}<a rel=\"next\" href=\"{secondary}/pagination-cross-next\">Next</a>"
+            ));
+            write_response(peer, "200 OK", "", &page);
+        }
+        "/pagination-same-start" => {
+            let page = html(
+                &format!(
+                    "{SAME_ORIGIN_AUTHENTICATED}<a rel=\"next\" href=\"/pagination-same-next\">Next</a>"
+                ),
+            );
+            write_response(peer, "200 OK", "", &page);
+        }
+        "/pagination-same-next" => {
+            let marker = if has_browser_caller_credentials(&headers) {
+                SAME_ORIGIN_AUTHENTICATED
+            } else {
+                SAME_ORIGIN_ANONYMOUS
+            };
+            let page = html(&format!(
+                "{marker}<script src=\"/pagination-same-subresource\"></script>"
+            ));
+            write_response(peer, "200 OK", "", &page);
+        }
+        "/pagination-same-subresource" => {
+            write_response(
+                peer,
+                "200 OK",
+                "",
+                "window.paginationSameSubresourceLoaded = true;",
+            );
+        }
         "/cross-subresources" => {
             let page = format!(
                 "<!doctype html><html><body><main>{SAME_ORIGIN_AUTHENTICATED}</main>\
@@ -254,6 +299,25 @@ fn serve_secondary(stream: TcpStream, state: Arc<OriginState>) {
                 CROSS_ORIGIN_ANONYMOUS
             };
             write_response(peer, "200 OK", "", &html(marker));
+        }
+        "/pagination-cross-next" => {
+            let marker = if has_any_caller_credential(&headers) {
+                CROSS_ORIGIN_AUTHENTICATED
+            } else {
+                CROSS_ORIGIN_ANONYMOUS
+            };
+            let page = html(&format!(
+                "{marker}<script src=\"/pagination-cross-subresource\"></script>"
+            ));
+            write_response(peer, "200 OK", "", &page);
+        }
+        "/pagination-cross-subresource" => {
+            write_response(
+                peer,
+                "200 OK",
+                "",
+                "window.paginationCrossSubresourceLoaded = true;",
+            );
         }
         "/image" => write_response(peer, "200 OK", "", "image bytes"),
         "/script.js" => write_response(peer, "200 OK", "", "window.crossScriptLoaded = true;"),
@@ -494,5 +558,66 @@ fn rendered_formats_start_at_the_direct_terminal_resource_and_remain_anonymous_c
     assert_requests_lack_credentials(
         &requests_at(&fixture.secondary_state, "/terminal"),
         "the terminal direct, rendered, and screenshot origin",
+    );
+}
+
+#[test]
+fn paginated_rendering_preserves_the_initiating_credential_origin() {
+    let fixture = fixture();
+    let cross_origin_start = format!("{}/pagination-cross-start", fixture.primary);
+    let proof = scrape_paginated_browser_with_credentials(&cross_origin_start, "markdown,html");
+
+    let markdown = proof["result"]["formats_produced"]["markdown"]
+        .as_str()
+        .expect("paginated markdown");
+    assert!(
+        markdown.contains(CROSS_ORIGIN_ANONYMOUS),
+        "cross-origin paginated output must represent the anonymous next page"
+    );
+    assert!(
+        !markdown.contains(CROSS_ORIGIN_AUTHENTICATED),
+        "cross-origin paginated output must not render a credentialed next page"
+    );
+    assert_eq!(
+        proof["result"]["crawled_urls"],
+        serde_json::json!([
+            cross_origin_start,
+            format!("{}/pagination-cross-next", fixture.secondary),
+        ]),
+        "pagination must retain the discovered cross-origin next URL"
+    );
+    assert_requests_lack_credentials(
+        &requests_at(&fixture.secondary_state, "/pagination-cross-next"),
+        "the cross-origin paginated document",
+    );
+    assert_requests_lack_credentials(
+        &requests_at(&fixture.secondary_state, "/pagination-cross-subresource"),
+        "a cross-origin paginated subresource",
+    );
+
+    let same_origin_start = format!("{}/pagination-same-start", fixture.primary);
+    let proof = scrape_paginated_browser_with_credentials(&same_origin_start, "markdown,html");
+    let markdown = proof["result"]["formats_produced"]["markdown"]
+        .as_str()
+        .expect("same-origin paginated markdown");
+    assert!(
+        markdown.contains(SAME_ORIGIN_AUTHENTICATED),
+        "same-origin paginated output must retain authenticated content"
+    );
+    assert_eq!(
+        proof["result"]["crawled_urls"],
+        serde_json::json!([
+            same_origin_start,
+            format!("{}/pagination-same-next", fixture.primary),
+        ]),
+        "pagination must retain the discovered same-origin next URL"
+    );
+    assert_requests_have_browser_credentials(
+        &requests_at(&fixture.primary_state, "/pagination-same-next"),
+        "the same-origin paginated document",
+    );
+    assert_requests_have_browser_credentials(
+        &requests_at(&fixture.primary_state, "/pagination-same-subresource"),
+        "a same-origin paginated subresource",
     );
 }
