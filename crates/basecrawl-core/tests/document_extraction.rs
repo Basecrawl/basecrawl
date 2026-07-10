@@ -10,6 +10,8 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 use std::thread;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
 const PDF_SENTINEL: &str = "Basecrawl PDF document sentinel";
@@ -100,9 +102,42 @@ fn malformed_office_document_fails_with_a_structured_extraction_error() {
     let url = format!("{}/malformed.docx", server_base());
     let output = run(&[&url, "--formats", "markdown,metadata", "--no-js"]);
 
+    assert_document_extraction_error(&output, "could not open office package");
+}
+
+#[test]
+fn empty_pdf_fails_with_a_structured_extraction_error() {
+    let url = format!("{}/empty.pdf", server_base());
+    let output = run(&[&url, "--formats", "markdown,metadata", "--no-js"]);
+
+    assert_document_extraction_error(&output, "PDF contains no extractable text");
+}
+
+#[test]
+fn semantically_empty_office_documents_fail_with_a_structured_extraction_error() {
+    for path in ["empty.docx", "empty.odt"] {
+        let url = format!("{}/{path}", server_base());
+        let output = run(&[&url, "--formats", "markdown,metadata", "--no-js"]);
+
+        assert_document_extraction_error(&output, "office document contains no extractable text");
+    }
+}
+
+#[test]
+fn compressed_office_parser_work_over_limit_fails_before_parsing() {
+    let url = format!("{}/parser-work-limit.docx", server_base());
+    let output = run(&[&url, "--formats", "markdown,metadata", "--no-js"]);
+
+    assert_document_extraction_error(
+        &output,
+        "office package exceeds 16777216-byte cumulative uncompressed limit",
+    );
+}
+
+fn assert_document_extraction_error(output: &Output, expected_message: &str) {
     assert!(
         !output.status.success(),
-        "malformed document must not be accepted as an empty successful scrape"
+        "document must not be accepted as an empty successful scrape"
     );
     assert!(
         output.stdout.is_empty(),
@@ -111,6 +146,12 @@ fn malformed_office_document_fails_with_a_structured_extraction_error() {
     let error: Value = serde_json::from_slice(&output.stderr)
         .unwrap_or_else(|parse_error| panic!("stderr must be structured JSON: {parse_error}"));
     assert_eq!(error["error"]["kind"], "document_extraction");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(expected_message)),
+        "expected error message containing {expected_message:?}, got: {error}"
+    );
 }
 
 fn server_base() -> &'static str {
@@ -169,6 +210,10 @@ fn fixture(path: &str) -> (&'static str, Vec<u8>) {
         "/document.pdf" => ("application/pdf", minimal_pdf(PDF_SENTINEL)),
         "/document.docx" => (DOCX_CONTENT_TYPE, docx()),
         "/document.odt" => (ODT_CONTENT_TYPE, odt()),
+        "/empty.pdf" => ("application/pdf", minimal_pdf("")),
+        "/empty.docx" => (DOCX_CONTENT_TYPE, docx_with_text("")),
+        "/empty.odt" => (ODT_CONTENT_TYPE, odt_with_text("")),
+        "/parser-work-limit.docx" => (DOCX_CONTENT_TYPE, parser_work_limit_docx()),
         "/malformed.docx" => (DOCX_CONTENT_TYPE, b"this is not a ZIP document".to_vec()),
         _ => ("text/plain", b"not found".to_vec()),
     }
@@ -202,6 +247,10 @@ fn minimal_pdf(text: &str) -> Vec<u8> {
 }
 
 fn docx() -> Vec<u8> {
+    docx_with_text(DOCX_SENTINEL)
+}
+
+fn docx_with_text(text: &str) -> Vec<u8> {
     zip_stored(&[
         (
             "[Content_Types].xml",
@@ -210,22 +259,67 @@ fn docx() -> Vec<u8> {
         (
             "word/document.xml",
             &format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{DOCX_SENTINEL}</w:t></w:r></w:p></w:body></w:document>"#
+                r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"#
             ),
         ),
     ])
 }
 
 fn odt() -> Vec<u8> {
+    odt_with_text(ODT_SENTINEL)
+}
+
+fn odt_with_text(text: &str) -> Vec<u8> {
     zip_stored(&[
         ("mimetype", "application/vnd.oasis.opendocument.text"),
         (
             "content.xml",
             &format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:p>{ODT_SENTINEL}</text:p></office:text></office:body></office:document-content>"#
+                r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:p>{text}</text:p></office:text></office:body></office:document-content>"#
             ),
         ),
     ])
+}
+
+fn parser_work_limit_docx() -> Vec<u8> {
+    const PART_COUNT: usize = 5;
+    const COMMENT_BYTES: usize = 3_500_000;
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    writer
+        .start_file("[Content_Types].xml", options)
+        .expect("start content types");
+    writer
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#,
+        )
+        .expect("write content types");
+
+    for part in 0..PART_COUNT {
+        writer
+            .start_file(format!("word/header{part}.xml"), options)
+            .expect("start XML part");
+        let comment = "x".repeat(COMMENT_BYTES);
+        writer
+            .write_all(
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><!--{comment}--></w:document>"#
+                )
+                .as_bytes(),
+            )
+            .expect("write XML part");
+    }
+
+    let archive = writer
+        .finish()
+        .expect("finish compressed package")
+        .into_inner();
+    assert!(
+        archive.len() < 1024 * 1024,
+        "fixture must be a materially compressed multi-part package"
+    );
+    archive
 }
 
 fn zip_stored(entries: &[(&str, &str)]) -> Vec<u8> {

@@ -16,6 +16,11 @@ const MAX_OFFICE_PART_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OFFICE_TEXT_BYTES: usize = 4 * 1024 * 1024;
 /// Archive metadata must not make document inspection unbounded.
 const MAX_OFFICE_ARCHIVE_ENTRIES: usize = 10_000;
+/// Cumulative uncompressed archive bytes accepted before any office XML is decompressed or parsed.
+///
+/// This applies to every ZIP member, including non-text members, so a compressed package cannot
+/// hide excessive work behind many individually valid parts.
+const MAX_OFFICE_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
 /// Bound the amount of decompression and XML parsing attempted for one package.
 const MAX_OFFICE_TEXT_PARTS: usize = 256;
 
@@ -25,9 +30,15 @@ const MAX_OFFICE_TEXT_PARTS: usize = 256;
 /// structured failure without leaking or dumping malformed binary data.
 pub fn extract(body: &[u8], kind: DocumentKind) -> Result<String, String> {
     match kind {
-        DocumentKind::Pdf => pdf_extract::extract_text_from_mem(body)
-            .map(|text| normalize_text(&text))
-            .map_err(|error| format!("could not extract PDF text: {error}")),
+        DocumentKind::Pdf => {
+            let text = pdf_extract::extract_text_from_mem(body)
+                .map_err(|error| format!("could not extract PDF text: {error}"))?;
+            let text = normalize_text(&text);
+            if text.is_empty() {
+                return Err("PDF contains no extractable text".to_string());
+            }
+            Ok(text)
+        }
         DocumentKind::Office => extract_office(body),
     }
 }
@@ -40,29 +51,47 @@ fn extract_office(body: &[u8]) -> Result<String, String> {
             "office package has more than {MAX_OFFICE_ARCHIVE_ENTRIES} entries"
         ));
     }
-    let mut extracted = String::new();
-    let mut parts_found = 0usize;
-
+    let mut text_parts = Vec::new();
+    let mut archive_bytes = 0u64;
     for index in 0..archive.len() {
-        let name = {
+        let (name, size) = {
             let file = archive
                 .by_index(index)
                 .map_err(|error| format!("could not inspect office package: {error}"))?;
-            file.name().to_owned()
+            (file.name().to_owned(), file.size())
         };
-        if !is_text_part(&name) {
-            continue;
+        add_capped_bytes(
+            &mut archive_bytes,
+            size,
+            MAX_OFFICE_ARCHIVE_BYTES,
+            "office package",
+        )?;
+        if is_text_part(&name) {
+            text_parts.push(index);
         }
-        if parts_found == MAX_OFFICE_TEXT_PARTS {
-            return Err(format!(
-                "office package has more than {MAX_OFFICE_TEXT_PARTS} text parts"
-            ));
-        }
-        parts_found += 1;
+    }
+
+    if text_parts.is_empty() {
+        return Err("office package contains no recognized text XML parts".to_string());
+    }
+    if text_parts.len() > MAX_OFFICE_TEXT_PARTS {
+        return Err(format!(
+            "office package has more than {MAX_OFFICE_TEXT_PARTS} text parts"
+        ));
+    }
+
+    let mut extracted = String::new();
+    let mut parser_work_bytes = 0u64;
+    for index in text_parts {
         let mut file = archive
             .by_index(index)
             .map_err(|error| format!("could not open office XML part: {error}"))?;
-        let bytes = read_capped_part(&mut file)?;
+        if file.size() > MAX_OFFICE_PART_BYTES {
+            return Err(format!(
+                "office XML part exceeds {MAX_OFFICE_PART_BYTES}-byte limit"
+            ));
+        }
+        let bytes = read_capped_part(&mut file, &mut parser_work_bytes)?;
         let source = std::str::from_utf8(&bytes)
             .map_err(|error| format!("office XML part was not UTF-8: {error}"))?;
         append_text(&mut extracted, &xml_text(source)?);
@@ -73,11 +102,12 @@ fn extract_office(body: &[u8]) -> Result<String, String> {
         }
     }
 
-    if parts_found == 0 {
-        return Err("office package contains no recognized text XML parts".to_string());
+    let text = normalize_text(&extracted);
+    if text.is_empty() {
+        return Err("office document contains no extractable text".to_string());
     }
 
-    Ok(normalize_text(&extracted))
+    Ok(text)
 }
 
 fn is_text_part(name: &str) -> bool {
@@ -96,7 +126,7 @@ fn is_text_part(name: &str) -> bool {
         || (name.starts_with("xl/worksheets/") && name.ends_with(".xml"))
 }
 
-fn read_capped_part<R: Read>(part: &mut R) -> Result<Vec<u8>, String> {
+fn read_capped_part<R: Read>(part: &mut R, parser_work_bytes: &mut u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     part.take(MAX_OFFICE_PART_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -106,7 +136,31 @@ fn read_capped_part<R: Read>(part: &mut R) -> Result<Vec<u8>, String> {
             "office XML part exceeds {MAX_OFFICE_PART_BYTES}-byte limit"
         ));
     }
+    add_capped_bytes(
+        parser_work_bytes,
+        bytes.len() as u64,
+        MAX_OFFICE_ARCHIVE_BYTES,
+        "office XML parser work",
+    )?;
     Ok(bytes)
+}
+
+fn add_capped_bytes(
+    total: &mut u64,
+    addition: u64,
+    limit: u64,
+    subject: &str,
+) -> Result<(), String> {
+    let updated = total
+        .checked_add(addition)
+        .ok_or_else(|| format!("{subject} byte accounting overflow"))?;
+    if updated > limit {
+        return Err(format!(
+            "{subject} exceeds {limit}-byte cumulative uncompressed limit"
+        ));
+    }
+    *total = updated;
+    Ok(())
 }
 
 fn xml_text(source: &str) -> Result<String, String> {
@@ -195,5 +249,23 @@ mod tests {
         }
         assert!(!is_text_part("word/styles.xml"));
         assert!(!is_text_part("xl/workbook.xml"));
+    }
+
+    #[test]
+    fn cumulative_byte_accounting_rejects_limit_excess_and_overflow() {
+        let mut total = 12;
+        let limit_error = add_capped_bytes(&mut total, 5, 16, "office package")
+            .expect_err("a cumulative limit excess must fail");
+        assert_eq!(
+            limit_error,
+            "office package exceeds 16-byte cumulative uncompressed limit"
+        );
+        assert_eq!(total, 12, "rejected accounting must not change the total");
+
+        let mut total = u64::MAX;
+        let overflow = add_capped_bytes(&mut total, 1, u64::MAX, "office package")
+            .expect_err("overflowing cumulative accounting must fail");
+        assert_eq!(overflow, "office package byte accounting overflow");
+        assert_eq!(total, u64::MAX, "overflow must not wrap the total");
     }
 }

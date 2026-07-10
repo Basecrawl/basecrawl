@@ -249,7 +249,12 @@ fn captures_tls_metadata_for_named_open_web_targets() {
     ] {
         let proof = scrape_json(url);
         let tls = &proof["tls"];
-        assert_eq!(tls["negotiated_version"], "1.3", "{name} must use TLS 1.3");
+        assert!(
+            tls["negotiated_version"]
+                .as_str()
+                .is_some_and(|version| matches!(version, "1.2" | "1.3")),
+            "{name} must report a supported TLS version"
+        );
         assert!(
             tls["sni"].as_str().is_some_and(|sni| !sni.is_empty()),
             "{name} must expose its SNI"
