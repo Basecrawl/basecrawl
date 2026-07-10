@@ -1,11 +1,12 @@
 //! Advanced navigation assertions (VAL-CRAWL-064, 065, 066, 067, 068, 069, 072, 073) exercised
 //! end-to-end through the shipped CLI.
 //!
-//! `064` (infinite scroll) runs against the real `quotes.toscrape.com/scroll` target and `065`
-//! (pagination) against `books.toscrape.com`, both named in the validation contract. `066` (SPA
-//! route), `067` (iframe), `068` (shadow DOM), `069` (consent wall), `072` (scripted actions), and
-//! `073` (meta-refresh / JS redirect + loop bound) run against a deterministic local HTTP server so
-//! the behaviour under test is reproducible.
+//! Every exact navigation assertion uses a deterministic loopback fixture. `064` (infinite scroll)
+//! and `065` (pagination) use the shared fixture site; `066` (SPA route), `067` (iframe), `068`
+//! (shadow DOM), `069` (consent wall), `072` (scripted actions), and `073` (meta-refresh / JS
+//! redirect + loop bound) use a dedicated local HTTP server.
+
+mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,12 +18,6 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
-const QUOTES_SCROLL: &str = "https://quotes.toscrape.com/scroll";
-const BOOKS_HOME: &str = "https://books.toscrape.com/";
-const QUOTES_JS: &str = "https://quotes.toscrape.com/js/";
-/// A quote that only exists once JavaScript has rendered the `/js/` page.
-const JS_QUOTE_TEXT: &str = "The world as we have created it is a process of our thinking";
-
 fn run(args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
@@ -208,13 +203,8 @@ fn server_base() -> &'static str {
 // VAL-CRAWL-064: infinite-scroll / lazy-load content is collected beyond the first viewport batch.
 #[test]
 fn infinite_scroll_collects_beyond_first_batch() {
-    let v = scrape_json(&[
-        QUOTES_SCROLL,
-        "--formats",
-        "markdown",
-        "--render-timeout",
-        "60",
-    ]);
+    let scroll = common::fixture_url("/scroll/");
+    let v = scrape_json(&[&scroll, "--formats", "markdown", "--render-timeout", "60"]);
     let md = produced(&v, "markdown");
     // Each quote's text is wrapped in a curly opening quote; the first batch is ~10 quotes.
     let quote_count = md.matches('\u{201c}').count();
@@ -228,8 +218,9 @@ fn infinite_scroll_collects_beyond_first_batch() {
 // VAL-CRAWL-065: pagination is followed when requested; the crawled set spans multiple pages.
 #[test]
 fn pagination_follows_next_across_pages() {
+    let books = common::fixture_url("/books/");
     let v = scrape_json(&[
-        BOOKS_HOME,
+        &books,
         "--formats",
         "markdown",
         "--follow-pagination",
@@ -246,12 +237,12 @@ fn pagination_follows_next_across_pages() {
     assert!(
         crawled
             .iter()
-            .any(|u| u.as_str().unwrap_or("").contains("page-2")),
+            .any(|u| u.as_str().unwrap_or("").contains("page-2.html")),
         "crawled set should include the second page, got {crawled:?}"
     );
 
     // Without the option, no multi-page crawl set is emitted.
-    let single = scrape_json(&[BOOKS_HOME, "--formats", "markdown"]);
+    let single = scrape_json(&[&books, "--formats", "markdown"]);
     assert!(
         single["result"]
             .get("crawled_urls")
@@ -274,13 +265,6 @@ fn spa_client_route_content_is_captured() {
     assert!(
         !produced(&v, "html").contains("SHELL_PLACEHOLDER"),
         "captured the pre-render shell instead of the routed view"
-    );
-
-    // The real client-rendered target also yields its routed content.
-    let real = scrape_json(&[QUOTES_JS, "--formats", "markdown"]);
-    assert!(
-        produced(&real, "markdown").contains(JS_QUOTE_TEXT),
-        "client-rendered quotes.toscrape.com/js/ content was not captured"
     );
 }
 

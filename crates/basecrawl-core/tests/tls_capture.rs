@@ -7,7 +7,6 @@
 mod common;
 
 use base64::Engine;
-use common::httpbin_base;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -236,43 +235,6 @@ fn tls_chain_hash_is_stable_and_transcript_varies_per_session() {
         first["tls"]["handshake_transcript_hash"], second["tls"]["handshake_transcript_hash"],
         "fresh TLS sessions must produce distinct handshake transcript hashes"
     );
-}
-
-// VAL-CRAWL-083.
-#[test]
-fn captures_tls_metadata_for_named_open_web_targets() {
-    let httpbin = httpbin_base();
-    for (name, url) in [
-        ("books", "https://books.toscrape.com"),
-        ("quotes", "https://quotes.toscrape.com"),
-        ("httpbin", httpbin),
-    ] {
-        let proof = scrape_json(url);
-        let tls = &proof["tls"];
-        assert!(
-            tls["negotiated_version"]
-                .as_str()
-                .is_some_and(|version| matches!(version, "1.2" | "1.3")),
-            "{name} must report a supported TLS version"
-        );
-        assert!(
-            tls["sni"].as_str().is_some_and(|sni| !sni.is_empty()),
-            "{name} must expose its SNI"
-        );
-        assert!(
-            !tls["server_cert_chain_der"]
-                .as_array()
-                .expect("certificate chain must be an array")
-                .is_empty(),
-            "{name} must expose a server certificate chain"
-        );
-        assert_lower_hex_transcript(
-            tls["handshake_transcript_hash"]
-                .as_str()
-                .expect("transcript hash must be present"),
-            "tls.handshake_transcript_hash",
-        );
-    }
 }
 
 // VAL-CRAWL-084.

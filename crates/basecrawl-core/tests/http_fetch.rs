@@ -3,9 +3,8 @@
 //! These exercise the response-block semantics owned by `basecrawl-http-fetch-core`: accurate
 //! status codes, decoded content-length, hash-shaped digests, transparent gzip/deflate/brotli
 //! decoding, an enforced request timeout, custom request headers, a browser-like User-Agent, and
-//! transport-level failures reported distinctly from an HTTP status. Tests run against the real
-//! open-web targets named in the validation contract (`example.com`, `books.toscrape.com`,
-//! `httpbin.org`) per the mission's "real open-web targets" directive.
+//! transport-level failures reported distinctly from an HTTP status. Exact failure status behavior
+//! uses a deterministic loopback fixture; httpbin-compatible targets cover their own API semantics.
 
 mod common;
 
@@ -85,7 +84,8 @@ fn headers_and_body_hash_are_lowercase_hex_64() {
 // VAL-CRAWL-016: 404 is recorded, not treated as a crash.
 #[test]
 fn http_404_is_recorded_with_exit_zero() {
-    let out = run(&["https://books.toscrape.com/nonexistent-xyz"]);
+    let url = common::fixture_url("/missing");
+    let out = run(&[&url, "--no-js"]);
     assert!(
         out.status.success(),
         "a 404 must still produce a well-formed proof and exit 0; stderr: {}",

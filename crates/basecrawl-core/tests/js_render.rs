@@ -1,11 +1,11 @@
 //! Headless-Chromium JS rendering core assertions (VAL-CRAWL-061, 062, 063, 070, 071) exercised
 //! end-to-end through the shipped CLI.
 //!
-//! `061` and `070` run against the real `quotes.toscrape.com/js/` target named in the validation
-//! contract (quotes are injected by JavaScript). `062` (deferred-XHR smart wait), `063` (explicit
-//! `--wait-for` selector), and `071` (never-idle render timeout) run against a deterministic local
-//! HTTP server so the timing behaviour under test is reproducible and not at the mercy of a public
-//! host.
+//! All exact behavior runs against deterministic loopback fixtures. `061` and `070` use a fixed
+//! JavaScript-injected quote page; `062` (deferred-XHR smart wait), `063` (explicit `--wait-for`
+//! selector), and `071` (never-idle render timeout) use a dedicated local HTTP server.
+
+mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,9 +17,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
-const QUOTES_JS: &str = "https://quotes.toscrape.com/js/";
 /// A quote that only exists once JavaScript has rendered the page.
-const JS_QUOTE_TEXT: &str = "The world as we have created it is a process of our thinking";
+const JS_QUOTE_TEXT: &str = "Fixture JS quote render marker";
 
 /// Distinctive markers embedded by the local server so we can prove late content was captured.
 const DEFERRED_MARKER: &str = "DEFERREDCONTENT12345";
@@ -181,7 +180,8 @@ fn server_base() -> &'static str {
 // VAL-CRAWL-061: JS-injected content is rendered into markdown and html.
 #[test]
 fn js_injected_content_is_rendered_into_markdown_and_html() {
-    let v = scrape_json(&[QUOTES_JS, "--formats", "markdown,html"]);
+    let js_url = common::fixture_url("/js/");
+    let v = scrape_json(&[&js_url, "--formats", "markdown,html"]);
     let md = produced(&v, "markdown");
     let html = produced(&v, "html");
     assert!(
@@ -194,7 +194,7 @@ fn js_injected_content_is_rendered_into_markdown_and_html() {
         "html is missing the JS-injected quote text (render not applied)"
     );
     assert!(
-        html.matches("class=\"quote\"").count() >= 5,
+        html.matches("class=\"quote\"").count() == 1,
         "post-render html is missing the JS-injected quote nodes"
     );
 }
@@ -249,13 +249,14 @@ fn wait_for_selector_blocks_capture_until_present() {
 // default (JS-enabled) run does render them.
 #[test]
 fn no_js_mode_returns_source_without_rendering() {
-    let rendered = scrape_json(&[QUOTES_JS, "--formats", "markdown,html"]);
+    let js_url = common::fixture_url("/js/");
+    let rendered = scrape_json(&[&js_url, "--formats", "markdown,html"]);
     assert!(
         produced(&rendered, "markdown").contains(JS_QUOTE_TEXT),
         "sanity: default run should render the JS quotes"
     );
 
-    let raw = scrape_json(&[QUOTES_JS, "--formats", "markdown,html,rawHtml", "--no-js"]);
+    let raw = scrape_json(&[&js_url, "--formats", "markdown,html,rawHtml", "--no-js"]);
     let md = produced(&raw, "markdown");
     let html = produced(&raw, "html");
     assert!(

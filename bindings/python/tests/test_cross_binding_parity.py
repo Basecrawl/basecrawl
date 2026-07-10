@@ -11,8 +11,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-EXAMPLE_OPTIONS = {"formats": ["markdown", "links", "metadata"], "render_enabled": False}
-QUOTE_OPTIONS = {"formats": ["markdown", "links"], "render_enabled": False}
+LOCAL_OPTIONS = {"formats": ["markdown", "links", "metadata"], "render_enabled": False}
 
 
 class StaticHandler(BaseHTTPRequestHandler):
@@ -177,19 +176,16 @@ def test_python_version_matches_cli_version() -> None:
     assert output.stdout.strip() == f"basecrawl {basecrawl.__version__}"
 
 
-def test_python_matches_cli_content_digests_and_outputs() -> None:
-    python_example = basecrawl.scrape("https://example.com", EXAMPLE_OPTIONS)
-    cli_example = cli_proof("https://example.com", EXAMPLE_OPTIONS["formats"])
+def test_python_matches_cli_content_digests_and_outputs_on_deterministic_content() -> None:
+    with static_server() as url:
+        python_proof = basecrawl.scrape(url, LOCAL_OPTIONS)
+        cli = cli_proof(url, LOCAL_OPTIONS["formats"])
 
-    assert python_example["result"]["result_hash"] == cli_example["result"]["result_hash"]
-    assert python_example["tls"]["cert_chain_hash"] == cli_example["tls"]["cert_chain_hash"]
-
-    python_quotes = basecrawl.scrape("https://quotes.toscrape.com", QUOTE_OPTIONS)
-    cli_quotes = cli_proof("https://quotes.toscrape.com", QUOTE_OPTIONS["formats"])
-
-    assert python_quotes["result"]["formats_produced"]["markdown"] == cli_quotes["result"][
+    assert python_proof["result"]["result_hash"] == cli["result"]["result_hash"]
+    assert python_proof["tls"]["cert_chain_hash"] == cli["tls"]["cert_chain_hash"]
+    assert python_proof["result"]["formats_produced"]["markdown"] == cli["result"][
         "formats_produced"
     ]["markdown"]
-    assert python_quotes["result"]["formats_produced"]["links"] == cli_quotes["result"][
+    assert python_proof["result"]["formats_produced"]["links"] == cli["result"][
         "formats_produced"
     ]["links"]

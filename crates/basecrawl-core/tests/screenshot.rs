@@ -1,10 +1,12 @@
 //! End-to-end deterministic `screenshot` format assertions (VAL-CRAWL-056..060) exercised through
-//! the shipped CLI against the real open-web targets named in the validation contract.
+//! the shipped CLI against a stable open-web target and a deterministic loopback tall-page fixture.
 //!
 //! The screenshot is surfaced as a base64 PNG in `result.formats_produced.screenshot`; these tests
 //! decode it with a real PNG decoder to assert validity and dimensions. The screenshot must be
 //! byte-deterministic across identical runs and must stay outside the deterministic `result_hash`
 //! quorum surface.
+
+mod common;
 
 use base64::Engine;
 use serde_json::Value;
@@ -12,7 +14,6 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
 const EXAMPLE: &str = "https://example.com/";
-const BOOKS: &str = "https://books.toscrape.com/";
 
 fn run(args: &[&str]) -> Output {
     Command::new(BIN)
@@ -108,8 +109,9 @@ fn requested_viewport_width_is_honored() {
 #[test]
 fn full_page_capture_exceeds_viewport_height() {
     let viewport_height = 800;
+    let tall = common::fixture_url("/tall/");
     let v = scrape_json(&[
-        BOOKS,
+        &tall,
         "--formats",
         "screenshot",
         "--viewport",

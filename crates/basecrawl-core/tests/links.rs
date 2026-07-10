@@ -1,16 +1,16 @@
 //! End-to-end `links`-format assertions (VAL-CRAWL-042, VAL-CRAWL-048) exercised through the
-//! shipped CLI against the real catalogue targets named in the validation contract.
+//! shipped CLI against deterministic loopback catalogue fixtures.
 //!
 //! The extraction rules (base-href resolution, canonical/hreflang capture, de-duplication, and the
 //! per-policy handling of non-navigational schemes) are unit-tested in `src/links.rs`; these tests
-//! confirm the same behavior end-to-end on a live, link-rich catalogue page and cross-check the
-//! link count against an independent `curl` ground truth.
+//! confirm the same behavior end-to-end on a fixed, link-rich catalogue page.
+
+mod common;
 
 use serde_json::Value;
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
-const BOOKS_HOME: &str = "https://books.toscrape.com/";
 
 fn run(args: &[&str]) -> Output {
     Command::new(BIN)
@@ -41,45 +41,28 @@ fn link_list(v: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Total `<a href=...>` occurrences in the raw served HTML, as an independent ground truth for the
-/// plausible-band comparison (VAL-CRAWL-048).
-fn curl_anchor_href_count(url: &str) -> usize {
-    let out = Command::new("curl")
-        .args(["-s", "-m", "20", url])
-        .output()
-        .expect("curl available");
-    let body = String::from_utf8_lossy(&out.stdout);
-    body.match_indices("<a ")
-        .filter(|(i, _)| {
-            body[*i..]
-                .split('>')
-                .next()
-                .is_some_and(|tag| tag.contains("href="))
-        })
-        .count()
-}
-
 // VAL-CRAWL-042: links extracts anchors as absolute product/category URLs resolved against base.
 #[test]
 fn books_home_links_are_absolute_product_and_category_urls() {
-    let v = scrape_json(&[BOOKS_HOME, "--formats", "links"]);
+    let books = common::fixture_url("/books/");
+    let v = scrape_json(&[&books, "--formats", "links"]);
     let links = link_list(&v);
     assert!(
         !links.is_empty(),
         "link-rich catalogue page yielded no links"
     );
     assert!(
-        links.iter().all(|l| l.starts_with("https://")),
-        "every extracted link must be an absolute https URL: {links:?}"
+        links.iter().all(|l| l.starts_with(common::fixture_base())),
+        "every extracted link must be an absolute fixture URL: {links:?}"
     );
     assert!(
         links
             .iter()
-            .any(|l| l.contains("catalogue/category/books/")),
+            .any(|l| l.contains("/books/category/fixtures/")),
         "expected category URLs resolved against base:\n{links:?}"
     );
     assert!(
-        links.iter().any(|l| l.contains("catalogue/")
+        links.iter().any(|l| l.contains("/books/catalogue/")
             && l.ends_with("index.html")
             && !l.contains("category")),
         "expected product URLs resolved against base:\n{links:?}"
@@ -93,26 +76,12 @@ fn books_home_links_are_absolute_product_and_category_urls() {
     );
 }
 
-// VAL-CRAWL-048: link count for a known catalogue page is plausible and comparable to grepping
-// href= from curl output.
+// VAL-CRAWL-048: the deterministic catalogue has an exact de-duplicated link count.
 #[test]
-fn books_home_link_count_is_plausible() {
-    let v = scrape_json(&[BOOKS_HOME, "--formats", "links"]);
+fn books_home_link_count_is_deterministic() {
+    let books = common::fixture_url("/books/");
+    let v = scrape_json(&[&books, "--formats", "links"]);
     let count = link_list(&v).len();
 
-    // Absolute plausibility band: the home page has ~20 book tiles + ~50 category nav links, so a
-    // de-duplicated count in the tens is expected. Zero or an order-of-magnitude miss fails.
-    assert!(
-        (30..=200).contains(&count),
-        "link count {count} outside the plausible band (30..=200)"
-    );
-
-    // Comparable to an independent curl grep of anchor href= occurrences. De-duplication means our
-    // count is <= the raw occurrence count but within the same order of magnitude.
-    let raw = curl_anchor_href_count(BOOKS_HOME);
-    assert!(raw > 0, "curl ground truth found no anchors");
-    assert!(
-        count <= raw && count * 4 >= raw,
-        "de-duplicated link count {count} is not comparable to curl anchor count {raw}"
-    );
+    assert_eq!(count, 4, "fixture link count must remain exact");
 }

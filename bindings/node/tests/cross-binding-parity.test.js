@@ -6,12 +6,8 @@ const test = require("node:test");
 const { scrape, version } = require("..");
 
 const root = path.resolve(__dirname, "../../..");
-const exampleOptions = {
+const localOptions = {
   formats: ["markdown", "links", "metadata"],
-  renderEnabled: false,
-};
-const quoteOptions = {
-  formats: ["markdown", "links"],
   renderEnabled: false,
 };
 
@@ -84,7 +80,7 @@ function startStaticFixture() {
     "http.createServer((_, response) => {",
     '  response.writeHead(200, {"Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(body), Connection: "close"});',
     "  response.end(body);",
-    '}).listen(21092, "127.0.0.1", function () { console.log(this.address().port); });',
+    '}).listen(0, "127.0.0.1", function () { console.log(this.address().port); });',
   ].join("\n");
 
   return new Promise((resolve, reject) => {
@@ -99,7 +95,15 @@ function startStaticFixture() {
     child.stdout.once("data", (chunk) => {
       resolve({
         url: `http://127.0.0.1:${chunk.toString().trim()}/`,
-        stop: () => child.kill(),
+        stop: () =>
+          new Promise((stopResolve) => {
+            if (child.exitCode !== null || child.signalCode !== null) {
+              stopResolve();
+              return;
+            }
+            child.once("exit", stopResolve);
+            child.kill();
+          }),
       });
     });
     child.once("exit", (code) => {
@@ -110,21 +114,22 @@ function startStaticFixture() {
   });
 }
 
-test("Node matches CLI content digests and outputs", () => {
-  const nodeExample = scrape("https://example.com", exampleOptions);
-  const cliExample = cliProof("https://example.com", exampleOptions.formats);
+test("Node matches CLI content digests and outputs on deterministic content", async () => {
+  const fixture = await startStaticFixture();
+  try {
+    const nodeProof = scrape(fixture.url, localOptions);
+    const cli = cliProof(fixture.url, localOptions.formats);
 
-  assert.equal(nodeExample.result.result_hash, cliExample.result.result_hash);
-  assert.equal(nodeExample.tls.cert_chain_hash, cliExample.tls.cert_chain_hash);
-
-  const nodeQuotes = scrape("https://quotes.toscrape.com", quoteOptions);
-  const cliQuotes = cliProof("https://quotes.toscrape.com", quoteOptions.formats);
-
-  assert.equal(
-    nodeQuotes.result.formats_produced.markdown,
-    cliQuotes.result.formats_produced.markdown,
-  );
-  assert.deepEqual(nodeQuotes.result.formats_produced.links, cliQuotes.result.formats_produced.links);
+    assert.equal(nodeProof.result.result_hash, cli.result.result_hash);
+    assert.equal(nodeProof.tls.cert_chain_hash, cli.tls.cert_chain_hash);
+    assert.equal(
+      nodeProof.result.formats_produced.markdown,
+      cli.result.formats_produced.markdown,
+    );
+    assert.deepEqual(nodeProof.result.formats_produced.links, cli.result.formats_produced.links);
+  } finally {
+    await fixture.stop();
+  }
 });
 
 test("Node and CLI emit byte-identical canonical JSON after volatile fields are removed", async () => {
@@ -142,7 +147,7 @@ test("Node and CLI emit byte-identical canonical JSON after volatile fields are 
       canonicalWire(withoutVolatileFields(JSON.parse(cli.stdout))),
     );
   } finally {
-    fixture.stop();
+    await fixture.stop();
   }
 });
 
@@ -171,7 +176,7 @@ test("Node and CLI normalize format selection identically", async () => {
       );
     }
   } finally {
-    fixture.stop();
+    await fixture.stop();
   }
 });
 

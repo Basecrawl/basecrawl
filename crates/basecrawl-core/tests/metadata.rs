@@ -1,9 +1,11 @@
-//! Integration tests for the `metadata` format against real open-web targets.
+//! Integration tests for the `metadata` format against deterministic loopback fixtures.
 //!
 //! These exercise the full `scrape()` wiring (fetch + charset-from-header + metadata extraction),
 //! not the extractor in isolation, so they confirm the end-to-end metadata surface a validator
 //! sees via the CLI/SDK. OpenGraph/Twitter, robots, and duplicate-key behavior are covered by the
 //! crafted-HTML unit tests in `src/metadata.rs` (the named public targets carry none of those).
+
+mod common;
 
 use basecrawl_core::{scrape, Format, ScrapeOptions};
 
@@ -22,9 +24,10 @@ fn scrape_metadata(url: &str) -> serde_json::Value {
 }
 
 #[test]
-fn quotes_metadata_reports_title_language_charset_source_and_status() {
-    let meta = scrape_metadata("https://quotes.toscrape.com/");
-    assert_eq!(meta["title"], "Quotes to Scrape");
+fn fixture_metadata_reports_title_language_charset_source_and_status() {
+    let url = common::fixture_url("/quotes/");
+    let meta = scrape_metadata(&url);
+    assert_eq!(meta["title"], "Fixture Quotes");
     assert_eq!(meta["language"], "en");
     assert_eq!(meta["charset"], "utf-8");
     assert_eq!(meta["statusCode"], serde_json::json!(200));
@@ -32,7 +35,7 @@ fn quotes_metadata_reports_title_language_charset_source_and_status() {
         meta["sourceURL"]
             .as_str()
             .unwrap()
-            .contains("quotes.toscrape.com"),
+            .contains(common::fixture_base()),
         "sourceURL should be the requested URL: {}",
         meta["sourceURL"]
     );
