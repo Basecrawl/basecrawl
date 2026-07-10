@@ -29,8 +29,12 @@ fn run(args: &[&str]) -> Output {
 }
 
 fn scrape(path: &str) -> Value {
+    scrape_with_formats(path, "markdown,rawHtml,metadata")
+}
+
+fn scrape_with_formats(path: &str, formats: &str) -> Value {
     let url = format!("{}/{path}", server_base());
-    let output = run(&[&url, "--formats", "markdown,rawHtml,metadata", "--no-js"]);
+    let output = run(&[&url, "--formats", formats, "--no-js"]);
     assert!(
         output.status.success(),
         "expected exit 0, got {:?}\nstderr: {}",
@@ -106,20 +110,68 @@ fn malformed_office_document_fails_with_a_structured_extraction_error() {
 }
 
 #[test]
-fn empty_pdf_fails_with_a_structured_extraction_error() {
-    let url = format!("{}/empty.pdf", server_base());
-    let output = run(&[&url, "--formats", "markdown,metadata", "--no-js"]);
-
-    assert_document_extraction_error(&output, "PDF contains no extractable text");
+fn empty_documents_fail_for_every_requested_format_surface() {
+    for (path, expected_message) in [
+        ("empty.pdf", "PDF contains no extractable text"),
+        ("empty.docx", "office document contains no extractable text"),
+        ("empty.odt", "office document contains no extractable text"),
+    ] {
+        let url = format!("{}/{path}", server_base());
+        for formats in [
+            "rawHtml,metadata",
+            "links,metadata",
+            "markdown,metadata",
+            "html,metadata",
+        ] {
+            let output = run(&[&url, "--formats", formats, "--no-js"]);
+            assert_document_extraction_error(&output, expected_message);
+        }
+    }
 }
 
 #[test]
-fn semantically_empty_office_documents_fail_with_a_structured_extraction_error() {
-    for path in ["empty.docx", "empty.odt"] {
-        let url = format!("{}/{path}", server_base());
-        let output = run(&[&url, "--formats", "markdown,metadata", "--no-js"]);
+fn non_empty_documents_succeed_without_text_formats_and_keep_binary_out_of_raw_html() {
+    for (path, content_type) in [
+        ("document.pdf", "application/pdf"),
+        ("document.docx", DOCX_CONTENT_TYPE),
+        ("document.odt", ODT_CONTENT_TYPE),
+    ] {
+        let raw_html_proof = scrape_with_formats(path, "rawHtml,metadata");
+        let raw_html_formats = raw_html_proof["result"]["formats_produced"]
+            .as_object()
+            .expect("formats_produced must be an object");
+        assert_eq!(
+            raw_html_formats.len(),
+            2,
+            "only requested non-text formats should be present"
+        );
+        assert_eq!(raw_html_proof["response"]["status_code"], 200);
+        assert_eq!(raw_html_proof["result"]["formats_produced"]["rawHtml"], "");
+        assert!(
+            raw_html_formats.get("markdown").is_none() && raw_html_formats.get("html").is_none(),
+            "a non-text request must not emit a text format"
+        );
+        assert_document_content_type(&raw_html_proof, content_type);
 
-        assert_document_extraction_error(&output, "office document contains no extractable text");
+        let links_proof = scrape_with_formats(path, "links,metadata");
+        let links_formats = links_proof["result"]["formats_produced"]
+            .as_object()
+            .expect("formats_produced must be an object");
+        assert_eq!(
+            links_formats.len(),
+            2,
+            "only requested non-text formats should be present"
+        );
+        assert_eq!(links_proof["response"]["status_code"], 200);
+        assert!(
+            links_formats.get("links").is_some(),
+            "links output must remain available for non-empty documents"
+        );
+        assert!(
+            links_formats.get("markdown").is_none() && links_formats.get("html").is_none(),
+            "a non-text request must not emit a text format"
+        );
+        assert_document_content_type(&links_proof, content_type);
     }
 }
 

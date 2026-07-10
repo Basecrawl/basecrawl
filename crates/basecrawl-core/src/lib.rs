@@ -183,12 +183,12 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     // producers. The resolution base is the terminal (post-redirect) URL so relative links/images
     // resolve correctly; a document `<base href>` overrides it inside each producer.
     let content_kind = content::classify(fetched.content_type.as_deref());
+    // Classification and semantic validation are independent of requested output formats. This
+    // invokes bounded extraction once for every recognized document so malformed or empty
+    // documents cannot succeed through metadata-, links-, or rawHtml-only requests. The extracted
+    // text remains emitted only by the markdown and HTML branches below.
     let document_text = match content_kind {
-        ContentKind::Document(kind)
-            if formats
-                .iter()
-                .any(|format| matches!(format, Format::Markdown | Format::Html)) =>
-        {
+        ContentKind::Document(kind) => {
             Some(document::extract(&fetched.body, kind).map_err(Error::DocumentExtraction)?)
         }
         _ => None,
