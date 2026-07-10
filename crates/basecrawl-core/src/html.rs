@@ -47,6 +47,9 @@ pub fn render_page_until(
             max,
             url: url.to_string(),
         }),
+        Err(RenderError::PacingDeadlineExceeded) => Err(Error::Timeout(
+            "scrape deadline exceeded while waiting for crawl delay".to_string(),
+        )),
         Err(RenderError::ResourceBudgetExceeded) => Err(Error::ResourceBudgetExceeded),
         Err(RenderError::DocumentPolicyDenied(detail)) => {
             Err(Error::from_document_policy_denial(detail))

@@ -73,11 +73,18 @@ pub enum ModifierKey {
     Shift = 8,
 }
 
-#[derive(Debug)]
 pub enum RequestPausedDecision {
     Fulfill(FulfillRequest),
     Fail(FailRequest),
     Continue(Option<ContinueRequest>),
+    /// Delegate handling to a worker thread. This keeps the target-event loop responsive while
+    /// allowing consumers to serialize policy or pacing work around the actual CDP continuation.
+    ///
+    /// The handler receives the transport, target session, and paused event so it can send
+    /// `Fetch.continueRequest` itself at the precise point its policy permits transmission.
+    Deferred(
+        Arc<dyn Fn(Arc<Transport>, SessionId, RequestPausedEvent) + Send + Sync>,
+    ),
 }
 
 #[rustfmt::skip]
@@ -399,6 +406,14 @@ impl Tab {
                             RequestPausedDecision::Fail(fail_request) => transport
                                 .call_method_on_target(session_id.clone(), fail_request)
                                 .map(|_| ()),
+                            RequestPausedDecision::Deferred(handler) => {
+                                let transport = Arc::clone(&transport);
+                                let session_id = session_id.clone();
+                                thread::spawn(move || {
+                                    handler(transport, session_id, event);
+                                });
+                                Ok(())
+                            }
                         };
                         if result.is_err() {
                             warn!("Tried to handle request after connection was closed");

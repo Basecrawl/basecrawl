@@ -9,13 +9,14 @@
 use crate::error::Error;
 use base64::Engine;
 use basecrawl_proof::{RedirectHop, Tls};
+use basecrawl_render::{OriginPacer, PacingDeadlineExceeded};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ClientConnection, Resumption, WebPkiServerVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
@@ -78,7 +79,9 @@ pub struct FetchConfig {
     /// limiter applies across redirects, robots, sitemaps, and pagination fetches that reuse this
     /// config.
     pub crawl_delay: Duration,
-    pub(crate) origin_limiter: Arc<OriginLimiter>,
+    /// Crawl-wide direct/browser transmission scheduler. Direct fetches and CDP continuations
+    /// share this state, so a screenshot or render cannot bypass the prior request's crawl delay.
+    pub(crate) origin_pacer: OriginPacer,
 }
 
 impl Default for FetchConfig {
@@ -91,65 +94,21 @@ impl Default for FetchConfig {
             insecure: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             crawl_delay: Duration::ZERO,
-            origin_limiter: Arc::new(OriginLimiter::default()),
+            origin_pacer: OriginPacer::default(),
         }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct OriginLimiter {
-    last_request_at: Mutex<HashMap<Origin, Instant>>,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Origin {
-    scheme: String,
-    host: String,
-    port: u16,
-}
-
-impl OriginLimiter {
-    fn wait_for_turn(&self, url: &Url, delay: Duration, deadline: Instant) -> Result<(), Error> {
-        if delay.is_zero() {
-            return Ok(());
-        }
-        let Some(host) = url.host_str() else {
-            return Ok(());
-        };
-        let Some(port) = url.port_or_known_default() else {
-            return Ok(());
-        };
-        let origin = Origin {
-            scheme: url.scheme().to_ascii_lowercase(),
-            host: host.to_ascii_lowercase(),
-            port,
-        };
-        let mut requests = self
-            .last_request_at
-            .lock()
-            .expect("origin limiter mutex must not be poisoned");
-        if let Some(previous) = requests.get(&origin) {
-            let elapsed = previous.elapsed();
-            if elapsed < delay {
-                let wait = delay - elapsed;
-                if wait >= remaining(deadline)? {
-                    return Err(deadline_elapsed());
-                }
-                thread::sleep(wait);
-            }
-        }
-        requests.insert(origin, Instant::now());
-        Ok(())
     }
 }
 
 impl FetchConfig {
-    /// Apply this fetcher's shared per-origin limiter before a browser navigation reuses the same
-    /// origin. Keeping this method on the config lets the core maintain one schedule across its
-    /// direct Rust fetches and the subsequent Chromium render.
-    pub(crate) fn wait_for_origin_until(&self, url: &Url, deadline: Instant) -> Result<(), Error> {
-        self.origin_limiter
-            .wait_for_turn(url, self.crawl_delay, deadline)
+    fn transmit_with_pacing<T>(
+        &self,
+        url: &Url,
+        deadline: Instant,
+        transmit: impl FnOnce() -> T,
+    ) -> Result<T, Error> {
+        self.origin_pacer
+            .transmit(url.as_str(), self.crawl_delay, deadline, transmit)
+            .map_err(|PacingDeadlineExceeded| deadline_elapsed())
     }
 
     /// Return caller-controlled headers only for the initiating origin.
@@ -353,13 +312,16 @@ where
         // This must precede every transport operation. In particular, a redirect target cannot
         // reach DNS or the origin before its document policy disposition is known.
         check_document(&current)?;
-        // Record the request immediately before opening the connection. This is deliberately in
-        // the redirect loop, rather than around `fetch`, so every physical same-origin request is
-        // spaced, including redirect hops and callers such as robots/sitemap/pagination.
-        config.wait_for_origin_until(&current, deadline)?;
+        // The shared pacer serializes the actual direct transmission with every Chromium
+        // continuation. It is deliberately in this redirect loop, so every physical same-origin
+        // request, including robots, sitemaps, pagination, and redirects, consumes one floor.
         let response = match current.scheme() {
-            "http" => fetch_http(&current, config, credential_origin, deadline)?,
-            "https" => fetch_https(&current, config, credential_origin, deadline)?,
+            "http" => config.transmit_with_pacing(&current, deadline, || {
+                fetch_http(&current, config, credential_origin, deadline)
+            })??,
+            "https" => config.transmit_with_pacing(&current, deadline, || {
+                fetch_https(&current, config, credential_origin, deadline)
+            })??,
             scheme => return Err(Error::UnsupportedScheme(scheme.to_string())),
         };
 

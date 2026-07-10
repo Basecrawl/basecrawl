@@ -105,6 +105,53 @@ setTimeout(function(){document.getElementById('target').textContent='POSTACTION_
     )
 }
 
+/// A same-URL meta-refresh loop. URL sampling cannot distinguish this reload from a stable page,
+/// but every top-frame document navigation must consume the shared redirect-hop budget.
+fn same_url_meta_loop_page() -> String {
+    page(
+        "<meta http-equiv=\"refresh\" content=\"0; url=/loop-same-meta\">\
+         <p>SAME_URL_META_LOOP</p>",
+    )
+}
+
+/// A same-URL JavaScript reload loop, complementing the meta-refresh case above.
+fn same_url_js_loop_page() -> String {
+    page(
+        "<p>SAME_URL_JS_LOOP</p>\
+         <script>window.location.replace('/loop-same-js');</script>",
+    )
+}
+
+/// Alternate redirect mechanisms at zero delay. This catches implementations that only count URL
+/// changes, or only one client-side redirect mechanism.
+fn alternating_meta_js_loop_page() -> String {
+    page(
+        "<meta http-equiv=\"refresh\" content=\"0; url=/loop-meta-js-b\">\
+         <p>META_TO_JS_LOOP</p>",
+    )
+}
+
+fn alternating_js_meta_loop_page() -> String {
+    page(
+        "<p>JS_TO_META_LOOP</p>\
+         <script>window.location.replace('/loop-meta-js-a');</script>",
+    )
+}
+
+/// Repeated fragment transitions are SPA state changes, not document navigations. They must never
+/// consume the redirect-hop budget even when the route changes more than the cap allows.
+fn fragment_transition_page() -> String {
+    page(
+        "<main id=\"app\">FRAGMENT_LOADING</main>\
+         <script>\
+         var n=0;var timer=setInterval(function(){\
+           location.hash='/route-'+n++;\
+           if(n>25){clearInterval(timer);document.getElementById('app').textContent='FRAGMENT_FINAL_4242';}\
+         },10);\
+         </script>",
+    )
+}
+
 fn write_response(mut stream: TcpStream, status: &str, content_type: &str, body: &[u8]) {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
@@ -177,6 +224,16 @@ fn handle_connection(stream: TcpStream) {
             peer,
             &page("<meta http-equiv=\"refresh\" content=\"0; url=/loop-a\"><p>LOOP_B</p>"),
         );
+    } else if path.starts_with("/loop-same-meta") {
+        html_response(peer, &same_url_meta_loop_page());
+    } else if path.starts_with("/loop-same-js") {
+        html_response(peer, &same_url_js_loop_page());
+    } else if path.starts_with("/loop-meta-js-a") {
+        html_response(peer, &alternating_meta_js_loop_page());
+    } else if path.starts_with("/loop-meta-js-b") {
+        html_response(peer, &alternating_js_meta_loop_page());
+    } else if path.starts_with("/fragment-transitions") {
+        html_response(peer, &fragment_transition_page());
     } else {
         write_response(peer, "404 Not Found", "text/plain; charset=utf-8", b"nf");
     }
@@ -422,5 +479,57 @@ fn wait_for_selector_still_tracks_and_bounds_client_redirects() {
     assert!(
         elapsed < Duration::from_secs(25),
         "the redirect hop cap must win before the selector timeout ({elapsed:?})"
+    );
+}
+
+fn assert_redirect_loop_is_bounded(path: &str) {
+    let url = format!("{}{}", server_base(), path);
+    let start = Instant::now();
+    let out = run(&[&url, "--formats", "html", "--render-timeout", "30"]);
+
+    assert!(
+        !out.status.success(),
+        "a zero-delay client redirect loop must not succeed"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a redirect-cap failure must not emit a partial ScrapeProof"
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).expect("structured JSON error on stderr");
+    assert_eq!(
+        err["error"]["kind"],
+        "too_many_redirects",
+        "top-frame navigation events must reach the shared redirect cap: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(err["error"]["max_redirects"], 20);
+    assert!(
+        start.elapsed() < Duration::from_secs(25),
+        "the navigation cap must win before the render timeout"
+    );
+}
+
+#[test]
+fn same_url_meta_refresh_loop_is_bounded_at_the_shared_hop_cap() {
+    assert_redirect_loop_is_bounded("/loop-same-meta");
+}
+
+#[test]
+fn same_url_javascript_loop_is_bounded_at_the_shared_hop_cap() {
+    assert_redirect_loop_is_bounded("/loop-same-js");
+}
+
+#[test]
+fn alternating_meta_and_javascript_loop_is_bounded_at_the_shared_hop_cap() {
+    assert_redirect_loop_is_bounded("/loop-meta-js-a");
+}
+
+#[test]
+fn fragment_only_spa_transitions_do_not_consume_redirect_hops() {
+    let url = format!("{}/fragment-transitions", server_base());
+    let proof = scrape_json(&[&url, "--formats", "html", "--render-timeout", "10"]);
+    assert!(
+        produced(&proof, "html").contains("FRAGMENT_FINAL_4242"),
+        "fragment-only transitions must not be misclassified as document redirects"
     );
 }

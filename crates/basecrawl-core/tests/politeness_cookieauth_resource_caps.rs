@@ -20,6 +20,7 @@ const BASIC_AUTH_MARKER: &str = "BASIC_AUTH_GATE_OPEN_84321";
 const COOKIE_MARKER: &str = "COOKIE_GATE_OPEN_84321";
 const ANONYMOUS_MARKER: &str = "ANONYMOUS_GATE_CLOSED_84321";
 const ASSET_BYTES: usize = 768;
+static BROWSER_PACING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 type RequestHeaders = Vec<(String, String)>;
 type ParsedRequest = (TcpStream, String, RequestHeaders);
@@ -27,6 +28,7 @@ type ParsedRequest = (TcpStream, String, RequestHeaders);
 #[derive(Debug, Default)]
 struct ServerState {
     polite_request_times: Mutex<Vec<Instant>>,
+    browser_request_times: Mutex<Vec<(String, Instant)>>,
 }
 
 fn run(args: &[&str]) -> Output {
@@ -128,6 +130,55 @@ fn handle_connection(stream: TcpStream, state: Arc<ServerState>) {
             "text/html; charset=utf-8",
             &page("<main>PAGE_TWO</main>"),
         );
+    } else if path == "/browser/pacing"
+        || path == "/browser/deadline"
+        || path == "/browser/page-1"
+        || path == "/browser/page-2"
+    {
+        state
+            .browser_request_times
+            .lock()
+            .expect("browser timestamps lock")
+            .push((path.clone(), Instant::now()));
+        if path == "/browser/deadline" {
+            thread::sleep(Duration::from_millis(650));
+        }
+        let body = if path == "/browser/page-1" {
+            "<main>BROWSER_PAGE_ONE</main><a rel=\"next\" href=\"/browser/page-2\">next</a>"
+        } else if path == "/browser/page-2" {
+            "<main>BROWSER_PAGE_TWO</main>"
+        } else {
+            "<main>BROWSER_PACING_PAGE</main>\
+             <img src=\"/browser/asset-one.png\">\
+             <script src=\"/browser/pacing-script.js\"></script>\
+             <img src=\"/browser/asset-two.png\">"
+        };
+        write_response(peer, "text/html; charset=utf-8", &page(body));
+    } else if path == "/browser/asset-one.png" || path == "/browser/asset-two.png" {
+        state
+            .browser_request_times
+            .lock()
+            .expect("browser timestamps lock")
+            .push((path.clone(), Instant::now()));
+        write_response(peer, "image/png", &[0_u8; ASSET_BYTES]);
+    } else if path == "/browser/pacing-script.js" {
+        state
+            .browser_request_times
+            .lock()
+            .expect("browser timestamps lock")
+            .push((path.clone(), Instant::now()));
+        write_response(
+            peer,
+            "application/javascript; charset=utf-8",
+            b"fetch('/browser/pacing-data').then(function(){document.body.dataset.paced='yes';});",
+        );
+    } else if path == "/browser/pacing-data" {
+        state
+            .browser_request_times
+            .lock()
+            .expect("browser timestamps lock")
+            .push((path.clone(), Instant::now()));
+        write_response(peer, "application/json", b"{\"paced\":true}");
     } else if path == "/gated/cookie" {
         let authenticated =
             header(&headers, "cookie").is_some_and(|value| value.contains("session=opened"));
@@ -193,6 +244,26 @@ fn raw_html(proof: &Value) -> &str {
         .expect("rawHtml format should be a string")
 }
 
+fn assert_server_observed_floor(
+    request_times: &[(String, Instant)],
+    floor: Duration,
+    context: &str,
+) {
+    assert!(
+        request_times.len() >= 4,
+        "{context}: expected direct, browser document, and subresource traffic, got {request_times:?}"
+    );
+    for window in request_times.windows(2) {
+        let elapsed = window[1].1.duration_since(window[0].1);
+        assert!(
+            elapsed >= floor,
+            "{context}: server observed {} -> {} only {elapsed:?}, below required {floor:?}",
+            window[0].0,
+            window[1].0,
+        );
+    }
+}
+
 // VAL-CRAWL-129: same-origin pagination requests observe the configured crawl delay.
 #[test]
 fn same_origin_pagination_observes_configured_crawl_delay() {
@@ -233,6 +304,168 @@ fn same_origin_pagination_observes_configured_crawl_delay() {
     assert!(
         interval >= Duration::from_millis(180),
         "same-origin requests were not spaced by the configured 200ms delay: {interval:?}"
+    );
+}
+
+// VAL-CRAWL-129: document and subresource browser transmission is paced at the CDP continuation
+// boundary. The server observes every arrival, so this rejects scheduling that records a timestamp
+// before the asynchronous Fetch.continueRequest reaches Chromium.
+#[test]
+fn browser_document_and_subresources_observe_the_250ms_crawl_delay_floor() {
+    let _serial = BROWSER_PACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (base, state) = server();
+    state
+        .browser_request_times
+        .lock()
+        .expect("browser timestamps lock")
+        .clear();
+
+    let target = format!("{base}/browser/pacing");
+    let proof = scrape_json(&[
+        &target,
+        "--formats",
+        "html",
+        "--robots",
+        "ignore",
+        "--crawl-delay-ms",
+        "250",
+    ]);
+    assert!(
+        proof["result"]["formats_produced"]["html"]
+            .as_str()
+            .is_some_and(|html| html.contains("BROWSER_PACING_PAGE")),
+        "browser render did not produce the expected page"
+    );
+    let arrivals = state
+        .browser_request_times
+        .lock()
+        .expect("browser timestamps lock")
+        .clone();
+    assert_server_observed_floor(
+        &arrivals,
+        Duration::from_millis(250),
+        "browser document/subresource crawl delay",
+    );
+}
+
+// VAL-CRAWL-129: repeated Chromium launches for HTML plus screenshot share the same scheduler.
+#[test]
+fn repeated_browser_launches_observe_the_500ms_crawl_delay_floor() {
+    let _serial = BROWSER_PACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (base, state) = server();
+    state
+        .browser_request_times
+        .lock()
+        .expect("browser timestamps lock")
+        .clear();
+
+    let target = format!("{base}/browser/pacing");
+    let proof = scrape_json(&[
+        &target,
+        "--formats",
+        "html,screenshot",
+        "--robots",
+        "ignore",
+        "--crawl-delay-ms",
+        "500",
+    ]);
+    assert!(
+        proof["result"]["formats_produced"]["screenshot"]
+            .as_str()
+            .is_some_and(|png| !png.is_empty()),
+        "screenshot browser launch did not produce a PNG"
+    );
+    let arrivals = state
+        .browser_request_times
+        .lock()
+        .expect("browser timestamps lock")
+        .clone();
+    assert_server_observed_floor(
+        &arrivals,
+        Duration::from_millis(500),
+        "repeated browser launch crawl delay",
+    );
+}
+
+// VAL-CRAWL-129: direct pagination fetches and the browser renders of every page use the same
+// crawl-wide scheduler. This is distinct from no-JS pagination, which only exercises Rust fetches.
+#[test]
+fn browser_pagination_shares_the_crawl_wide_delay_schedule() {
+    let _serial = BROWSER_PACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (base, state) = server();
+    state
+        .browser_request_times
+        .lock()
+        .expect("browser timestamps lock")
+        .clear();
+
+    let target = format!("{base}/browser/page-1");
+    let proof = scrape_json(&[
+        &target,
+        "--formats",
+        "html,markdown",
+        "--robots",
+        "ignore",
+        "--follow-pagination",
+        "--max-pages",
+        "2",
+        "--crawl-delay-ms",
+        "250",
+    ]);
+    assert_eq!(
+        proof["result"]["crawled_urls"].as_array().map(Vec::len),
+        Some(2),
+        "browser pagination must visit the second page"
+    );
+    let arrivals = state
+        .browser_request_times
+        .lock()
+        .expect("browser timestamps lock")
+        .clone();
+    assert_server_observed_floor(
+        &arrivals,
+        Duration::from_millis(250),
+        "browser pagination crawl delay",
+    );
+}
+
+#[test]
+fn browser_pacing_wait_consumes_the_existing_scrape_deadline() {
+    let _serial = BROWSER_PACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (base, _) = server();
+    let target = format!("{base}/browser/deadline");
+    let output = run(&[
+        &target,
+        "--formats",
+        "html",
+        "--robots",
+        "ignore",
+        "--crawl-delay-ms",
+        "500",
+        "--timeout",
+        "1",
+    ]);
+    assert!(
+        !output.status.success(),
+        "pacing beyond the scrape deadline must fail the scrape"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a pacing deadline failure must not emit a partial ScrapeProof"
+    );
+    let error: Value =
+        serde_json::from_slice(&output.stderr).expect("pacing failure must be structured");
+    assert_eq!(
+        error["error"]["kind"], "timeout",
+        "pacing exhaustion must map to the normal scrape deadline error: {error}"
     );
 }
 

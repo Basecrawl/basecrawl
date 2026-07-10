@@ -230,7 +230,6 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         && content_kind == ContentKind::Html
         && !body_str.trim().is_empty()
     {
-        config.wait_for_origin_until(&page_base, deadline)?;
         let mut rendered = html::render_page_until(
             &page_base,
             basecrawl_render::RenderConfig {
@@ -243,6 +242,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 max_resource_bytes: options.max_render_bytes,
                 max_document_bytes: options.max_body_bytes as u64,
                 resource_budget: Some(render_resource_budget.clone()),
+                origin_pacer: Some(config.origin_pacer.clone()),
                 document_request_policy: Some(render_document_policy(document_policy.clone())),
                 wait_for: options.wait_for.clone(),
                 actions: options.actions.clone(),
@@ -300,7 +300,6 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 value
             }
             Format::Screenshot => {
-                config.wait_for_origin_until(&page_base, deadline)?;
                 let shot = screenshot::capture_until(
                     &page_base,
                     basecrawl_render::ScreenshotConfig {
@@ -313,6 +312,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                         max_resource_bytes: options.max_render_bytes,
                         max_document_bytes: options.max_body_bytes as u64,
                         resource_budget: Some(render_resource_budget.clone()),
+                        origin_pacer: Some(config.origin_pacer.clone()),
                         document_request_policy: Some(render_document_policy(
                             document_policy.clone(),
                         )),
@@ -470,7 +470,6 @@ fn crawl_page(
     redact_sensitive_request_echoes(&mut body_str, &options.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
-        config.wait_for_origin_until(&page_base, deadline)?;
         let mut rendered = html::render_page_until(
             &page_base,
             basecrawl_render::RenderConfig {
@@ -483,6 +482,7 @@ fn crawl_page(
                 max_resource_bytes: options.max_render_bytes,
                 max_document_bytes: options.max_body_bytes as u64,
                 resource_budget: Some(render_resource_budget),
+                origin_pacer: Some(config.origin_pacer.clone()),
                 document_request_policy: Some(render_document_policy(document_policy.clone())),
                 wait_for: options.wait_for.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,

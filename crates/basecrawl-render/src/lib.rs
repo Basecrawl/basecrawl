@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,6 +81,8 @@ pub enum RenderError {
     Render(String),
     #[error("render timed out after {0:?}: the page never reached network idle")]
     Timeout(Duration),
+    #[error("the scrape deadline expired while waiting for the per-origin crawl delay")]
+    PacingDeadlineExceeded,
     #[error("timed out waiting for selector {selector:?}: {detail}")]
     WaitFor { selector: String, detail: String },
     #[error("exceeded the maximum of {max} client-side redirect hop(s)")]
@@ -165,6 +168,10 @@ pub struct RenderConfig {
     /// Optional scrape-owned budget shared by all browser launches. A standalone render without
     /// this value creates one from `max_subresources` and `max_resource_bytes`.
     pub resource_budget: Option<RenderResourceBudget>,
+    /// Shared scheduler used by direct fetches and every browser launch in a scrape. Browser
+    /// continuations record their timestamp only after the `Fetch.continueRequest` CDP command has
+    /// completed, rather than when an interception callback first observes the request.
+    pub origin_pacer: Option<OriginPacer>,
     /// Optional policy consulted before every top-level document request. This deliberately does
     /// not run for iframe documents or other subresources.
     pub document_request_policy: Option<DocumentRequestPolicy>,
@@ -204,6 +211,7 @@ impl Default for RenderConfig {
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
             max_document_bytes: u64::MAX,
             resource_budget: None,
+            origin_pacer: None,
             document_request_policy: None,
             wait_for: None,
             network_idle: true,
@@ -241,7 +249,6 @@ pub struct RenderResourceUsage {
 #[derive(Debug, Default)]
 struct RenderResourceState {
     usage: RenderResourceUsage,
-    last_request_at: HashMap<RenderOrigin, Instant>,
 }
 
 #[derive(Debug)]
@@ -339,6 +346,129 @@ struct RenderOrigin {
     port: u16,
 }
 
+/// One monotonic per-origin transmission schedule shared by direct and browser request paths.
+///
+/// A browser continuation holds the schedule lock until its `Fetch.continueRequest` CDP command
+/// finishes. The next request therefore begins its delay after Chromium has accepted the prior
+/// continuation, avoiding the interception-callback-to-wire gap that can otherwise undershoot a
+/// crawl-delay floor at the origin.
+#[derive(Debug, Clone, Default)]
+pub struct OriginPacer {
+    last_transmission_at: Arc<Mutex<HashMap<RenderOrigin, Instant>>>,
+}
+
+/// The caller's absolute scrape deadline expired before an origin could next be contacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacingDeadlineExceeded;
+
+impl OriginPacer {
+    /// Run `transmit` only after the configured origin interval has elapsed.
+    ///
+    /// The schedule timestamp is committed after `transmit` returns, including a transport error,
+    /// because an errored continuation or direct attempt may still have reached the origin.
+    pub fn transmit<T>(
+        &self,
+        raw_url: &str,
+        delay: Duration,
+        deadline: Instant,
+        transmit: impl FnOnce() -> T,
+    ) -> Result<T, PacingDeadlineExceeded> {
+        if delay.is_zero() {
+            return Ok(transmit());
+        }
+        let Some(origin) = origin_for_url(raw_url) else {
+            return Ok(transmit());
+        };
+        let mut transmissions = self
+            .last_transmission_at
+            .lock()
+            .expect("origin pacer mutex must not be poisoned");
+        if let Some(previous) = transmissions.get(&origin) {
+            let elapsed = previous.elapsed();
+            if elapsed < delay {
+                let wait = delay - elapsed;
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or(PacingDeadlineExceeded)?;
+                if wait >= remaining {
+                    return Err(PacingDeadlineExceeded);
+                }
+                thread::sleep(wait);
+            }
+        }
+        let result = transmit();
+        transmissions.insert(origin, Instant::now());
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Default)]
+struct NavigationState {
+    first_document_request_seen: bool,
+    client_navigation_hops: usize,
+    too_many_redirects: bool,
+}
+
+/// CDP-bound top-frame navigation accounting.
+///
+/// The initial browser document request establishes the rendered document. Every later top-frame
+/// document request is a navigation hop, counted exactly where Chromium pauses it, including
+/// same-URL reloads and meta/JavaScript redirects that URL sampling can miss. Fragment-only SPA
+/// transitions do not issue a document request and are intentionally excluded.
+#[derive(Debug, Clone)]
+struct NavigationTracker {
+    follow_client_redirects: bool,
+    max_redirects: usize,
+    state: Arc<Mutex<NavigationState>>,
+}
+
+impl NavigationTracker {
+    fn new(follow_client_redirects: bool, max_redirects: usize) -> Self {
+        Self {
+            follow_client_redirects,
+            max_redirects,
+            state: Arc::new(Mutex::new(NavigationState::default())),
+        }
+    }
+
+    fn record_top_document_request(&self) -> Result<(), RenderError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("navigation tracker mutex must not be poisoned");
+        if !state.first_document_request_seen {
+            state.first_document_request_seen = true;
+            return Ok(());
+        }
+        if self.follow_client_redirects {
+            state.client_navigation_hops += 1;
+            if state.client_navigation_hops > self.max_redirects {
+                state.too_many_redirects = true;
+                return Err(RenderError::TooManyRedirects {
+                    max: self.max_redirects,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_within_limit(&self) -> Result<(), RenderError> {
+        if self
+            .state
+            .lock()
+            .expect("navigation tracker mutex must not be poisoned")
+            .too_many_redirects
+        {
+            Err(RenderError::TooManyRedirects {
+                max: self.max_redirects,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Resolve a Chromium executable: prefer `$CHROME`, then the well-known system locations.
 fn resolve_chrome() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CHROME") {
@@ -353,6 +483,17 @@ fn resolve_chrome() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+#[derive(Clone)]
+struct ResourceGuard {
+    budget: RenderResourceBudget,
+    credential_origin: Url,
+    top_frame_id: Page::FrameId,
+    document_policy_denial: Arc<Mutex<Option<String>>>,
+    navigation_tracker: NavigationTracker,
+    pacing_deadline_exceeded: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
 /// Configure per-origin pacing and one scrape-owned browser resource budget.
 ///
 /// Request interception prevents requests above the count cap before transmission and rejects an
@@ -362,11 +503,7 @@ fn resolve_chrome() -> Option<PathBuf> {
 fn configure_resource_guard(
     tab: &Arc<Tab>,
     config: &RenderConfig,
-    budget: RenderResourceBudget,
-    credential_origin: &Url,
-    top_frame_id: Page::FrameId,
-    document_policy_denial: Arc<Mutex<Option<String>>>,
-    deadline: Instant,
+    guard: ResourceGuard,
 ) -> Result<(), RenderError> {
     let patterns = [
         Fetch::RequestPattern {
@@ -394,9 +531,17 @@ fn configure_resource_guard(
     let crawl_delay = config.crawl_delay;
     let max_document_bytes = config.max_document_bytes;
     let request_headers = config.request_headers.clone();
-    let credential_origin = credential_origin.clone();
+    let ResourceGuard {
+        budget,
+        credential_origin,
+        top_frame_id,
+        document_policy_denial,
+        navigation_tracker,
+        pacing_deadline_exceeded,
+        deadline,
+    } = guard;
     let document_request_policy = config.document_request_policy.clone();
-    let timeout = config.timeout;
+    let origin_pacer = config.origin_pacer.clone().unwrap_or_default();
     let response_meters = Arc::new(Mutex::new(HashMap::<String, BrowserResponseMeter>::new()));
     let response_meters_for_requests = Arc::clone(&response_meters);
     let budget_for_requests = budget.clone();
@@ -442,7 +587,8 @@ fn configure_resource_guard(
                 return RequestPausedDecision::Continue(None);
             }
 
-            if is_document && paused.params.frame_id == top_frame_id {
+            let is_top_document = is_document && paused.params.frame_id == top_frame_id;
+            if is_top_document {
                 if let Some(policy) = &document_request_policy {
                     match Url::parse(&paused.params.request.url)
                         .map_err(|error| error.to_string())
@@ -460,37 +606,18 @@ fn configure_resource_guard(
                         }
                     }
                 }
+                if navigation_tracker.record_top_document_request().is_err() {
+                    return RequestPausedDecision::Fail(Fetch::FailRequest {
+                        request_id: paused.params.request_id,
+                        error_reason: ErrorReason::BlockedByClient,
+                    });
+                }
             }
 
-            let origin = origin_for_url(&paused.params.request.url);
             let mut state = budget_for_requests
                 .state
                 .lock()
                 .expect("render resource guard mutex must not be poisoned");
-            if let Some(origin) = origin {
-                if !crawl_delay.is_zero() {
-                    if let Some(previous) = state.last_request_at.get(&origin) {
-                        let elapsed = previous.elapsed();
-                        if elapsed < crawl_delay {
-                            let wait = crawl_delay - elapsed;
-                            let Ok(remaining) = remaining(deadline, timeout) else {
-                                return RequestPausedDecision::Fail(Fetch::FailRequest {
-                                    request_id: paused.params.request_id,
-                                    error_reason: ErrorReason::TimedOut,
-                                });
-                            };
-                            if wait >= remaining {
-                                return RequestPausedDecision::Fail(Fetch::FailRequest {
-                                    request_id: paused.params.request_id,
-                                    error_reason: ErrorReason::TimedOut,
-                                });
-                            }
-                            std::thread::sleep(wait);
-                        }
-                    }
-                }
-                state.last_request_at.insert(origin, Instant::now());
-            }
             if state.usage.cap_exceeded
                 || state.usage.subresource_count >= budget_for_requests.max_requests
             {
@@ -502,7 +629,41 @@ fn configure_resource_guard(
             }
             state.usage.subresource_count += 1;
             drop(state);
-            continue_with_effective_headers(paused, &request_headers, &credential_origin)
+            let request_url = paused.params.request.url.clone();
+            let continue_request =
+                effective_continue_request(paused.clone(), &request_headers, &credential_origin);
+            let pacing_deadline_exceeded = Arc::clone(&pacing_deadline_exceeded);
+            let navigation_tracker = navigation_tracker.clone();
+            let origin_pacer = origin_pacer.clone();
+            RequestPausedDecision::Deferred(Arc::new(move |transport, session_id, event| {
+                let request_id = event.params.request_id.clone();
+                let outcome = origin_pacer.transmit(&request_url, crawl_delay, deadline, || {
+                    transport.call_method_on_target(session_id.clone(), continue_request.clone())
+                });
+                match outcome {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => {}
+                    Err(PacingDeadlineExceeded) => {
+                        pacing_deadline_exceeded.store(true, Ordering::SeqCst);
+                        let _ = transport.call_method_on_target(
+                            session_id.clone(),
+                            Fetch::FailRequest {
+                                request_id: request_id.clone(),
+                                error_reason: ErrorReason::TimedOut,
+                            },
+                        );
+                    }
+                }
+                if navigation_tracker.ensure_within_limit().is_err() {
+                    let _ = transport.call_method_on_target(
+                        session_id,
+                        Fetch::FailRequest {
+                            request_id,
+                            error_reason: ErrorReason::BlockedByClient,
+                        },
+                    );
+                }
+            }))
         },
     ))
     .map_err(|error| RenderError::Render(error.to_string()))?;
@@ -563,11 +724,11 @@ fn configure_resource_guard(
 /// first, then re-added only when the paused request has the initiating scheme, host, and port.
 /// This guards cross-origin HTTP redirects, client navigations, iframes, and subresources even when
 /// Chromium has copied headers from a prior same-origin request into the paused request.
-fn continue_with_effective_headers(
+fn effective_continue_request(
     paused: Fetch::events::RequestPausedEvent,
     effective_headers: &[(String, String)],
     credential_origin: &Url,
-) -> RequestPausedDecision {
+) -> Fetch::ContinueRequest {
     let is_same_origin = same_origin_url(&paused.params.request.url, credential_origin);
     let mut headers = paused
         .params
@@ -606,14 +767,14 @@ fn continue_with_effective_headers(
         );
     }
 
-    RequestPausedDecision::Continue(Some(Fetch::ContinueRequest {
+    Fetch::ContinueRequest {
         request_id: paused.params.request_id,
         url: None,
         method: None,
         post_data: None,
         headers: Some(headers),
         intercept_response: None,
-    }))
+    }
 }
 
 fn origin_for_url(raw_url: &str) -> Option<RenderOrigin> {
@@ -865,6 +1026,9 @@ pub fn render_until(
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
     let document_policy_denial = Arc::new(Mutex::new(None));
+    let navigation_tracker =
+        NavigationTracker::new(config.follow_client_redirects, config.max_redirects);
+    let pacing_deadline_exceeded = Arc::new(AtomicBool::new(false));
     set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
         set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -876,11 +1040,15 @@ pub fn render_until(
     configure_resource_guard(
         &tab,
         config,
-        resource_budget.clone(),
-        config.credential_origin.as_ref().unwrap_or(url),
-        top_frame_id,
-        Arc::clone(&document_policy_denial),
-        deadline,
+        ResourceGuard {
+            budget: resource_budget.clone(),
+            credential_origin: config.credential_origin.as_ref().unwrap_or(url).clone(),
+            top_frame_id,
+            document_policy_denial: Arc::clone(&document_policy_denial),
+            navigation_tracker: navigation_tracker.clone(),
+            pacing_deadline_exceeded: Arc::clone(&pacing_deadline_exceeded),
+            deadline,
+        },
     )?;
 
     // Install the network in-flight tracker before any page script runs so the smart wait can see
@@ -915,17 +1083,39 @@ pub fn render_until(
                 selector,
                 config,
                 &resource_budget,
+                &navigation_tracker,
+                &pacing_deadline_exceeded,
                 deadline,
             )
             .map_err(|error| {
-                render_or_policy_error(error, &resource_budget, &document_policy_denial)
+                render_or_policy_error(
+                    error,
+                    &resource_budget,
+                    &document_policy_denial,
+                    &navigation_tracker,
+                    &pacing_deadline_exceeded,
+                )
             })?;
         }
         None => {
             // Wait for network idle while following (and bounding) any client-side redirect.
-            settle_and_follow_redirects(&tab, config, &resource_budget, deadline).map_err(
-                |error| render_or_policy_error(error, &resource_budget, &document_policy_denial),
-            )?;
+            settle_and_follow_redirects(
+                &tab,
+                config,
+                &resource_budget,
+                &navigation_tracker,
+                &pacing_deadline_exceeded,
+                deadline,
+            )
+            .map_err(|error| {
+                render_or_policy_error(
+                    error,
+                    &resource_budget,
+                    &document_policy_denial,
+                    &navigation_tracker,
+                    &pacing_deadline_exceeded,
+                )
+            })?;
         }
     }
     ensure_document_policy_allowed(&document_policy_denial)?;
@@ -945,10 +1135,22 @@ pub fn render_until(
 
     // Execute the supplied scripted actions in order (click / scroll / wait / wait-for-selector).
     for action in &config.actions {
-        run_action(&tab, action, config, &resource_budget, deadline)?;
+        run_action(
+            &tab,
+            action,
+            config,
+            &resource_budget,
+            &navigation_tracker,
+            &pacing_deadline_exceeded,
+            deadline,
+        )?;
         resource_budget.ensure_available()?;
     }
     ensure_document_policy_allowed(&document_policy_denial)?;
+    if pacing_deadline_exceeded.load(Ordering::SeqCst) {
+        return Err(RenderError::PacingDeadlineExceeded);
+    }
+    navigation_tracker.ensure_within_limit()?;
 
     // Inline iframe/shadow content, strip scripts/styles, and serialize (one CDP round-trip).
     set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -984,88 +1186,35 @@ fn set_tab_deadline(tab: &Tab, deadline: Instant, timeout: Duration) -> Result<(
     Ok(())
 }
 
-/// The current top-frame URL with any fragment removed. Fragment-only changes are SPA hash routing,
-/// not a navigation redirect, so they must not count against the client-redirect hop cap.
-fn current_url_no_fragment(tab: &Tab) -> String {
-    let url = tab.get_url();
-    match url.split_once('#') {
-        Some((base, _)) => base.to_string(),
-        None => url,
-    }
-}
-
-/// Whether `url` is a committed http(s) document (as opposed to `about:blank` / `chrome:` before the
-/// navigation commits).
-fn is_committed_http(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
-}
-
-/// Wait until the committed page has loaded and its network has been idle for `quiet_period`, while
-/// following any client-side redirect (meta-refresh / `window.location`) the top frame performs.
-///
-/// The loop first waits for the top frame to commit to an http(s) document (ignoring the pre-commit
-/// `about:blank`), so it never settles on a blank shell. Thereafter a change of the top-frame URL
-/// (ignoring the fragment) is a client-side redirect: each hop is counted and, when
-/// `follow_client_redirects` is set, bounded by `max_redirects` — a loop exceeding the cap aborts
-/// with [`RenderError::TooManyRedirects`] rather than hanging until the deadline. The whole wait is
-/// also bounded by `deadline` ([`RenderError::Timeout`]).
+/// Wait until a top-frame document request has committed and the page's network has been idle for
+/// `quiet_period`. Client redirects are counted by the top-frame `Fetch.requestPaused` boundary,
+/// not by polling a URL, so same-URL reloads count while fragment-only SPA transitions do not.
 fn settle_and_follow_redirects(
     tab: &Tab,
     config: &RenderConfig,
     resource_budget: &RenderResourceBudget,
+    navigation_tracker: &NavigationTracker,
+    pacing_deadline_exceeded: &AtomicBool,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     let poll = Duration::from_millis(100);
     let quiet_ms = config.quiet_period.as_millis() as i64;
-    let mut current = String::new();
-    let mut committed = false;
-    let mut url_stable_since = Instant::now();
-    let mut hops = 0usize;
 
     loop {
+        if pacing_deadline_exceeded.load(Ordering::SeqCst) {
+            return Err(RenderError::PacingDeadlineExceeded);
+        }
+        navigation_tracker.ensure_within_limit()?;
         resource_budget.ensure_available()?;
         set_tab_deadline(tab, deadline, config.timeout)?;
 
-        let live = current_url_no_fragment(tab);
-        if !is_committed_http(&live) {
-            // The navigation has not committed to a real page yet (still about:blank).
-            thread::sleep(poll.min(remaining(deadline, config.timeout)?));
-            continue;
-        }
-
-        if !committed {
-            // First commit: this is the initial navigation landing, not a client redirect.
-            committed = true;
-            current = live;
-            url_stable_since = Instant::now();
-        } else if live != current {
-            if config.follow_client_redirects {
-                hops += 1;
-                if hops > config.max_redirects {
-                    return Err(RenderError::TooManyRedirects {
-                        max: config.max_redirects,
-                    });
-                }
-            }
-            current = live;
-            url_stable_since = Instant::now();
-            thread::sleep(poll.min(remaining(deadline, config.timeout)?));
-            continue;
-        }
-
         if !config.network_idle {
-            // The URL is stable and network-idle waiting is disabled: nothing more to wait for.
             return Ok(());
         }
 
         set_tab_deadline(tab, deadline, config.timeout)?;
         if let Some(snap) = probe_idle(tab) {
-            let url_quiet_ms = url_stable_since.elapsed().as_millis() as i64;
-            if snap.ready == "complete"
-                && snap.inflight <= 0
-                && snap.quiet_ms >= quiet_ms
-                && url_quiet_ms >= quiet_ms
-            {
+            if snap.ready == "complete" && snap.inflight <= 0 && snap.quiet_ms >= quiet_ms {
                 return Ok(());
             }
         }
@@ -1073,16 +1222,14 @@ fn settle_and_follow_redirects(
     }
 }
 
-/// Poll selector presence and the committed top-frame URL in one deadline-bounded loop.
-///
-/// `Tab::wait_for_element_with_custom_timeout` cannot observe document URL changes while it
-/// blocks, allowing a client redirect loop to masquerade as a selector timeout. This loop makes
-/// selector waits use the same client redirect accounting as the network-idle path.
+/// Poll selector presence while the interception boundary tracks every top-frame navigation.
 fn wait_for_selector_and_follow_redirects(
     tab: &Tab,
     selector: &str,
     config: &RenderConfig,
     resource_budget: &RenderResourceBudget,
+    navigation_tracker: &NavigationTracker,
+    pacing_deadline_exceeded: &AtomicBool,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     let poll = Duration::from_millis(50);
@@ -1090,30 +1237,14 @@ fn wait_for_selector_and_follow_redirects(
         "document.querySelector({}) !== null",
         js_string_literal(selector)
     );
-    let mut current = String::new();
-    let mut committed = false;
-    let mut hops = 0usize;
 
     loop {
+        if pacing_deadline_exceeded.load(Ordering::SeqCst) {
+            return Err(RenderError::PacingDeadlineExceeded);
+        }
+        navigation_tracker.ensure_within_limit()?;
         resource_budget.ensure_available()?;
         set_tab_deadline(tab, deadline, config.timeout)?;
-        let live = current_url_no_fragment(tab);
-        if is_committed_http(&live) {
-            if !committed {
-                committed = true;
-                current = live;
-            } else if live != current {
-                if config.follow_client_redirects {
-                    hops += 1;
-                    if hops > config.max_redirects {
-                        return Err(RenderError::TooManyRedirects {
-                            max: config.max_redirects,
-                        });
-                    }
-                }
-                current = live;
-            }
-        }
 
         set_tab_deadline(tab, deadline, config.timeout)?;
         let present = tab
@@ -1199,6 +1330,8 @@ fn run_action(
     action: &Action,
     config: &RenderConfig,
     resource_budget: &RenderResourceBudget,
+    navigation_tracker: &NavigationTracker,
+    pacing_deadline_exceeded: &AtomicBool,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     match action {
@@ -1229,6 +1362,8 @@ fn run_action(
                 selector,
                 config,
                 resource_budget,
+                navigation_tracker,
+                pacing_deadline_exceeded,
                 deadline,
             )?;
         }
@@ -1264,6 +1399,8 @@ pub struct ScreenshotConfig {
     pub max_document_bytes: u64,
     /// Optional scrape-owned budget shared with HTML renders and pagination.
     pub resource_budget: Option<RenderResourceBudget>,
+    /// Optional shared direct/browser per-origin transmission scheduler.
+    pub origin_pacer: Option<OriginPacer>,
     /// Optional policy consulted before every top-level document request during capture.
     pub document_request_policy: Option<DocumentRequestPolicy>,
     /// Layout viewport width in CSS pixels. Captured at device-scale-factor 1, so the produced
@@ -1288,6 +1425,7 @@ impl Default for ScreenshotConfig {
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
             max_document_bytes: u64::MAX,
             resource_budget: None,
+            origin_pacer: None,
             document_request_policy: None,
             width: DEFAULT_VIEWPORT_WIDTH,
             height: DEFAULT_VIEWPORT_HEIGHT,
@@ -1367,19 +1505,33 @@ pub fn screenshot_until(
         max_resource_bytes: config.max_resource_bytes,
         max_document_bytes: config.max_document_bytes,
         resource_budget: Some(resource_budget.clone()),
+        origin_pacer: config.origin_pacer.clone(),
         document_request_policy: config.document_request_policy.clone(),
         ..RenderConfig::default()
     };
     set_tab_deadline(&tab, deadline, config.timeout)?;
     let top_frame_id = top_frame_id(&tab)?;
+    let navigation_tracker = NavigationTracker::new(
+        resource_config.follow_client_redirects,
+        resource_config.max_redirects,
+    );
+    let pacing_deadline_exceeded = Arc::new(AtomicBool::new(false));
     configure_resource_guard(
         &tab,
         &resource_config,
-        resource_budget.clone(),
-        resource_config.credential_origin.as_ref().unwrap_or(url),
-        top_frame_id,
-        Arc::clone(&document_policy_denial),
-        deadline,
+        ResourceGuard {
+            budget: resource_budget.clone(),
+            credential_origin: resource_config
+                .credential_origin
+                .as_ref()
+                .unwrap_or(url)
+                .clone(),
+            top_frame_id,
+            document_policy_denial: Arc::clone(&document_policy_denial),
+            navigation_tracker: navigation_tracker.clone(),
+            pacing_deadline_exceeded: Arc::clone(&pacing_deadline_exceeded),
+            deadline,
+        },
     )?;
 
     set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -1415,12 +1567,27 @@ pub fn screenshot_until(
         max_resource_bytes: config.max_resource_bytes,
         max_document_bytes: config.max_document_bytes,
         resource_budget: Some(resource_budget.clone()),
+        origin_pacer: config.origin_pacer.clone(),
         document_request_policy: config.document_request_policy.clone(),
         ..RenderConfig::default()
     };
-    settle_and_follow_redirects(&tab, &navigation_config, &resource_budget, deadline).map_err(
-        |error| render_or_policy_error(error, &resource_budget, &document_policy_denial),
-    )?;
+    settle_and_follow_redirects(
+        &tab,
+        &navigation_config,
+        &resource_budget,
+        &navigation_tracker,
+        &pacing_deadline_exceeded,
+        deadline,
+    )
+    .map_err(|error| {
+        render_or_policy_error(
+            error,
+            &resource_budget,
+            &document_policy_denial,
+            &navigation_tracker,
+            &pacing_deadline_exceeded,
+        )
+    })?;
     ensure_document_policy_allowed(&document_policy_denial)?;
     resource_budget.ensure_available()?;
 
@@ -1504,7 +1671,15 @@ fn render_or_policy_error(
     error: RenderError,
     budget: &RenderResourceBudget,
     document_policy_denial: &Arc<Mutex<Option<String>>>,
+    navigation_tracker: &NavigationTracker,
+    pacing_deadline_exceeded: &AtomicBool,
 ) -> RenderError {
+    if pacing_deadline_exceeded.load(Ordering::SeqCst) {
+        return RenderError::PacingDeadlineExceeded;
+    }
+    if let Err(error) = navigation_tracker.ensure_within_limit() {
+        return error;
+    }
     document_policy_error(document_policy_denial)
         .unwrap_or_else(|| render_or_budget_error(error, budget))
 }
@@ -1514,7 +1689,8 @@ fn render_failure_with_policy(
     budget: &RenderResourceBudget,
     document_policy_denial: &Arc<Mutex<Option<String>>>,
 ) -> RenderError {
-    render_or_policy_error(RenderError::Render(message), budget, document_policy_denial)
+    document_policy_error(document_policy_denial)
+        .unwrap_or_else(|| render_or_budget_error(RenderError::Render(message), budget))
 }
 
 #[cfg(test)]
