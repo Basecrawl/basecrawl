@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-headless_chrome = { workspace = true }
+headless_chrome = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

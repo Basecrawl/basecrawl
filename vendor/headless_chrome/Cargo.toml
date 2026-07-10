@@ -148,6 +148,8 @@ version = "1.12.4"
 [dependencies.rustls]
 version = "0.23.40"
 optional = true
+default-features = false
+features = ["std", "ring"]
 
 [dependencies.rustls-pemfile]
 version = "2.2.0"

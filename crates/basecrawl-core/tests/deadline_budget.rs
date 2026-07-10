@@ -12,7 +12,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
 const HOP_DELAY: Duration = Duration::from_millis(350);
 const SLOW_RENDER_DELAY: Duration = Duration::from_millis(650);
 const SETUP_DELAY: Duration = Duration::from_millis(250);
+const UPGRADE_TRICKLE_INTERVAL: Duration = Duration::from_millis(80);
 
 fn run(args: &[&str]) -> Output {
     Command::new(BIN)
@@ -209,6 +211,110 @@ impl Drop for DelayedCdpServer {
     }
 }
 
+/// A CDP endpoint that sends a syntactically valid HTTP 101 status line but never completes the
+/// WebSocket upgrade. Each byte arrives well within a resettable socket timeout, so only the
+/// caller-owned absolute deadline can end the setup promptly.
+struct TricklingUpgradeCdpServer {
+    chrome_script: String,
+    pid_file: PathBuf,
+    stop: Arc<AtomicBool>,
+    peer: Option<thread::JoinHandle<()>>,
+}
+
+impl TricklingUpgradeCdpServer {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind trickling CDP server");
+        listener
+            .set_nonblocking(true)
+            .expect("make trickling CDP listener nonblocking");
+        let port = listener
+            .local_addr()
+            .expect("read trickling CDP port")
+            .port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer_stop = Arc::clone(&stop);
+        let peer = thread::spawn(move || {
+            while !peer_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        serve_trickling_upgrade(stream, &peer_stop);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept trickling CDP WebSocket: {error}"),
+                }
+            }
+        });
+
+        let script = std::env::temp_dir().join(format!(
+            "basecrawl-trickling-cdp-chrome-{}-{port}.sh",
+            std::process::id()
+        ));
+        let pid_file = script.with_extension("pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {pid_file}\nprintf 'DevTools listening on ws://127.0.0.1:{port}/devtools/browser/trickling\\n' >&2\nexec sleep 60\n",
+                pid_file = pid_file.display(),
+            ),
+        )
+        .expect("write trickling fake Chrome launcher");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+                .expect("mark trickling fake Chrome launcher executable");
+        }
+
+        Self {
+            chrome_script: script.to_string_lossy().into_owned(),
+            pid_file,
+            stop,
+            peer: Some(peer),
+        }
+    }
+
+    fn assert_cleaned_up(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(pid) = fs::read_to_string(&self.pid_file) {
+                let process = PathBuf::from(format!("/proc/{}", pid.trim()));
+                if !process.exists() {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an interrupted WebSocket upgrade must not leave its Chrome process running"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        self.stop.store(true, Ordering::SeqCst);
+        self.peer
+            .take()
+            .expect("trickling peer is joined once")
+            .join()
+            .expect("trickling peer thread must not panic");
+    }
+}
+
+impl Drop for TricklingUpgradeCdpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(peer) = self.peer.take() {
+            peer.join()
+                .expect("trickling peer thread must not panic during cleanup");
+        }
+        let _ = fs::remove_file(&self.chrome_script);
+        let _ = fs::remove_file(&self.pid_file);
+    }
+}
+
 fn serve_delayed_cdp(mut stream: TcpStream) {
     complete_websocket_handshake(&mut stream);
 
@@ -275,6 +381,31 @@ fn serve_delayed_cdp(mut stream: TcpStream) {
             }
             unexpected => panic!("unexpected CDP method from setup fixture: {unexpected}"),
         }
+    }
+}
+
+fn serve_trickling_upgrade(mut stream: TcpStream, stop: &AtomicBool) {
+    stream
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .expect("bound trickling peer writes");
+
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        if stream.read_exact(&mut byte).is_err() {
+            return;
+        }
+        request.push(byte[0]);
+    }
+
+    for byte in b"HTTP/1.1 101 Switching Protocols\r\n" {
+        if stop.load(Ordering::SeqCst)
+            || stream.write_all(std::slice::from_ref(byte)).is_err()
+            || stream.flush().is_err()
+        {
+            return;
+        }
+        thread::sleep(UPGRADE_TRICKLE_INTERVAL);
     }
 }
 
@@ -544,4 +675,31 @@ fn screenshot_browser_setup_consumes_the_remaining_scrape_deadline() {
         start.elapsed()
     );
     delayed_cdp.assert_browser_terminated();
+}
+
+#[test]
+fn incomplete_trickling_websocket_upgrade_obeys_the_absolute_scrape_deadline() {
+    let mut trickling_cdp = TricklingUpgradeCdpServer::new();
+    let url = format!("{}/slow-render", server_base());
+    let start = Instant::now();
+    let out = run_with_chrome(
+        &[
+            &url,
+            "--formats",
+            "html",
+            "--robots",
+            "ignore",
+            "--timeout",
+            "1",
+        ],
+        &trickling_cdp.chrome_script,
+    );
+
+    assert_timeout_without_proof(&out);
+    trickling_cdp.assert_cleaned_up();
+    assert!(
+        start.elapsed() < Duration::from_millis(1_400),
+        "a trickling incomplete upgrade must not reset the one-second scrape deadline (took {:?})",
+        start.elapsed()
+    );
 }

@@ -150,6 +150,7 @@ impl Browser {
             true,
             Some(deadline),
         )
+        .map_err(|error| remaining_until(deadline).err().unwrap_or(error))
     }
 
     /// Calls [`Browser::new`] with options to launch a headless browser using whatever Chrome / Chromium
