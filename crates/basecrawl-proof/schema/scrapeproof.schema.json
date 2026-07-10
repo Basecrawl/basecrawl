@@ -55,7 +55,7 @@
         "server_ephemeral_pubkey": { "type": ["string", "null"] },
         "ct_scts": { "type": "array", "items": { "type": "string" } },
         "ocsp": { "type": ["string", "null"] },
-        "handshake_transcript_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
+        "handshake_transcript_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}([0-9a-f]{32})?$" }
       }
     },
     "response": {

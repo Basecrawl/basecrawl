@@ -493,18 +493,20 @@ fn fetch_https(
             Error::TlsCapture(format!("could not create rustls connection: {error}"))
         })?;
 
-    // Drive the handshake explicitly so the recorder has an exact, bounded wire view that ends at
-    // the client Finished. This is intentionally before any HTTP application data is written.
-    let wire = Arc::new(Mutex::new(HandshakeWire::default()));
-    let mut recorder = RecordingStream::new(tcp, wire.clone(), deadline);
+    // Drive the handshake explicitly. The verifier captures rustls's RFC 8446 CertificateVerify
+    // transcript digest, while this recorder retains only the plaintext ServerHello record needed
+    // to expose its ECDHE key share. This is intentionally before any HTTP application data is
+    // written.
+    let server_hello_wire = Arc::new(Mutex::new(ServerHelloWire::default()));
+    let mut recorder = RecordingStream::new(tcp, server_hello_wire.clone(), deadline);
     while connection.is_handshaking() {
         connection.complete_io(&mut recorder).map_err(classify_io)?;
     }
-    let handshake_wire = wire
+    let server_hello_wire = server_hello_wire
         .lock()
-        .expect("handshake wire mutex must not be poisoned")
+        .expect("ServerHello wire mutex must not be poisoned")
         .clone();
-    let tls = capture_tls_metadata(&connection, host, &capture, &handshake_wire)?;
+    let tls = capture_tls_metadata(&connection, host, &capture, &server_hello_wire)?;
 
     let request = build_http_request(url, host, port, config, credential_origin)?;
     let mut stream = rustls::StreamOwned::new(connection, recorder);
@@ -820,11 +822,11 @@ fn hash_header_lines(headers: &Headers) -> String {
     sha256_hex(lines.join("\n").as_bytes())
 }
 
-/// Side-channel state populated by the verifier while rustls validates the peer. It only stores
-/// the raw stapled OCSP response when the server actually sends one; absent evidence stays absent.
+/// Side-channel state populated by the verifier while rustls validates the peer.
 #[derive(Debug, Default)]
 struct TlsCaptureState {
     ocsp: Mutex<Option<Vec<u8>>>,
+    certificate_verify_transcript_hash: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -868,7 +870,18 @@ impl ServerCertVerifier for CapturingVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        let verified = self.inner.verify_tls13_signature(message, cert, dss)?;
+        if let Some(transcript_hash) =
+            certificate_verify_transcript_hash_from_verifier_input(message)
+        {
+            *self
+                .capture
+                .certificate_verify_transcript_hash
+                .lock()
+                .expect("CertificateVerify transcript mutex must not be poisoned") =
+                Some(transcript_hash);
+        }
+        Ok(verified)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -926,26 +939,28 @@ impl ServerCertVerifier for InsecureVerifier {
     }
 }
 
-/// Records encrypted TLS records during the handshake only. Capturing at this layer binds the
-/// digest to the actual client/server exchange without exposing application plaintext.
+/// Inbound TLS records retained only to parse the plaintext TLS 1.3 ServerHello key share.
 #[derive(Debug, Default, Clone)]
-struct HandshakeWire {
-    outbound: Vec<u8>,
+struct ServerHelloWire {
     inbound: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct RecordingStream {
     inner: TcpStream,
-    wire: Arc<Mutex<HandshakeWire>>,
+    server_hello_wire: Arc<Mutex<ServerHelloWire>>,
     deadline: Instant,
 }
 
 impl RecordingStream {
-    fn new(inner: TcpStream, wire: Arc<Mutex<HandshakeWire>>, deadline: Instant) -> Self {
+    fn new(
+        inner: TcpStream,
+        server_hello_wire: Arc<Mutex<ServerHelloWire>>,
+        deadline: Instant,
+    ) -> Self {
         Self {
             inner,
-            wire,
+            server_hello_wire,
             deadline,
         }
     }
@@ -956,9 +971,9 @@ impl Read for RecordingStream {
         set_socket_read_timeout(&self.inner, self.deadline)?;
         let read = self.inner.read(buffer)?;
         if read != 0 {
-            self.wire
+            self.server_hello_wire
                 .lock()
-                .expect("handshake wire mutex must not be poisoned")
+                .expect("ServerHello wire mutex must not be poisoned")
                 .inbound
                 .extend_from_slice(&buffer[..read]);
         }
@@ -969,15 +984,7 @@ impl Read for RecordingStream {
 impl Write for RecordingStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         set_socket_write_timeout(&self.inner, self.deadline)?;
-        let written = self.inner.write(buffer)?;
-        if written != 0 {
-            self.wire
-                .lock()
-                .expect("handshake wire mutex must not be poisoned")
-                .outbound
-                .extend_from_slice(&buffer[..written]);
-        }
-        Ok(written)
+        self.inner.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -1047,7 +1054,7 @@ fn capture_tls_metadata(
     connection: &ClientConnection,
     host: &str,
     capture: &TlsCaptureState,
-    handshake_wire: &HandshakeWire,
+    server_hello_wire: &ServerHelloWire,
 ) -> Result<Tls, Error> {
     let version = match connection.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "1.3".to_string(),
@@ -1077,7 +1084,7 @@ fn capture_tls_metadata(
         .collect::<Vec<_>>();
     let server_ephemeral_pubkey = if version == "1.3" {
         Some(
-            parse_server_key_share(&handshake_wire.inbound).ok_or_else(|| {
+            parse_server_key_share(&server_hello_wire.inbound).ok_or_else(|| {
                 Error::TlsCapture(
                     "TLS 1.3 ServerHello did not include an ECDHE key share".to_string(),
                 )
@@ -1086,7 +1093,42 @@ fn capture_tls_metadata(
     } else {
         None
     };
-    let transcript = handshake_wire_hash(handshake_wire);
+    let handshake_transcript_hash = if version == "1.3" {
+        let transcript_hash = capture
+            .certificate_verify_transcript_hash
+            .lock()
+            .expect("CertificateVerify transcript mutex must not be poisoned")
+            .clone()
+            .ok_or_else(|| {
+                Error::TlsCapture(
+                    "TLS 1.3 server CertificateVerify transcript digest was not captured"
+                        .to_string(),
+                )
+            })?;
+        let expected_width = match connection
+            .negotiated_cipher_suite()
+            .ok_or_else(|| Error::TlsCapture("TLS cipher suite was not negotiated".to_string()))?
+            .suite()
+        {
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+            | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 64,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 96,
+            suite => {
+                return Err(Error::TlsCapture(format!(
+                    "TLS 1.3 cipher suite {suite:?} has an unsupported transcript hash"
+                )));
+            }
+        };
+        if transcript_hash.len() != expected_width {
+            return Err(Error::TlsCapture(format!(
+                "TLS 1.3 CertificateVerify transcript digest width {} did not match negotiated cipher suite",
+                transcript_hash.len()
+            )));
+        }
+        Some(transcript_hash)
+    } else {
+        None
+    };
     let ct_scts = embedded_scts(&certs[0]);
     let ocsp = capture
         .ocsp
@@ -1109,21 +1151,28 @@ fn capture_tls_metadata(
             .map(|key_share| base64::prelude::BASE64_STANDARD.encode(key_share)),
         ct_scts,
         ocsp,
-        handshake_transcript_hash: Some(transcript),
+        handshake_transcript_hash,
     })
 }
 
-/// SHA-256 over the complete, direction-delimited handshake wire exchange. It includes exact TLS
-/// record headers and encrypted TLS 1.3 handshake records, and is captured before HTTP bytes flow.
-/// Fresh ClientHello randomness and ECDHE shares therefore make it non-static across sessions.
-fn handshake_wire_hash(wire: &HandshakeWire) -> String {
-    let mut hasher = Sha256::new();
-    for (direction, bytes) in [(b'C', &wire.outbound), (b'S', &wire.inbound)] {
-        hasher.update([direction]);
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
+/// Extract rustls's RFC 8446 server CertificateVerify input digest.
+///
+/// rustls creates this exact message from the negotiated transcript immediately before it verifies
+/// the server CertificateVerify signature. Thus the captured suffix is the cipher-suite-selected
+/// hash of encoded handshake messages from ClientHello through Certificate, including rustls's
+/// synthetic `message_hash` handling after HelloRetryRequest. It cannot contain TLS record
+/// framing, ciphertext, direction markers, Finished, or application data.
+fn certificate_verify_transcript_hash_from_verifier_input(message: &[u8]) -> Option<String> {
+    const CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify\0";
+    let padding = message.get(..64)?;
+    if padding.iter().any(|byte| *byte != 0x20) {
+        return None;
     }
-    hex_lower(&hasher.finalize())
+    let transcript_hash = message.get(64..)?.strip_prefix(CONTEXT)?;
+    match transcript_hash.len() {
+        32 | 48 => Some(hex_lower(transcript_hash)),
+        _ => None,
+    }
 }
 
 /// Locate the final TLS 1.3 ServerHello and return its key-share bytes. ServerHello remains
@@ -1415,20 +1464,121 @@ mod tests {
         assert_eq!(parse_server_key_share(&record), Some(vec![0xaa, 0xbb]));
     }
 
+    fn append_handshake_message(transcript: &mut Vec<u8>, message_type: u8, body: &[u8]) {
+        transcript.push(message_type);
+        transcript.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        transcript.extend_from_slice(body);
+    }
+
+    fn certificate_verify_input(transcript_hash: &[u8]) -> Vec<u8> {
+        let mut input = vec![0x20; 64];
+        input.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
+        input.extend_from_slice(transcript_hash);
+        input
+    }
+
     #[test]
-    fn handshake_wire_hash_is_direction_delimited_and_session_sensitive() {
-        let first = HandshakeWire {
-            outbound: b"client-one".to_vec(),
-            inbound: b"server".to_vec(),
-        };
-        let same = first.clone();
-        let second = HandshakeWire {
-            outbound: b"client-two".to_vec(),
-            inbound: b"server".to_vec(),
-        };
-        assert_eq!(handshake_wire_hash(&first), handshake_wire_hash(&same));
-        assert_ne!(handshake_wire_hash(&first), handshake_wire_hash(&second));
-        assert_eq!(handshake_wire_hash(&first).len(), 64);
+    fn certificate_verify_transcript_hash_matches_independent_rfc8446_vectors() {
+        use sha2::Sha384;
+
+        // Each message below is the encoded TLS handshake form:
+        // HandshakeType || uint24(length) || body. The values intentionally use tiny bodies so
+        // the independently recomputed preimage is easy to audit.
+        let mut normal = Vec::new();
+        append_handshake_message(&mut normal, 1, b"A"); // ClientHello
+        append_handshake_message(&mut normal, 2, b"D"); // ServerHello
+        append_handshake_message(&mut normal, 8, b"E"); // EncryptedExtensions
+        append_handshake_message(&mut normal, 11, b"F"); // Certificate
+
+        let normal_sha256 = Sha256::digest(&normal);
+        assert_eq!(
+            hex_lower(&normal_sha256),
+            "ce89915a97ec833005d2f0c45033cf3c6bbe7e73e232a095fe77e4efb82a08bb"
+        );
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&certificate_verify_input(
+                &normal_sha256
+            )),
+            Some("ce89915a97ec833005d2f0c45033cf3c6bbe7e73e232a095fe77e4efb82a08bb".to_string())
+        );
+
+        let normal_sha384 = Sha384::digest(&normal);
+        assert_eq!(
+            hex_lower(&normal_sha384),
+            "4700099dd95293f80daae66eba7ac62759fa9458329aee850a691d9b2ad019a30be3704d450656e1324932c00700206b"
+        );
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&certificate_verify_input(
+                &normal_sha384
+            )),
+            Some("4700099dd95293f80daae66eba7ac62759fa9458329aee850a691d9b2ad019a30be3704d450656e1324932c00700206b".to_string())
+        );
+
+        let mut client_hello = Vec::new();
+        append_handshake_message(&mut client_hello, 1, b"A");
+        let mut hello_retry = Vec::new();
+        // RFC 8446 §4.4.1 replaces ClientHello1 with this synthetic message_hash before HRR.
+        append_handshake_message(&mut hello_retry, 254, &Sha256::digest(&client_hello));
+        append_handshake_message(&mut hello_retry, 2, b"B"); // HelloRetryRequest
+        append_handshake_message(&mut hello_retry, 1, b"C"); // ClientHello2
+        append_handshake_message(&mut hello_retry, 2, b"D"); // ServerHello
+        append_handshake_message(&mut hello_retry, 8, b"E"); // EncryptedExtensions
+        append_handshake_message(&mut hello_retry, 11, b"F"); // Certificate
+
+        let hrr_sha256 = Sha256::digest(&hello_retry);
+        assert_eq!(
+            hex_lower(&hrr_sha256),
+            "c9d36ace3a0926deded5decab1ddf8be9cf0bf071646f9976692040fe91b8bad"
+        );
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&certificate_verify_input(
+                &hrr_sha256
+            )),
+            Some("c9d36ace3a0926deded5decab1ddf8be9cf0bf071646f9976692040fe91b8bad".to_string())
+        );
+
+        let mut hello_retry_sha384 = Vec::new();
+        append_handshake_message(&mut hello_retry_sha384, 254, &Sha384::digest(&client_hello));
+        append_handshake_message(&mut hello_retry_sha384, 2, b"B");
+        append_handshake_message(&mut hello_retry_sha384, 1, b"C");
+        append_handshake_message(&mut hello_retry_sha384, 2, b"D");
+        append_handshake_message(&mut hello_retry_sha384, 8, b"E");
+        append_handshake_message(&mut hello_retry_sha384, 11, b"F");
+
+        let hrr_sha384 = Sha384::digest(&hello_retry_sha384);
+        assert_eq!(
+            hex_lower(&hrr_sha384),
+            "1ea62e460e135ee17408dcb4248900c0a6db1d1d4a9a3cfb51eeafe3e4a2615004c29e33637368d8cd05f06b0b82726e"
+        );
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&certificate_verify_input(
+                &hrr_sha384
+            )),
+            Some("1ea62e460e135ee17408dcb4248900c0a6db1d1d4a9a3cfb51eeafe3e4a2615004c29e33637368d8cd05f06b0b82726e".to_string())
+        );
+    }
+
+    #[test]
+    fn certificate_verify_transcript_hash_rejects_non_rfc8446_verifier_inputs() {
+        let digest = [0x42; 32];
+        let mut wrong_context = certificate_verify_input(&digest);
+        wrong_context[64] = b'X';
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&wrong_context),
+            None
+        );
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&certificate_verify_input(
+                &[0x42; 31]
+            )),
+            None
+        );
+        assert_eq!(
+            certificate_verify_transcript_hash_from_verifier_input(&certificate_verify_input(
+                &[0x42; 49]
+            )),
+            None
+        );
     }
 
     #[test]

@@ -43,6 +43,20 @@ fn assert_lower_hex_64(value: &str, name: &str) {
     );
 }
 
+fn assert_lower_hex_transcript(value: &str, name: &str) {
+    assert!(
+        matches!(value.len(), 64 | 96),
+        "{name} must use the negotiated SHA-256 or SHA-384 width, got {}",
+        value.len()
+    );
+    assert!(
+        value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "{name} must be lowercase hex, got {value}"
+    );
+}
+
 fn decoded_chain(proof: &serde_json::Value) -> Vec<Vec<u8>> {
     let chain = proof["tls"]["server_cert_chain_der"]
         .as_array()
@@ -167,7 +181,7 @@ fn captures_tls13_chain_ground_truth_and_session_metadata() {
     let transcript = tls["handshake_transcript_hash"]
         .as_str()
         .expect("a TLS 1.3 fetch must have a transcript hash");
-    assert_lower_hex_64(transcript, "tls.handshake_transcript_hash");
+    assert_lower_hex_transcript(transcript, "tls.handshake_transcript_hash");
 
     let ephemeral = tls["server_ephemeral_pubkey"]
         .as_str()
@@ -247,7 +261,7 @@ fn captures_tls_metadata_for_named_open_web_targets() {
                 .is_empty(),
             "{name} must expose a server certificate chain"
         );
-        assert_lower_hex_64(
+        assert_lower_hex_transcript(
             tls["handshake_transcript_hash"]
                 .as_str()
                 .expect("transcript hash must be present"),
