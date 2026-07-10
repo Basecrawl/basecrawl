@@ -85,15 +85,16 @@ pub struct Response {
     /// Ordered redirect hops followed to reach the terminal response, in the order they were
     /// followed. Empty when the request was served without a redirect.
     pub redirect_chain: Vec<RedirectHop>,
-    /// Non-document browser requests accepted while producing the rendered DOM.
+    /// Browser requests accepted while producing rendered outputs, including top-level documents.
     pub render_subresource_count: u64,
-    /// Configured ceiling for accepted browser subresources.
+    /// Configured ceiling for accepted browser requests across the scrape.
     pub render_subresource_max_count: u64,
-    /// Sum of declared `Content-Length` values for accepted browser subresources.
+    /// Sum of actually observed browser-response bytes across the scrape.
     pub render_resource_bytes: u64,
-    /// Configured aggregate browser subresource-byte ceiling.
+    /// Configured aggregate browser-response byte ceiling.
     pub render_max_bytes: u64,
-    /// True when a browser request or response was blocked by an aggregate resource cap.
+    /// True when a browser request or response exhausted an aggregate resource cap. Exhaustion
+    /// fails the scrape before this response block can be emitted.
     pub render_resource_cap_exceeded: bool,
 }
 

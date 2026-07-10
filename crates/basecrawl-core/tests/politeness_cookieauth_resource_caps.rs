@@ -332,12 +332,12 @@ fn basic_auth_retrieves_real_httpbin_authenticated_view() {
     );
 }
 
-// VAL-CRAWL-131: count and cumulative-byte caps block render subresources and report the truncation.
+// VAL-CRAWL-131: count and cumulative-byte caps fail the scrape before emitting a partial proof.
 #[test]
 fn aggregate_render_resource_caps_are_enforced_and_exposed() {
     let (base, _) = server();
     let target = format!("{base}/assets");
-    let proof = scrape_json(&[
+    let output = run(&[
         &target,
         "--formats",
         "html",
@@ -348,20 +348,18 @@ fn aggregate_render_resource_caps_are_enforced_and_exposed() {
         "--max-render-bytes",
         "1024",
     ]);
-
-    let response = &proof["response"];
-    assert_eq!(response["render_subresource_max_count"], 2);
-    assert_eq!(response["render_max_bytes"], 1024);
     assert!(
-        response["render_resource_cap_exceeded"].as_bool() == Some(true),
-        "aggregate cap must be explicitly signaled in the proof: {response}"
+        !output.status.success(),
+        "aggregate cap exhaustion must fail the scrape"
     );
     assert!(
-        response["render_subresource_count"].as_u64().unwrap() <= 2,
-        "render accepted too many subresources: {response}"
+        output.stdout.is_empty(),
+        "resource exhaustion must not emit a partial ScrapeProof"
     );
+    let error: Value =
+        serde_json::from_slice(&output.stderr).expect("resource exhaustion must be structured");
     assert!(
-        response["render_resource_bytes"].as_u64().unwrap() <= 1024,
-        "render accepted too many cumulative bytes: {response}"
+        error["error"]["kind"] == "resource_budget_exceeded",
+        "aggregate cap error must be explicit: {error}"
     );
 }

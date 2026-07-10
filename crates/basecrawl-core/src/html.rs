@@ -44,6 +44,7 @@ pub fn render_page_until(
             max,
             url: url.to_string(),
         }),
+        Err(RenderError::ResourceBudgetExceeded) => Err(Error::ResourceBudgetExceeded),
         Err(e) => Err(Error::Render(e.to_string())),
     }
 }

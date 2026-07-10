@@ -80,13 +80,13 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "MILLISECONDS")]
     crawl_delay_ms: u64,
 
-    /// Maximum browser subresources accepted while rendering [default: 128]. Excess requests are
-    /// blocked and response.render_resource_cap_exceeded is set in the ScrapeProof.
+    /// Maximum browser requests accepted across HTML, screenshots, and pagination [default: 128].
+    /// Exhaustion fails with a structured resource_budget_exceeded error and no partial proof.
     #[arg(long, default_value_t = 128, value_name = "N")]
     max_render_subresources: usize,
 
-    /// Maximum cumulative declared browser subresource bytes accepted while rendering [default:
-    /// 20971520]. Responses that would exceed it are blocked and the proof indicates the cap.
+    /// Maximum cumulative observed browser-response bytes across HTML, screenshots, and pagination
+    /// [default: 20971520]. Exhaustion fails with a structured resource_budget_exceeded error.
     #[arg(long, default_value_t = 20 * 1024 * 1024, value_name = "BYTES")]
     max_render_bytes: u64,
 

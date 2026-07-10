@@ -63,6 +63,9 @@ pub enum Error {
     #[error("html render failed: {0}")]
     Render(String),
 
+    #[error("the scrape-owned browser request or byte budget was exhausted")]
+    ResourceBudgetExceeded,
+
     #[error("document extraction failed: {0}")]
     DocumentExtraction(String),
 
@@ -95,6 +98,7 @@ impl Error {
             Error::Redirect(_) => "redirect_error",
             Error::Fetch(_) => "fetch_error",
             Error::Render(_) => "render_error",
+            Error::ResourceBudgetExceeded => "resource_budget_exceeded",
             Error::DocumentExtraction(_) => "document_extraction",
             Error::EgressMetadata(_) => "egress_metadata_error",
             Error::Io(_) => "io_error",

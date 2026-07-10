@@ -67,9 +67,9 @@ pub struct ScrapeOptions {
     /// Minimum spacing between physical requests to the same origin, including robots, redirects,
     /// sitemap discovery, pagination, and browser subresources.
     pub crawl_delay_ms: u64,
-    /// Maximum browser subresources accepted while producing the rendered DOM.
+    /// Maximum browser requests accepted while producing all rendered outputs.
     pub max_render_subresources: usize,
-    /// Maximum sum of declared browser subresource response bytes accepted during one render.
+    /// Maximum observed browser-response bytes shared by all rendered outputs.
     pub max_render_bytes: u64,
     /// Screenshot viewport as `(width, height)` in CSS pixels (device-scale-factor 1).
     pub viewport: (u32, u32),
@@ -216,7 +216,13 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let needs_render = formats
         .iter()
         .any(|f| matches!(f, Format::Markdown | Format::Html));
-    let mut render_resource_usage = basecrawl_render::RenderResourceUsage::default();
+    // Every browser launch for this scrape receives this same budget. It includes top-level
+    // documents, redirects, subresources, HTML, screenshots, and paginated pages, so no stage can
+    // reset a cap that an earlier stage already consumed.
+    let render_resource_budget = basecrawl_render::RenderResourceBudget::new(
+        options.max_render_subresources,
+        options.max_render_bytes,
+    );
     let rendered_html: Option<String> = if options.render_enabled
         && needs_render
         && content_kind == ContentKind::Html
@@ -233,6 +239,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 crawl_delay: config.crawl_delay,
                 max_subresources: options.max_render_subresources,
                 max_resource_bytes: options.max_render_bytes,
+                max_document_bytes: options.max_body_bytes as u64,
+                resource_budget: Some(render_resource_budget.clone()),
                 wait_for: options.wait_for.clone(),
                 actions: options.actions.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,
@@ -241,7 +249,6 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             deadline,
         )?;
         redact_sensitive_request_echoes(&mut rendered.html, &options.headers);
-        render_resource_usage = rendered.resource_usage;
         Some(rendered.html)
     } else {
         None
@@ -301,22 +308,14 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                         crawl_delay: config.crawl_delay,
                         max_subresources: options.max_render_subresources,
                         max_resource_bytes: options.max_render_bytes,
+                        max_document_bytes: options.max_body_bytes as u64,
+                        resource_budget: Some(render_resource_budget.clone()),
                         width: options.viewport.0,
                         height: options.viewport.1,
                         full_page: options.screenshot_full_page,
                     },
                     deadline,
                 )?;
-                render_resource_usage.subresource_count = render_resource_usage
-                    .subresource_count
-                    .saturating_add(shot.resource_usage.subresource_count);
-                render_resource_usage.resource_bytes = render_resource_usage
-                    .resource_bytes
-                    .saturating_add(shot.resource_usage.resource_bytes);
-                render_resource_usage.cap_exceeded |= shot.resource_usage.cap_exceeded
-                    || render_resource_usage.subresource_count
-                        > options.max_render_subresources as u64
-                    || render_resource_usage.resource_bytes > options.max_render_bytes;
                 Value::String(shot.base64)
             }
             _ => Value::Null,
@@ -353,8 +352,13 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             if !visited.insert(key.clone()) {
                 break;
             }
-            let (page_markdown, page_html, page_base_next) =
-                crawl_page(&next, options, &config, deadline)?;
+            let (page_markdown, page_html, page_base_next) = crawl_page(
+                &next,
+                options,
+                &config,
+                render_resource_budget.clone(),
+                deadline,
+            )?;
             if let Some(agg) = aggregated_markdown.as_mut() {
                 agg.push_str("\n\n");
                 agg.push_str(&page_markdown);
@@ -372,6 +376,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     if Instant::now() >= deadline {
         return Err(Error::Timeout("scrape deadline exceeded".to_string()));
     }
+    let render_resource_usage = render_resource_budget.usage();
 
     // `result_hash` covers only the deterministic result surface; `screenshot` (and `json`) are
     // excluded so a viewport tweak that changes only pixels never shifts the byte-quorum digest.
@@ -430,6 +435,7 @@ fn crawl_page(
     url: &Url,
     options: &ScrapeOptions,
     config: &FetchConfig,
+    render_resource_budget: basecrawl_render::RenderResourceBudget,
     deadline: Instant,
 ) -> Result<(String, String, Url), Error> {
     let fetched = fetch::fetch_until(url, config, deadline)?;
@@ -450,6 +456,8 @@ fn crawl_page(
                 crawl_delay: config.crawl_delay,
                 max_subresources: options.max_render_subresources,
                 max_resource_bytes: options.max_render_bytes,
+                max_document_bytes: options.max_body_bytes as u64,
+                resource_budget: Some(render_resource_budget),
                 wait_for: options.wait_for.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,
                 ..basecrawl_render::RenderConfig::default()

@@ -4,7 +4,7 @@
 //! in `result.formats_produced.screenshot`. The screenshot is deliberately outside the
 //! deterministic `result_hash` surface (see [`crate::canonical`]).
 
-use basecrawl_render::{screenshot_until, Screenshot, ScreenshotConfig};
+use basecrawl_render::{screenshot_until, RenderError, Screenshot, ScreenshotConfig};
 use std::time::Instant;
 use url::Url;
 
@@ -24,7 +24,10 @@ pub fn capture_until(
     config: ScreenshotConfig,
     deadline: Instant,
 ) -> Result<Screenshot, Error> {
-    screenshot_until(url, &config, deadline).map_err(|e| Error::Render(e.to_string()))
+    screenshot_until(url, &config, deadline).map_err(|error| match error {
+        RenderError::ResourceBudgetExceeded => Error::ResourceBudgetExceeded,
+        error => Error::Render(error.to_string()),
+    })
 }
 
 /// Parse a `WIDTHxHEIGHT` viewport spec (e.g. `1280x800`) into `(width, height)`.

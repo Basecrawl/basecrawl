@@ -22,7 +22,7 @@ fn run(args: &[&str]) -> Output {
 }
 
 fn scrape_json(url: &str) -> serde_json::Value {
-    let out = run(&[url, "--formats", "rawHtml", "--no-js"]);
+    let out = run(&[url, "--formats", "rawHtml", "--no-js", "--robots", "ignore"]);
     assert!(
         out.status.success(),
         "expected a successful scrape of {url}, got {:?}\nstderr: {}",

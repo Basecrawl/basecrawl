@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use headless_chrome::browser::tab::RequestPausedDecision;
 use headless_chrome::protocol::cdp::{
-    Emulation, Fetch,
+    types::Event,
+    Emulation, Fetch, Network,
     Network::{ErrorReason, ResourceType},
     Page,
 };
@@ -40,18 +41,18 @@ pub const DEFAULT_MAX_REDIRECTS: usize = 20;
 /// content before giving up (each step is also bounded by the render deadline).
 pub const DEFAULT_MAX_SCROLLS: usize = 15;
 
-/// Default cap on the number of browser subresources accepted during one rendered DOM capture.
+/// Default cap on the number of browser requests accepted during one scrape.
 ///
-/// The top-level document is excluded because basecrawl's direct fetch already applies its
-/// `max_body_bytes` cap before Chromium is launched. Every image, stylesheet, script, font, XHR,
-/// and similar browser subresource is counted.
+/// Document navigations, redirects, images, stylesheets, scripts, fonts, XHR, and every other
+/// browser resource consume this one counter. The core shares a single budget across HTML renders,
+/// screenshots, and pagination rather than granting every Chromium launch a fresh cap.
 pub const DEFAULT_MAX_RENDER_SUBRESOURCES: usize = 128;
 
-/// Default cap on cumulative accepted subresource bytes during one rendered DOM capture.
+/// Default cap on cumulative accepted browser-response bytes during one scrape.
 ///
-/// CDP intercepts each response before its body is consumed, so a declared `Content-Length` that
-/// would carry the aggregate beyond this cap is blocked. Resources without a declared length are
-/// still bounded by the independent subresource count cap.
+/// CDP response bodies are streamed through the interceptor and charged by actual observed bytes.
+/// `Content-Length` can reject an obviously too-large response early, but never contributes to the
+/// accounting total by itself.
 pub const DEFAULT_MAX_RENDER_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Candidate Chromium executables searched (in order) when `CHROME` is unset.
@@ -77,6 +78,8 @@ pub enum RenderError {
     WaitFor { selector: String, detail: String },
     #[error("exceeded the maximum of {max} client-side redirect hop(s)")]
     TooManyRedirects { max: usize },
+    #[error("the scrape-owned browser request or byte budget was exhausted")]
+    ResourceBudgetExceeded,
     #[error("browser returned no serialized DOM")]
     NoContent,
 }
@@ -133,10 +136,17 @@ pub struct RenderConfig {
     pub credential_origin: Option<Url>,
     /// Minimum interval between browser requests to one scheme/host/port origin.
     pub crawl_delay: Duration,
-    /// Maximum non-document requests accepted during this render.
+    /// Maximum browser requests accepted by the shared scrape budget.
     pub max_subresources: usize,
-    /// Maximum sum of accepted declared subresource response bytes during this render.
+    /// Maximum observed browser-response bytes accepted by the shared scrape budget.
     pub max_resource_bytes: u64,
+    /// Maximum observed bytes for each top-level browser document. The core sets this to the
+    /// direct-fetch body cap, preventing Chromium from re-downloading an unbounded document after
+    /// the direct body was capped.
+    pub max_document_bytes: u64,
+    /// Optional scrape-owned budget shared by all browser launches. A standalone render without
+    /// this value creates one from `max_subresources` and `max_resource_bytes`.
+    pub resource_budget: Option<RenderResourceBudget>,
     /// When set, capture is blocked until an element matching this CSS selector exists (bounded by
     /// `timeout`). When present it takes precedence over the network-idle wait.
     pub wait_for: Option<String>,
@@ -171,6 +181,8 @@ impl Default for RenderConfig {
             crawl_delay: Duration::ZERO,
             max_subresources: DEFAULT_MAX_RENDER_SUBRESOURCES,
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
+            max_document_bytes: u64::MAX,
+            resource_budget: None,
             wait_for: None,
             network_idle: true,
             quiet_period: Duration::from_millis(DEFAULT_NETWORK_IDLE_QUIET_MS),
@@ -193,14 +205,14 @@ pub struct Rendered {
     pub resource_usage: RenderResourceUsage,
 }
 
-/// Browser subresource accounting and cap outcome surfaced by the core proof response block.
+/// Browser request accounting surfaced by the core proof response block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderResourceUsage {
-    /// Number of non-document browser requests accepted by the cap guard.
+    /// Number of browser requests accepted by the cap guard, including documents.
     pub subresource_count: u64,
-    /// Sum of declared `Content-Length` values for accepted browser subresource responses.
+    /// Sum of actually observed browser-response bytes.
     pub resource_bytes: u64,
-    /// Whether a request or response was blocked due to either configured aggregate cap.
+    /// Whether a request or response exhausted either configured aggregate cap.
     pub cap_exceeded: bool,
 }
 
@@ -208,6 +220,94 @@ pub struct RenderResourceUsage {
 struct RenderResourceState {
     usage: RenderResourceUsage,
     last_request_at: HashMap<RenderOrigin, Instant>,
+}
+
+#[derive(Debug)]
+struct BrowserResponseMeter {
+    observed_bytes: u64,
+    max_document_bytes: u64,
+    is_document: bool,
+}
+
+/// One mutable request/byte budget owned by a scrape.
+///
+/// Clones share the same counters. The core gives this object to every HTML render, screenshot,
+/// and paginated browser navigation so none can reset the configured caps.
+#[derive(Debug, Clone)]
+pub struct RenderResourceBudget {
+    max_requests: u64,
+    max_bytes: u64,
+    state: Arc<Mutex<RenderResourceState>>,
+}
+
+impl RenderResourceBudget {
+    /// Create a shared budget with explicit request and observed-byte ceilings.
+    pub fn new(max_requests: usize, max_bytes: u64) -> Self {
+        Self {
+            max_requests: max_requests as u64,
+            max_bytes,
+            state: Arc::new(Mutex::new(RenderResourceState::default())),
+        }
+    }
+
+    /// Return a snapshot suitable for the ScrapeProof response block.
+    pub fn usage(&self) -> RenderResourceUsage {
+        self.state
+            .lock()
+            .expect("render resource budget mutex must not be poisoned")
+            .usage
+            .clone()
+    }
+
+    fn ensure_available(&self) -> Result<(), RenderError> {
+        if self
+            .state
+            .lock()
+            .expect("render resource budget mutex must not be poisoned")
+            .usage
+            .cap_exceeded
+        {
+            Err(RenderError::ResourceBudgetExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remaining_bytes(&self) -> Result<u64, RenderError> {
+        let state = self
+            .state
+            .lock()
+            .expect("render resource budget mutex must not be poisoned");
+        if state.usage.cap_exceeded {
+            return Err(RenderError::ResourceBudgetExceeded);
+        }
+        Ok(self.max_bytes.saturating_sub(state.usage.resource_bytes))
+    }
+
+    fn charge_bytes(&self, bytes: u64) -> Result<(), RenderError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("render resource budget mutex must not be poisoned");
+        let Some(total) = state.usage.resource_bytes.checked_add(bytes) else {
+            state.usage.cap_exceeded = true;
+            return Err(RenderError::ResourceBudgetExceeded);
+        };
+        if state.usage.cap_exceeded || total > self.max_bytes {
+            state.usage.cap_exceeded = true;
+            return Err(RenderError::ResourceBudgetExceeded);
+        }
+        state.usage.resource_bytes = total;
+        Ok(())
+    }
+
+    fn exhaust(&self) {
+        self.state
+            .lock()
+            .expect("render resource budget mutex must not be poisoned")
+            .usage
+            .cap_exceeded = true;
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -231,16 +331,16 @@ fn resolve_chrome() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// Configure per-origin pacing and aggregate subresource caps before page navigation starts.
+/// Configure per-origin pacing and one scrape-owned browser resource budget.
 ///
-/// Fetch interception pauses every non-document request before it is sent, allowing the count cap
-/// and per-origin delay to prevent a request from reaching the origin. Response-stage interception
-/// happens after headers but before the body is consumed, so a declared content length that would
-/// exceed the cumulative cap is cancelled before it is downloaded.
+/// Request interception prevents requests above the count cap before transmission and rejects an
+/// obviously excessive declared length as an early hint. `Network.dataReceived` then charges every
+/// actually received byte, including chunked and invalid-length responses. An exhausted budget
+/// closes the tab promptly, and the render path turns that into a structured failure.
 fn configure_resource_guard(
-    tab: &Tab,
+    tab: &Arc<Tab>,
     config: &RenderConfig,
-    state: Arc<Mutex<RenderResourceState>>,
+    budget: RenderResourceBudget,
     credential_origin: &Url,
     deadline: Instant,
 ) -> Result<(), RenderError> {
@@ -258,47 +358,73 @@ fn configure_resource_guard(
     ];
     tab.enable_fetch(Some(&patterns), None)
         .map_err(|error| RenderError::Render(error.to_string()))?;
+    tab.call_method(Network::Enable {
+        max_total_buffer_size: None,
+        max_resource_buffer_size: None,
+        max_post_data_size: None,
+        report_direct_socket_traffic: None,
+        enable_durable_messages: None,
+    })
+    .map_err(|error| RenderError::Render(error.to_string()))?;
 
     let crawl_delay = config.crawl_delay;
-    let max_subresources = config.max_subresources as u64;
-    let max_resource_bytes = config.max_resource_bytes;
+    let max_document_bytes = config.max_document_bytes;
     let request_headers = config.request_headers.clone();
     let credential_origin = credential_origin.clone();
     let timeout = config.timeout;
+    let response_meters = Arc::new(Mutex::new(HashMap::<String, BrowserResponseMeter>::new()));
+    let response_meters_for_requests = Arc::clone(&response_meters);
+    let budget_for_requests = budget.clone();
     tab.enable_request_interception(Arc::new(
         move |_transport, _session_id, paused: Fetch::events::RequestPausedEvent| {
             let is_document = paused.params.resource_Type == ResourceType::Document;
             if paused.params.response_status_code.is_some() {
-                if is_document {
-                    return RequestPausedDecision::Continue(None);
-                }
                 let declared_bytes = paused
                     .params
                     .response_headers
                     .as_deref()
                     .and_then(declared_content_length)
-                    .unwrap_or(0);
-                let mut guard = state
-                    .lock()
-                    .expect("render resource guard mutex must not be poisoned");
-                if guard.usage.resource_bytes.saturating_add(declared_bytes) > max_resource_bytes {
-                    guard.usage.cap_exceeded = true;
+                    .unwrap_or_default();
+                let document_limit = if is_document {
+                    max_document_bytes
+                } else {
+                    u64::MAX
+                };
+                let early_limit = budget_for_requests
+                    .remaining_bytes()
+                    .ok()
+                    .map(|remaining| remaining.min(document_limit));
+                if early_limit.is_none_or(|limit| declared_bytes > limit) {
+                    budget_for_requests.exhaust();
                     return RequestPausedDecision::Fail(Fetch::FailRequest {
                         request_id: paused.params.request_id,
                         error_reason: ErrorReason::BlockedByClient,
                     });
                 }
-                guard.usage.resource_bytes += declared_bytes;
+                if let Some(network_id) = paused.params.network_id {
+                    response_meters_for_requests
+                        .lock()
+                        .expect("browser response meter mutex must not be poisoned")
+                        .insert(
+                            network_id.to_string(),
+                            BrowserResponseMeter {
+                                observed_bytes: 0,
+                                max_document_bytes,
+                                is_document,
+                            },
+                        );
+                }
                 return RequestPausedDecision::Continue(None);
             }
 
             let origin = origin_for_url(&paused.params.request.url);
-            let mut guard = state
+            let mut state = budget_for_requests
+                .state
                 .lock()
                 .expect("render resource guard mutex must not be poisoned");
             if let Some(origin) = origin {
                 if !crawl_delay.is_zero() {
-                    if let Some(previous) = guard.last_request_at.get(&origin) {
+                    if let Some(previous) = state.last_request_at.get(&origin) {
                         let elapsed = previous.elapsed();
                         if elapsed < crawl_delay {
                             let wait = crawl_delay - elapsed;
@@ -318,27 +444,70 @@ fn configure_resource_guard(
                         }
                     }
                 }
-                guard.last_request_at.insert(origin, Instant::now());
+                state.last_request_at.insert(origin, Instant::now());
             }
-            if is_document {
-                return continue_with_effective_headers(
-                    paused,
-                    &request_headers,
-                    &credential_origin,
-                );
-            }
-            if guard.usage.subresource_count >= max_subresources {
-                guard.usage.cap_exceeded = true;
+            if state.usage.cap_exceeded
+                || state.usage.subresource_count >= budget_for_requests.max_requests
+            {
+                state.usage.cap_exceeded = true;
                 return RequestPausedDecision::Fail(Fetch::FailRequest {
                     request_id: paused.params.request_id,
                     error_reason: ErrorReason::BlockedByClient,
                 });
             }
-            guard.usage.subresource_count += 1;
+            state.usage.subresource_count += 1;
+            drop(state);
             continue_with_effective_headers(paused, &request_headers, &credential_origin)
         },
     ))
-    .map_err(|error| RenderError::Render(error.to_string()))
+    .map_err(|error| RenderError::Render(error.to_string()))?;
+
+    let response_meters_for_bytes = Arc::clone(&response_meters);
+    let budget_for_bytes = budget.clone();
+    let tab_for_abort = Arc::clone(tab);
+    tab.add_event_listener(Arc::new(move |event: &Event| {
+        let Event::NetworkDataReceived(event) = event else {
+            return;
+        };
+        // CDP's encoded length is the received transfer size. Some Chromium response paths report
+        // it as zero on an individual chunk, so fall back to the observed payload length rather
+        // than letting a chunked or malformed-length response escape accounting.
+        let encoded_bytes = u64::from(event.params.encoded_data_length);
+        let bytes = if encoded_bytes == 0 {
+            u64::from(event.params.data_length)
+        } else {
+            encoded_bytes
+        };
+        if bytes == 0 {
+            return;
+        }
+        let exceeded = {
+            let mut meters = response_meters_for_bytes
+                .lock()
+                .expect("browser response meter mutex must not be poisoned");
+            let Some(meter) = meters.get_mut(&event.params.request_id.to_string()) else {
+                return;
+            };
+            match meter.observed_bytes.checked_add(bytes) {
+                None => true,
+                Some(total) if meter.is_document && total > meter.max_document_bytes => true,
+                Some(_) if budget_for_bytes.charge_bytes(bytes).is_err() => true,
+                Some(total) => {
+                    meter.observed_bytes = total;
+                    false
+                }
+            }
+        };
+        if exceeded {
+            budget_for_bytes.exhaust();
+            let tab = Arc::clone(&tab_for_abort);
+            thread::spawn(move || {
+                let _ = tab.close_target();
+            });
+        }
+    }))
+    .map_err(|error| RenderError::Render(error.to_string()))?;
+    Ok(())
 }
 
 /// Resume a paused request with caller headers restricted to their initiating origin.
@@ -641,6 +810,10 @@ pub fn render_until(
     deadline: Instant,
 ) -> Result<Rendered, RenderError> {
     let deadline = effective_deadline(deadline, config.timeout);
+    let resource_budget = config.resource_budget.clone().unwrap_or_else(|| {
+        RenderResourceBudget::new(config.max_subresources, config.max_resource_bytes)
+    });
+    resource_budget.ensure_available()?;
     let browser = launch_browser(deadline, config.timeout, (1280, 800))?;
     let tab = browser
         .new_tab()
@@ -651,12 +824,11 @@ pub fn render_until(
         tab.set_user_agent(&config.user_agent, None, None)
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
-    let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
     set_tab_deadline(&tab, deadline, config.timeout)?;
     configure_resource_guard(
         &tab,
         config,
-        Arc::clone(&resource_state),
+        resource_budget.clone(),
         config.credential_origin.as_ref().unwrap_or(url),
         deadline,
     )?;
@@ -674,7 +846,7 @@ pub fn render_until(
 
     set_tab_deadline(&tab, deadline, config.timeout)?;
     tab.navigate_to(url.as_str())
-        .map_err(|e| RenderError::Render(e.to_string()))?;
+        .map_err(|error| render_failure(error.to_string(), &resource_budget))?;
     // `navigate_to` returns without waiting for the load to finish. We deliberately do NOT call
     // `wait_until_navigated` here: it performs its own internal network-idle wait (doubling the
     // settle delay) and, on a client-side redirect loop (a page that never stops navigating), would
@@ -686,27 +858,39 @@ pub fn render_until(
         // An explicit selector is the authoritative capture signal (it also handles content injected
         // by a timer with no network activity, which a network-idle wait would miss).
         Some(selector) => {
-            wait_for_selector_and_follow_redirects(&tab, selector, config, deadline)?;
+            wait_for_selector_and_follow_redirects(
+                &tab,
+                selector,
+                config,
+                &resource_budget,
+                deadline,
+            )
+            .map_err(|error| render_or_budget_error(error, &resource_budget))?;
         }
         None => {
             // Wait for network idle while following (and bounding) any client-side redirect.
-            settle_and_follow_redirects(&tab, config, deadline)?;
+            settle_and_follow_redirects(&tab, config, &resource_budget, deadline)
+                .map_err(|error| render_or_budget_error(error, &resource_budget))?;
         }
     }
+    resource_budget.ensure_available()?;
     // Dismiss a cookie/consent overlay (best-effort) so the underlying page, not the banner, is the
     // captured content; let anything the dismissal reveals settle briefly.
     if config.dismiss_consent && dismiss_consent(&tab, deadline, config.timeout)? {
-        settle_quiet(&tab, config.quiet_period, deadline);
+        settle_quiet(&tab, config.quiet_period, &resource_budget, deadline);
     }
+    resource_budget.ensure_available()?;
 
     // Collect infinite-scroll / lazy-loaded content by scrolling until the page stops growing.
     if config.auto_scroll {
         auto_scroll(&tab, config, deadline)?;
     }
+    resource_budget.ensure_available()?;
 
     // Execute the supplied scripted actions in order (click / scroll / wait / wait-for-selector).
     for action in &config.actions {
-        run_action(&tab, action, config, deadline)?;
+        run_action(&tab, action, config, &resource_budget, deadline)?;
+        resource_budget.ensure_available()?;
     }
 
     // Inline iframe/shadow content, strip scripts/styles, and serialize (one CDP round-trip).
@@ -717,14 +901,10 @@ pub fn render_until(
 
     match evaluated.value {
         Some(serde_json::Value::String(html)) if !html.is_empty() => {
-            let resource_usage = resource_state
-                .lock()
-                .expect("render resource guard mutex must not be poisoned")
-                .usage
-                .clone();
+            resource_budget.ensure_available()?;
             Ok(Rendered {
                 html,
-                resource_usage,
+                resource_usage: resource_budget.usage(),
             })
         }
         _ => Err(RenderError::NoContent),
@@ -775,6 +955,7 @@ fn is_committed_http(url: &str) -> bool {
 fn settle_and_follow_redirects(
     tab: &Tab,
     config: &RenderConfig,
+    resource_budget: &RenderResourceBudget,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     let poll = Duration::from_millis(100);
@@ -785,6 +966,7 @@ fn settle_and_follow_redirects(
     let mut hops = 0usize;
 
     loop {
+        resource_budget.ensure_available()?;
         set_tab_deadline(tab, deadline, config.timeout)?;
 
         let live = current_url_no_fragment(tab);
@@ -843,6 +1025,7 @@ fn wait_for_selector_and_follow_redirects(
     tab: &Tab,
     selector: &str,
     config: &RenderConfig,
+    resource_budget: &RenderResourceBudget,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     let poll = Duration::from_millis(50);
@@ -855,6 +1038,7 @@ fn wait_for_selector_and_follow_redirects(
     let mut hops = 0usize;
 
     loop {
+        resource_budget.ensure_available()?;
         set_tab_deadline(tab, deadline, config.timeout)?;
         let live = current_url_no_fragment(tab);
         if is_committed_http(&live) {
@@ -894,11 +1078,19 @@ fn wait_for_selector_and_follow_redirects(
 
 /// Best-effort short settle used after a consent dismissal: return once the network is idle, or
 /// after a brief grace window, whichever comes first (never longer than the render deadline).
-fn settle_quiet(tab: &Tab, quiet: Duration, deadline: Instant) {
+fn settle_quiet(
+    tab: &Tab,
+    quiet: Duration,
+    resource_budget: &RenderResourceBudget,
+    deadline: Instant,
+) {
     let poll = Duration::from_millis(50);
     let quiet_ms = quiet.as_millis() as i64;
     let step_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
     loop {
+        if resource_budget.ensure_available().is_err() {
+            return;
+        }
         if Instant::now() >= step_deadline {
             return;
         }
@@ -949,6 +1141,7 @@ fn run_action(
     tab: &Tab,
     action: &Action,
     config: &RenderConfig,
+    resource_budget: &RenderResourceBudget,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     match action {
@@ -974,7 +1167,13 @@ fn run_action(
             remaining(deadline, config.timeout)?;
         }
         Action::WaitForSelector { selector } => {
-            wait_for_selector_and_follow_redirects(tab, selector, config, deadline)?;
+            wait_for_selector_and_follow_redirects(
+                tab,
+                selector,
+                config,
+                resource_budget,
+                deadline,
+            )?;
         }
     }
     Ok(())
@@ -1000,10 +1199,14 @@ pub struct ScreenshotConfig {
     pub credential_origin: Option<Url>,
     /// Minimum interval between browser requests to one origin during capture.
     pub crawl_delay: Duration,
-    /// Maximum non-document requests accepted during capture.
+    /// Maximum browser requests accepted by the shared scrape budget.
     pub max_subresources: usize,
-    /// Maximum sum of accepted declared subresource response bytes during capture.
+    /// Maximum observed browser-response bytes accepted by the shared scrape budget.
     pub max_resource_bytes: u64,
+    /// Maximum observed bytes for an individual top-level browser document.
+    pub max_document_bytes: u64,
+    /// Optional scrape-owned budget shared with HTML renders and pagination.
+    pub resource_budget: Option<RenderResourceBudget>,
     /// Layout viewport width in CSS pixels. Captured at device-scale-factor 1, so the produced
     /// image width equals this value exactly.
     pub width: u32,
@@ -1024,6 +1227,8 @@ impl Default for ScreenshotConfig {
             crawl_delay: Duration::ZERO,
             max_subresources: DEFAULT_MAX_RENDER_SUBRESOURCES,
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
+            max_document_bytes: u64::MAX,
+            resource_budget: None,
             width: DEFAULT_VIEWPORT_WIDTH,
             height: DEFAULT_VIEWPORT_HEIGHT,
             full_page: false,
@@ -1079,6 +1284,10 @@ pub fn screenshot_until(
     deadline: Instant,
 ) -> Result<Screenshot, RenderError> {
     let deadline = effective_deadline(deadline, config.timeout);
+    let resource_budget = config.resource_budget.clone().unwrap_or_else(|| {
+        RenderResourceBudget::new(config.max_subresources, config.max_resource_bytes)
+    });
+    resource_budget.ensure_available()?;
     let browser = launch_browser(deadline, config.timeout, (config.width, config.height))?;
     let tab = browser
         .new_tab()
@@ -1089,20 +1298,21 @@ pub fn screenshot_until(
         tab.set_user_agent(&config.user_agent, None, None)
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
-    let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
     let resource_config = RenderConfig {
         request_headers: config.request_headers.clone(),
         credential_origin: config.credential_origin.clone(),
         crawl_delay: config.crawl_delay,
         max_subresources: config.max_subresources,
         max_resource_bytes: config.max_resource_bytes,
+        max_document_bytes: config.max_document_bytes,
+        resource_budget: Some(resource_budget.clone()),
         ..RenderConfig::default()
     };
     set_tab_deadline(&tab, deadline, config.timeout)?;
     configure_resource_guard(
         &tab,
         &resource_config,
-        Arc::clone(&resource_state),
+        resource_budget.clone(),
         resource_config.credential_origin.as_ref().unwrap_or(url),
         deadline,
     )?;
@@ -1128,7 +1338,7 @@ pub fn screenshot_until(
 
     set_tab_deadline(&tab, deadline, config.timeout)?;
     tab.navigate_to(url.as_str())
-        .map_err(|e| RenderError::Render(e.to_string()))?;
+        .map_err(|error| render_failure(error.to_string(), &resource_budget))?;
     let navigation_config = RenderConfig {
         timeout: config.timeout,
         request_headers: config.request_headers.clone(),
@@ -1136,9 +1346,13 @@ pub fn screenshot_until(
         crawl_delay: config.crawl_delay,
         max_subresources: config.max_subresources,
         max_resource_bytes: config.max_resource_bytes,
+        max_document_bytes: config.max_document_bytes,
+        resource_budget: Some(resource_budget.clone()),
         ..RenderConfig::default()
     };
-    settle_and_follow_redirects(&tab, &navigation_config, deadline)?;
+    settle_and_follow_redirects(&tab, &navigation_config, &resource_budget, deadline)
+        .map_err(|error| render_or_budget_error(error, &resource_budget))?;
+    resource_budget.ensure_available()?;
 
     let clip_height = if config.full_page {
         set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -1174,16 +1388,26 @@ pub fn screenshot_until(
         return Err(RenderError::NoContent);
     }
     remaining(deadline, config.timeout)?;
-    let resource_usage = resource_state
-        .lock()
-        .expect("render resource guard mutex must not be poisoned")
-        .usage
-        .clone();
+    resource_budget.ensure_available()?;
     Ok(Screenshot {
         png,
         base64: data,
-        resource_usage,
+        resource_usage: resource_budget.usage(),
     })
+}
+
+/// Preserve a specific control-flow error, but prefer a budget exhaustion recorded by the
+/// interceptor over Chromium's generic `ERR_BLOCKED_BY_CLIENT` navigation failure.
+fn render_or_budget_error(error: RenderError, budget: &RenderResourceBudget) -> RenderError {
+    if budget.usage().cap_exceeded {
+        RenderError::ResourceBudgetExceeded
+    } else {
+        error
+    }
+}
+
+fn render_failure(message: String, budget: &RenderResourceBudget) -> RenderError {
+    render_or_budget_error(RenderError::Render(message), budget)
 }
 
 #[cfg(test)]
