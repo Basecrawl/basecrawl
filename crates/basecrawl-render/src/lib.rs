@@ -55,6 +55,12 @@ pub const DEFAULT_MAX_RENDER_SUBRESOURCES: usize = 128;
 /// accounting total by itself.
 pub const DEFAULT_MAX_RENDER_BYTES: u64 = 20 * 1024 * 1024;
 
+/// A caller-supplied check run before Chromium transmits a top-level document request.
+///
+/// The renderer keeps this callback neutral so it does not depend on core policy code. The core
+/// uses it for robots decisions, while standalone render consumers may leave it unset.
+pub type DocumentRequestPolicy = Arc<dyn Fn(&Url) -> Result<(), String> + Send + Sync>;
+
 /// Candidate Chromium executables searched (in order) when `CHROME` is unset.
 const CHROME_CANDIDATES: &[&str] = &[
     "/usr/bin/google-chrome-stable",
@@ -80,6 +86,8 @@ pub enum RenderError {
     TooManyRedirects { max: usize },
     #[error("the scrape-owned browser request or byte budget was exhausted")]
     ResourceBudgetExceeded,
+    #[error("top-level document policy denied navigation: {0}")]
+    DocumentPolicyDenied(String),
     #[error("browser returned no serialized DOM")]
     NoContent,
 }
@@ -120,7 +128,7 @@ pub enum Action {
 }
 
 /// Configuration for a single render.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RenderConfig {
     /// Whole-render timeout (navigation + smart-wait + evaluation). A page that never settles is
     /// aborted at this bound with [`RenderError::Timeout`] rather than hanging indefinitely.
@@ -147,6 +155,9 @@ pub struct RenderConfig {
     /// Optional scrape-owned budget shared by all browser launches. A standalone render without
     /// this value creates one from `max_subresources` and `max_resource_bytes`.
     pub resource_budget: Option<RenderResourceBudget>,
+    /// Optional policy consulted before every top-level document request. This deliberately does
+    /// not run for iframe documents or other subresources.
+    pub document_request_policy: Option<DocumentRequestPolicy>,
     /// When set, capture is blocked until an element matching this CSS selector exists (bounded by
     /// `timeout`). When present it takes precedence over the network-idle wait.
     pub wait_for: Option<String>,
@@ -183,6 +194,7 @@ impl Default for RenderConfig {
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
             max_document_bytes: u64::MAX,
             resource_budget: None,
+            document_request_policy: None,
             wait_for: None,
             network_idle: true,
             quiet_period: Duration::from_millis(DEFAULT_NETWORK_IDLE_QUIET_MS),
@@ -342,6 +354,8 @@ fn configure_resource_guard(
     config: &RenderConfig,
     budget: RenderResourceBudget,
     credential_origin: &Url,
+    top_frame_id: Page::FrameId,
+    document_policy_denial: Arc<Mutex<Option<String>>>,
     deadline: Instant,
 ) -> Result<(), RenderError> {
     let patterns = [
@@ -371,6 +385,7 @@ fn configure_resource_guard(
     let max_document_bytes = config.max_document_bytes;
     let request_headers = config.request_headers.clone();
     let credential_origin = credential_origin.clone();
+    let document_request_policy = config.document_request_policy.clone();
     let timeout = config.timeout;
     let response_meters = Arc::new(Mutex::new(HashMap::<String, BrowserResponseMeter>::new()));
     let response_meters_for_requests = Arc::clone(&response_meters);
@@ -415,6 +430,26 @@ fn configure_resource_guard(
                         );
                 }
                 return RequestPausedDecision::Continue(None);
+            }
+
+            if is_document && paused.params.frame_id == top_frame_id {
+                if let Some(policy) = &document_request_policy {
+                    match Url::parse(&paused.params.request.url)
+                        .map_err(|error| error.to_string())
+                        .and_then(|target| policy(&target))
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            *document_policy_denial
+                                .lock()
+                                .expect("document policy mutex must not be poisoned") = Some(error);
+                            return RequestPausedDecision::Fail(Fetch::FailRequest {
+                                request_id: paused.params.request_id,
+                                error_reason: ErrorReason::BlockedByClient,
+                            });
+                        }
+                    }
+                }
             }
 
             let origin = origin_for_url(&paused.params.request.url);
@@ -818,6 +853,7 @@ pub fn render_until(
     let tab = browser
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
+    let document_policy_denial = Arc::new(Mutex::new(None));
     set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
         set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -825,11 +861,14 @@ pub fn render_until(
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
     set_tab_deadline(&tab, deadline, config.timeout)?;
+    let top_frame_id = top_frame_id(&tab)?;
     configure_resource_guard(
         &tab,
         config,
         resource_budget.clone(),
         config.credential_origin.as_ref().unwrap_or(url),
+        top_frame_id,
+        Arc::clone(&document_policy_denial),
         deadline,
     )?;
 
@@ -845,8 +884,9 @@ pub fn render_until(
     .map_err(|e| RenderError::Render(e.to_string()))?;
 
     set_tab_deadline(&tab, deadline, config.timeout)?;
-    tab.navigate_to(url.as_str())
-        .map_err(|error| render_failure(error.to_string(), &resource_budget))?;
+    tab.navigate_to(url.as_str()).map_err(|error| {
+        render_failure_with_policy(error.to_string(), &resource_budget, &document_policy_denial)
+    })?;
     // `navigate_to` returns without waiting for the load to finish. We deliberately do NOT call
     // `wait_until_navigated` here: it performs its own internal network-idle wait (doubling the
     // settle delay) and, on a client-side redirect loop (a page that never stops navigating), would
@@ -865,14 +905,18 @@ pub fn render_until(
                 &resource_budget,
                 deadline,
             )
-            .map_err(|error| render_or_budget_error(error, &resource_budget))?;
+            .map_err(|error| {
+                render_or_policy_error(error, &resource_budget, &document_policy_denial)
+            })?;
         }
         None => {
             // Wait for network idle while following (and bounding) any client-side redirect.
-            settle_and_follow_redirects(&tab, config, &resource_budget, deadline)
-                .map_err(|error| render_or_budget_error(error, &resource_budget))?;
+            settle_and_follow_redirects(&tab, config, &resource_budget, deadline).map_err(
+                |error| render_or_policy_error(error, &resource_budget, &document_policy_denial),
+            )?;
         }
     }
+    ensure_document_policy_allowed(&document_policy_denial)?;
     resource_budget.ensure_available()?;
     // Dismiss a cookie/consent overlay (best-effort) so the underlying page, not the banner, is the
     // captured content; let anything the dismissal reveals settle briefly.
@@ -892,6 +936,7 @@ pub fn render_until(
         run_action(&tab, action, config, &resource_budget, deadline)?;
         resource_budget.ensure_available()?;
     }
+    ensure_document_policy_allowed(&document_policy_denial)?;
 
     // Inline iframe/shadow content, strip scripts/styles, and serialize (one CDP round-trip).
     set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -1185,7 +1230,7 @@ pub const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
 
 /// Configuration for a single deterministic screenshot capture.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScreenshotConfig {
     /// Whole-capture timeout (navigation + rasterization).
     pub timeout: Duration,
@@ -1207,6 +1252,8 @@ pub struct ScreenshotConfig {
     pub max_document_bytes: u64,
     /// Optional scrape-owned budget shared with HTML renders and pagination.
     pub resource_budget: Option<RenderResourceBudget>,
+    /// Optional policy consulted before every top-level document request during capture.
+    pub document_request_policy: Option<DocumentRequestPolicy>,
     /// Layout viewport width in CSS pixels. Captured at device-scale-factor 1, so the produced
     /// image width equals this value exactly.
     pub width: u32,
@@ -1229,6 +1276,7 @@ impl Default for ScreenshotConfig {
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
             max_document_bytes: u64::MAX,
             resource_budget: None,
+            document_request_policy: None,
             width: DEFAULT_VIEWPORT_WIDTH,
             height: DEFAULT_VIEWPORT_HEIGHT,
             full_page: false,
@@ -1292,6 +1340,7 @@ pub fn screenshot_until(
     let tab = browser
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
+    let document_policy_denial = Arc::new(Mutex::new(None));
     set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
         set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -1306,14 +1355,18 @@ pub fn screenshot_until(
         max_resource_bytes: config.max_resource_bytes,
         max_document_bytes: config.max_document_bytes,
         resource_budget: Some(resource_budget.clone()),
+        document_request_policy: config.document_request_policy.clone(),
         ..RenderConfig::default()
     };
     set_tab_deadline(&tab, deadline, config.timeout)?;
+    let top_frame_id = top_frame_id(&tab)?;
     configure_resource_guard(
         &tab,
         &resource_config,
         resource_budget.clone(),
         resource_config.credential_origin.as_ref().unwrap_or(url),
+        top_frame_id,
+        Arc::clone(&document_policy_denial),
         deadline,
     )?;
 
@@ -1337,8 +1390,9 @@ pub fn screenshot_until(
     .map_err(|e| RenderError::Render(e.to_string()))?;
 
     set_tab_deadline(&tab, deadline, config.timeout)?;
-    tab.navigate_to(url.as_str())
-        .map_err(|error| render_failure(error.to_string(), &resource_budget))?;
+    tab.navigate_to(url.as_str()).map_err(|error| {
+        render_failure_with_policy(error.to_string(), &resource_budget, &document_policy_denial)
+    })?;
     let navigation_config = RenderConfig {
         timeout: config.timeout,
         request_headers: config.request_headers.clone(),
@@ -1348,10 +1402,13 @@ pub fn screenshot_until(
         max_resource_bytes: config.max_resource_bytes,
         max_document_bytes: config.max_document_bytes,
         resource_budget: Some(resource_budget.clone()),
+        document_request_policy: config.document_request_policy.clone(),
         ..RenderConfig::default()
     };
-    settle_and_follow_redirects(&tab, &navigation_config, &resource_budget, deadline)
-        .map_err(|error| render_or_budget_error(error, &resource_budget))?;
+    settle_and_follow_redirects(&tab, &navigation_config, &resource_budget, deadline).map_err(
+        |error| render_or_policy_error(error, &resource_budget, &document_policy_denial),
+    )?;
+    ensure_document_policy_allowed(&document_policy_denial)?;
     resource_budget.ensure_available()?;
 
     let clip_height = if config.full_page {
@@ -1406,8 +1463,45 @@ fn render_or_budget_error(error: RenderError, budget: &RenderResourceBudget) -> 
     }
 }
 
-fn render_failure(message: String, budget: &RenderResourceBudget) -> RenderError {
-    render_or_budget_error(RenderError::Render(message), budget)
+fn top_frame_id(tab: &Tab) -> Result<Page::FrameId, RenderError> {
+    tab.call_method(Page::GetFrameTree(None))
+        .map(|tree| tree.frame_tree.frame.id)
+        .map_err(|error| RenderError::Render(error.to_string()))
+}
+
+fn document_policy_error(
+    document_policy_denial: &Arc<Mutex<Option<String>>>,
+) -> Option<RenderError> {
+    document_policy_denial
+        .lock()
+        .expect("document policy mutex must not be poisoned")
+        .clone()
+        .map(RenderError::DocumentPolicyDenied)
+}
+
+fn ensure_document_policy_allowed(
+    document_policy_denial: &Arc<Mutex<Option<String>>>,
+) -> Result<(), RenderError> {
+    document_policy_error(document_policy_denial).map_or(Ok(()), Err)
+}
+
+/// Prefer a document-policy denial over Chromium's generic blocked-client error, then preserve
+/// the existing budget-specific error mapping.
+fn render_or_policy_error(
+    error: RenderError,
+    budget: &RenderResourceBudget,
+    document_policy_denial: &Arc<Mutex<Option<String>>>,
+) -> RenderError {
+    document_policy_error(document_policy_denial)
+        .unwrap_or_else(|| render_or_budget_error(error, budget))
+}
+
+fn render_failure_with_policy(
+    message: String,
+    budget: &RenderResourceBudget,
+    document_policy_denial: &Arc<Mutex<Option<String>>>,
+) -> RenderError {
+    render_or_policy_error(RenderError::Render(message), budget, document_policy_denial)
 }
 
 #[cfg(test)]

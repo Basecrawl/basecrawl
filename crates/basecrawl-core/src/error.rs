@@ -110,6 +110,17 @@ impl Error {
         1
     }
 
+    /// Restore a robots denial recorded by the renderer's dependency-neutral document policy hook.
+    ///
+    /// The render crate intentionally does not depend on core policy types, so it carries a
+    /// serialized decision detail. Invalid detail remains a normal render failure rather than
+    /// fabricating a policy error.
+    pub fn from_document_policy_denial(detail: String) -> Self {
+        serde_json::from_str::<Value>(&detail)
+            .map(Self::RobotsDenied)
+            .unwrap_or(Self::Render(detail))
+    }
+
     /// Structured `{"error": {...}}` representation for stderr.
     pub fn to_json(&self) -> Value {
         let mut obj = serde_json::Map::new();

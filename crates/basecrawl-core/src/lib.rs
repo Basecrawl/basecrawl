@@ -30,6 +30,7 @@ use content::ContentKind;
 use fetch::{FetchConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -160,11 +161,12 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         crawl_delay: Duration::from_millis(options.crawl_delay_ms),
         ..FetchConfig::default()
     };
-    let robots_decision = robots::consult(&url, &config, options.robots_policy, deadline)?;
-    if robots_decision.denies_fetch() {
-        return Err(Error::RobotsDenied(robots_decision.to_value()));
-    }
-    let fetched = fetch::fetch_until(&url, &config, deadline)?;
+    let document_policy =
+        robots::DocumentPolicy::new(config.clone(), options.robots_policy, deadline);
+    let fetched = fetch::fetch_document_until(&url, &config, deadline, |target| {
+        document_policy.check(target)
+    })?;
+    let robots_decision = document_policy.initial_decision();
 
     // The request-side hashes cover the one validated ordered effective header list. The empty GET
     // body remains explicitly hashed.
@@ -241,6 +243,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 max_resource_bytes: options.max_render_bytes,
                 max_document_bytes: options.max_body_bytes as u64,
                 resource_budget: Some(render_resource_budget.clone()),
+                document_request_policy: Some(render_document_policy(document_policy.clone())),
                 wait_for: options.wait_for.clone(),
                 actions: options.actions.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,
@@ -293,6 +296,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 );
                 if let Value::Object(metadata) = &mut value {
                     metadata.insert("robotsPolicy".to_string(), robots_decision.to_value());
+                    metadata.insert("robotsPolicyHops".to_string(), document_policy.hops_value());
                 }
                 value
             }
@@ -310,6 +314,9 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                         max_resource_bytes: options.max_render_bytes,
                         max_document_bytes: options.max_body_bytes as u64,
                         resource_budget: Some(render_resource_budget.clone()),
+                        document_request_policy: Some(render_document_policy(
+                            document_policy.clone(),
+                        )),
                         width: options.viewport.0,
                         height: options.viewport.1,
                         full_page: options.screenshot_full_page,
@@ -356,6 +363,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 &next,
                 options,
                 &config,
+                &document_policy,
                 render_resource_budget.clone(),
                 deadline,
             )?;
@@ -435,10 +443,13 @@ fn crawl_page(
     url: &Url,
     options: &ScrapeOptions,
     config: &FetchConfig,
+    document_policy: &robots::DocumentPolicy,
     render_resource_budget: basecrawl_render::RenderResourceBudget,
     deadline: Instant,
 ) -> Result<(String, String, Url), Error> {
-    let fetched = fetch::fetch_until(url, config, deadline)?;
+    let fetched = fetch::fetch_document_until(url, config, deadline, |target| {
+        document_policy.check(target)
+    })?;
     let is_html = content::classify(fetched.content_type.as_deref()) == ContentKind::Html;
     let mut body_str =
         charset::decode_body(&fetched.body, fetched.content_type.as_deref(), is_html);
@@ -458,6 +469,7 @@ fn crawl_page(
                 max_resource_bytes: options.max_render_bytes,
                 max_document_bytes: options.max_body_bytes as u64,
                 resource_budget: Some(render_resource_budget),
+                document_request_policy: Some(render_document_policy(document_policy.clone())),
                 wait_for: options.wait_for.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,
                 ..basecrawl_render::RenderConfig::default()
@@ -471,6 +483,18 @@ fn crawl_page(
     };
     let markdown = markdown::to_markdown(&source, &page_base);
     Ok((markdown, source, page_base))
+}
+
+/// Adapt the core's typed robots policy to the renderer's dependency-neutral document hook.
+fn render_document_policy(
+    document_policy: robots::DocumentPolicy,
+) -> basecrawl_render::DocumentRequestPolicy {
+    Arc::new(move |target| {
+        document_policy.check(target).map_err(|error| match error {
+            Error::RobotsDenied(detail) => detail.to_string(),
+            error => error.to_string(),
+        })
+    })
 }
 
 fn text_surface(body: &str, content_kind: ContentKind) -> Value {

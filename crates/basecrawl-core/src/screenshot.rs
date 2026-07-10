@@ -26,6 +26,7 @@ pub fn capture_until(
 ) -> Result<Screenshot, Error> {
     screenshot_until(url, &config, deadline).map_err(|error| match error {
         RenderError::ResourceBudgetExceeded => Error::ResourceBudgetExceeded,
+        RenderError::DocumentPolicyDenied(detail) => Error::from_document_policy_denial(detail),
         error => Error::Render(error.to_string()),
     })
 }

@@ -48,6 +48,16 @@ Connection: close\r\n\r\n{body}",
     stream.flush().expect("flush fixture response");
 }
 
+fn write_redirect(mut stream: TcpStream, location: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+Connection: close\r\n\r\n"
+    )
+    .expect("write fixture redirect");
+    stream.flush().expect("flush fixture redirect");
+}
+
 fn handle_connection(stream: TcpStream, base: &str, requests: &Arc<Mutex<Vec<String>>>) {
     let peer = stream.try_clone().expect("clone stream");
     let mut reader = BufReader::new(stream);
@@ -116,6 +126,55 @@ fn handle_connection(stream: TcpStream, base: &str, requests: &Arc<Mutex<Vec<Str
             "200 OK",
             "text/html; charset=utf-8",
             &format!("<!doctype html><html><body><main>fixture {path}</main></body></html>"),
+        ),
+        "/redirect-to-blocked" => {
+            let target = if target.contains("observe=1") {
+                "/blocked/private?redirect-observe-target=1"
+            } else {
+                "/blocked/private?redirect-target=1"
+            };
+            write_redirect(peer, target);
+        }
+        "/browser-server-redirect" => {
+            let request_count = requests
+                .lock()
+                .expect("fixture request log mutex")
+                .iter()
+                .filter(|request| request.as_str() == target)
+                .count();
+            if request_count == 1 {
+                write_response(
+                    peer,
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    "<!doctype html><html><body><main>BROWSER_SERVER_START</main></body></html>",
+                );
+            } else {
+                write_redirect(peer, "/blocked/private?browser-server-target=1");
+            }
+        }
+        "/browser-client-navigate" => {
+            let target = if target.contains("observe=1") {
+                "/blocked/private?browser-client-observe-target=1"
+            } else {
+                "/blocked/private?browser-client-target=1"
+            };
+            write_response(
+                peer,
+                "200 OK",
+                "text/html; charset=utf-8",
+                &format!(
+                    "<!doctype html><html><body><main>BROWSER_CLIENT_START</main>\
+                     <script>location.replace('{target}')</script></body></html>"
+                ),
+            );
+        }
+        "/iframe-document" => write_response(
+            peer,
+            "200 OK",
+            "text/html; charset=utf-8",
+            "<!doctype html><html><body><main>IFRAME_PARENT</main>\
+             <iframe src='/blocked/private?iframe-document-target=1'></iframe></body></html>",
         ),
         _ => write_response(peer, "404 Not Found", "text/plain; charset=utf-8", "not found"),
     }
@@ -218,6 +277,200 @@ fn observe_policy_surfaces_denial_while_permitting_the_page() {
     assert_eq!(robots["disposition"], "denied");
     assert_eq!(robots["matched_rule"]["directive"], "disallow");
     assert_eq!(robots["matched_rule"]["path"], "/blocked");
+}
+
+// An allowed entry point must not bypass the policy by redirecting to a denied target. The target
+// must be denied before its request is transmitted, rather than after a response is received.
+#[test]
+fn enforce_blocks_a_denied_direct_redirect_target_before_fetch() {
+    let server = fixture_server();
+    let url = format!("{}/redirect-to-blocked", server.base);
+    let output = run(&[&url, "--formats", "metadata", "--no-js"]);
+
+    assert!(
+        !output.status.success(),
+        "a redirect to a denied robots path must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error: Value =
+        serde_json::from_slice(&output.stderr).expect("stderr must expose structured policy JSON");
+    assert_eq!(error["error"]["kind"], "robots_denied");
+    assert_eq!(error["error"]["robots"]["disposition"], "denied");
+    assert_eq!(
+        error["error"]["robots"]["targetUrl"],
+        format!("{}/blocked/private?redirect-target=1", server.base)
+    );
+    assert!(
+        !server
+            .requests
+            .lock()
+            .expect("fixture request log mutex")
+            .iter()
+            .any(|path| path == "/blocked/private?redirect-target=1"),
+        "a denied redirect target must never be requested"
+    );
+}
+
+// Observe mode leaves the redirect traversable, but exposes every document-hop policy decision in
+// order so callers can see that the terminal path was denied.
+#[test]
+fn observe_records_each_direct_redirect_hop_without_blocking() {
+    let server = fixture_server();
+    let url = format!("{}/redirect-to-blocked?observe=1", server.base);
+    let proof = successful_scrape(&[
+        &url,
+        "--formats",
+        "metadata",
+        "--robots",
+        "observe",
+        "--no-js",
+    ]);
+    let hops = proof["result"]["formats_produced"]["metadata"]["robotsPolicyHops"]
+        .as_array()
+        .expect("robots policy records every document hop");
+
+    assert_eq!(proof["response"]["status_code"], 200);
+    assert_eq!(
+        hops.len(),
+        2,
+        "entry and redirect target must both be checked"
+    );
+    assert_eq!(hops[0]["targetUrl"], url);
+    assert_eq!(hops[0]["disposition"], "unmatched");
+    assert_eq!(
+        hops[1]["targetUrl"],
+        format!("{}/blocked/private?redirect-observe-target=1", server.base)
+    );
+    assert_eq!(hops[1]["disposition"], "denied");
+    assert!(
+        server
+            .requests
+            .lock()
+            .expect("fixture request log mutex")
+            .iter()
+            .any(|path| path == "/blocked/private?redirect-observe-target=1"),
+        "observe mode must allow the denied redirect target"
+    );
+}
+
+// The browser receives its own top-level navigation policy checks. Its HTTP redirect target is
+// denied before Chromium transmits it and is mapped back to the core robots error surface.
+#[test]
+fn enforce_blocks_a_denied_browser_redirect_target_before_fetch() {
+    let server = fixture_server();
+    let url = format!("{}/browser-server-redirect", server.base);
+    let output = run(&[&url, "--formats", "html"]);
+
+    assert!(
+        !output.status.success(),
+        "a browser redirect to a denied robots path must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error: Value =
+        serde_json::from_slice(&output.stderr).expect("stderr must expose structured policy JSON");
+    assert_eq!(error["error"]["kind"], "robots_denied");
+    assert_eq!(error["error"]["robots"]["disposition"], "denied");
+    assert_eq!(
+        error["error"]["robots"]["targetUrl"],
+        format!("{}/blocked/private?browser-server-target=1", server.base)
+    );
+    assert!(
+        !server
+            .requests
+            .lock()
+            .expect("fixture request log mutex")
+            .iter()
+            .any(|path| path == "/blocked/private?browser-server-target=1"),
+        "a denied browser redirect target must never be requested"
+    );
+}
+
+// JavaScript navigation is also a top-level document hop, not an exception to enforcement.
+#[test]
+fn enforce_blocks_a_denied_browser_client_navigation_before_fetch() {
+    let server = fixture_server();
+    let url = format!("{}/browser-client-navigate", server.base);
+    let output = run(&[&url, "--formats", "html"]);
+
+    assert!(
+        !output.status.success(),
+        "a client navigation to a denied robots path must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error: Value =
+        serde_json::from_slice(&output.stderr).expect("stderr must expose structured policy JSON");
+    assert_eq!(error["error"]["kind"], "robots_denied");
+    assert_eq!(error["error"]["robots"]["disposition"], "denied");
+    assert_eq!(
+        error["error"]["robots"]["targetUrl"],
+        format!("{}/blocked/private?browser-client-target=1", server.base)
+    );
+    assert!(
+        !server
+            .requests
+            .lock()
+            .expect("fixture request log mutex")
+            .iter()
+            .any(|path| path == "/blocked/private?browser-client-target=1"),
+        "a denied client navigation target must never be requested"
+    );
+}
+
+// Client-side top-frame navigation follows the same policy. In observe mode the navigation remains
+// allowed, and its denied disposition is emitted alongside the initial document hops.
+#[test]
+fn observe_records_a_denied_browser_client_navigation_without_blocking() {
+    let server = fixture_server();
+    let url = format!("{}/browser-client-navigate?observe=1", server.base);
+    let proof = successful_scrape(&[&url, "--formats", "html,metadata", "--robots", "observe"]);
+    let hops = proof["result"]["formats_produced"]["metadata"]["robotsPolicyHops"]
+        .as_array()
+        .expect("browser top-level navigation decisions must be recorded");
+    let target = format!(
+        "{}/blocked/private?browser-client-observe-target=1",
+        server.base
+    );
+
+    assert!(
+        proof["result"]["formats_produced"]["html"]
+            .as_str()
+            .expect("rendered HTML")
+            .contains("fixture /blocked/private"),
+        "observe mode must allow the client-side navigation"
+    );
+    assert!(
+        hops.iter().any(|hop| {
+            hop["targetUrl"].as_str() == Some(target.as_str())
+                && hop["disposition"].as_str() == Some("denied")
+        }),
+        "the client navigation target must be recorded as denied: {hops:?}"
+    );
+}
+
+// An iframe document is not a top-level document hop. It remains outside this policy so document
+// navigation enforcement never becomes accidental subresource enforcement.
+#[test]
+fn enforce_does_not_apply_document_hop_policy_to_iframe_documents() {
+    let server = fixture_server();
+    let url = format!("{}/iframe-document", server.base);
+    let proof = successful_scrape(&[&url, "--formats", "html"]);
+
+    assert!(
+        proof["result"]["formats_produced"]["html"]
+            .as_str()
+            .expect("rendered HTML")
+            .contains("fixture /blocked/private"),
+        "an iframe document must stay outside top-frame robots enforcement"
+    );
+    assert!(
+        server
+            .requests
+            .lock()
+            .expect("fixture request log mutex")
+            .iter()
+            .any(|path| path == "/blocked/private?iframe-document-target=1"),
+        "the iframe must be fetched separately from top-frame document policy"
+    );
 }
 
 // VAL-CRAWL-124: default /sitemap.xml and robots-referenced sitemap indexes become URL seed sets.

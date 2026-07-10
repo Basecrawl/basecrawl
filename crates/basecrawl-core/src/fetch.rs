@@ -314,6 +314,35 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
 /// Every redirect hop and its DNS, connection, TLS, request-write, and body-read work receives
 /// only the time still available from this deadline.
 pub fn fetch_until(url: &Url, config: &FetchConfig, deadline: Instant) -> Result<Fetched, Error> {
+    fetch_with_document_policy_until(url, config, deadline, |_| Ok(()))
+}
+
+/// Perform a document fetch while consulting `check_document` before every transmitted request.
+///
+/// The callback runs for the initial URL and each resolved redirect target, before origin pacing,
+/// DNS resolution, or any connection attempt. Internal policy resources such as `robots.txt` and
+/// sitemaps use [`fetch_until`] instead, so robots consultation does not recurse into itself.
+pub fn fetch_document_until<F>(
+    url: &Url,
+    config: &FetchConfig,
+    deadline: Instant,
+    check_document: F,
+) -> Result<Fetched, Error>
+where
+    F: FnMut(&Url) -> Result<(), Error>,
+{
+    fetch_with_document_policy_until(url, config, deadline, check_document)
+}
+
+fn fetch_with_document_policy_until<F>(
+    url: &Url,
+    config: &FetchConfig,
+    deadline: Instant,
+    mut check_document: F,
+) -> Result<Fetched, Error>
+where
+    F: FnMut(&Url) -> Result<(), Error>,
+{
     let mut current = url.clone();
     let credential_origin = config.credential_origin.as_ref().unwrap_or(url);
     let mut redirects: Vec<RedirectHop> = Vec::new();
@@ -321,6 +350,9 @@ pub fn fetch_until(url: &Url, config: &FetchConfig, deadline: Instant) -> Result
     let mut egress_ip = None;
 
     loop {
+        // This must precede every transport operation. In particular, a redirect target cannot
+        // reach DNS or the origin before its document policy disposition is known.
+        check_document(&current)?;
         // Record the request immediately before opening the connection. This is deliberately in
         // the redirect loop, rather than around `fetch`, so every physical same-origin request is
         // spaced, including redirect hops and callers such as robots/sitemap/pagination.

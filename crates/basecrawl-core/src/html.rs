@@ -45,6 +45,9 @@ pub fn render_page_until(
             url: url.to_string(),
         }),
         Err(RenderError::ResourceBudgetExceeded) => Err(Error::ResourceBudgetExceeded),
+        Err(RenderError::DocumentPolicyDenied(detail)) => {
+            Err(Error::from_document_policy_denial(detail))
+        }
         Err(e) => Err(Error::Render(e.to_string())),
     }
 }

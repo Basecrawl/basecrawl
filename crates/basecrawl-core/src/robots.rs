@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use url::Url;
 
@@ -109,6 +110,95 @@ impl RobotsDecision {
             "disposition": self.disposition,
             "matched_rule": matched_rule,
         })
+    }
+}
+
+/// A policy decision made before transmitting a top-level document request.
+#[derive(Debug, Clone)]
+pub struct DocumentHop {
+    target_url: String,
+    decision: RobotsDecision,
+}
+
+impl DocumentHop {
+    fn to_value(&self) -> Value {
+        let mut value = self.decision.to_value();
+        if let Value::Object(object) = &mut value {
+            object.insert(
+                "targetUrl".to_string(),
+                Value::String(self.target_url.clone()),
+            );
+        }
+        value
+    }
+}
+
+/// Shared robots consultation for all direct and browser top-level document hops in one scrape.
+///
+/// Auxiliary policy documents such as `robots.txt` and sitemaps continue to use the unguarded
+/// fetch path. This keeps policy consultation non-recursive and distinct from document traversal.
+#[derive(Debug, Clone)]
+pub struct DocumentPolicy {
+    config: FetchConfig,
+    policy: RobotsPolicy,
+    deadline: Instant,
+    hops: Arc<Mutex<Vec<DocumentHop>>>,
+}
+
+impl DocumentPolicy {
+    /// Create a recorder that applies one policy configuration to every document hop.
+    pub fn new(config: FetchConfig, policy: RobotsPolicy, deadline: Instant) -> Self {
+        Self {
+            config,
+            policy,
+            deadline,
+            hops: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Consult and record policy before the caller transmits a top-level document request.
+    pub fn check(&self, target: &Url) -> Result<(), crate::Error> {
+        let decision = consult(target, &self.config, self.policy, self.deadline)?;
+        let denied = decision.denies_fetch();
+        self.hops
+            .lock()
+            .expect("document robots policy mutex must not be poisoned")
+            .push(DocumentHop {
+                target_url: target.to_string(),
+                decision: decision.clone(),
+            });
+        if denied {
+            let mut value = decision.to_value();
+            if let Value::Object(object) = &mut value {
+                object.insert("targetUrl".to_string(), Value::String(target.to_string()));
+            }
+            return Err(crate::Error::RobotsDenied(value));
+        }
+        Ok(())
+    }
+
+    /// Return the first document hop's decision for compatibility with the existing metadata
+    /// field. A policy check is always performed for the initial document before this is called.
+    pub fn initial_decision(&self) -> RobotsDecision {
+        self.hops
+            .lock()
+            .expect("document robots policy mutex must not be poisoned")
+            .first()
+            .expect("initial document robots policy must be checked")
+            .decision
+            .clone()
+    }
+
+    /// Serialize every recorded top-level document disposition in traversal order.
+    pub fn hops_value(&self) -> Value {
+        Value::Array(
+            self.hops
+                .lock()
+                .expect("document robots policy mutex must not be poisoned")
+                .iter()
+                .map(DocumentHop::to_value)
+                .collect(),
+        )
     }
 }
 
