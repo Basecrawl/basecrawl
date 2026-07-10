@@ -203,21 +203,32 @@ fn html_is_cleaned_serialized_dom() {
 // VAL-CRAWL-038 smoke check: the public JS page still renders through Chromium and retains source.
 #[test]
 fn remote_js_page_smoke_renders_html_and_retains_source() {
-    let v = common::retry_open_web(|| {
-        let out = run(&[QUOTES_JS, "--formats", "html,rawHtml", "--timeout", "8"]);
-        out.status
-            .success()
-            .then(|| serde_json::from_slice::<Value>(&out.stdout).ok())
-            .flatten()
-    });
-    let Some(v) = v else {
-        eprintln!(
-            "quotes open-web render smoke unavailable after {} bounded attempts; \
-             deterministic loopback coverage remains authoritative",
-            common::REMOTE_SMOKE_MAX_ATTEMPTS
-        );
-        return;
+    let proof = match common::retry_open_web(|| {
+        let out = run(&[
+            QUOTES_JS,
+            "--formats",
+            "html,rawHtml",
+            "--robots",
+            "ignore",
+            "--timeout",
+            "8",
+        ]);
+        common::classify_open_web_output(&out, "quotes.toscrape.com")
+    }) {
+        common::RemoteSmokeOutcome::Success(proof) => proof,
+        common::RemoteSmokeOutcome::Skipped(transient) => {
+            eprintln!(
+                "quotes open-web render smoke skipped after {} bounded transient-origin failure \
+                 attempt(s): {transient}; deterministic loopback coverage remains authoritative",
+                common::REMOTE_SMOKE_MAX_ATTEMPTS
+            );
+            return;
+        }
+        common::RemoteSmokeOutcome::Fatal(failure) => {
+            panic!("quotes open-web render smoke failed without a skip: {failure}");
+        }
     };
+    let v = serde_json::to_value(proof).expect("ScrapeProof must serialize");
     let html = produced(&v, "html");
     let raw = produced(&v, "rawHtml");
 

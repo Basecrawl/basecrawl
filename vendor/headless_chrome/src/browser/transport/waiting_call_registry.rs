@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::mpsc;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use log::trace;
@@ -39,17 +39,32 @@ impl WaitingCallRegistry {
 
     pub fn resolve_call(&self, response: Response) -> Result<()> {
         trace!("Resolving call");
-        let waiting_call_tx: mpsc::Sender<Result<Response>> = {
-            let mut waiting_calls = self.calls.lock().unwrap();
-            waiting_calls.remove(&response.call_id()).unwrap()
+        let waiting_call_tx = {
+            let mut waiting_calls = self.calls.lock().unwrap_or_else(|poisoned| {
+                trace!("Recovering waiting-call registry after a prior panic");
+                poisoned.into_inner()
+            });
+            waiting_calls.remove(&response.call_id())
         };
-        waiting_call_tx.send(Ok(response))?;
+        let Some(waiting_call_tx) = waiting_call_tx else {
+            trace!(
+                "Ignoring response for call {:?}, which was already deregistered",
+                response.call_id()
+            );
+            return Ok(());
+        };
+        if let Err(error) = waiting_call_tx.send(Ok(response)) {
+            trace!("Response receiver closed before delivery: {error:?}");
+        }
         Ok(())
     }
 
     pub fn register_call(&self, call_id: CallId) -> mpsc::Receiver<Result<Response>> {
         let (tx, rx) = mpsc::channel::<Result<Response>>();
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|poisoned| {
+            trace!("Recovering waiting-call registry after a prior panic");
+            poisoned.into_inner()
+        });
         calls.insert(call_id, tx);
         trace!("registered {call_id:?}");
         rx
@@ -57,15 +72,23 @@ impl WaitingCallRegistry {
 
     pub fn unregister_call(&self, call_id: CallId) {
         trace!("Deregistering call");
-        let mut calls = self.calls.lock().unwrap();
-        calls.remove(&call_id).unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|poisoned| {
+            trace!("Recovering waiting-call registry after a prior panic");
+            poisoned.into_inner()
+        });
+        if calls.remove(&call_id).is_none() {
+            trace!("Call {call_id:?} was already deregistered");
+        }
     }
 
     // TODO: make it so we can pass in whatever error we want here
     // to make it less dependent on browser::transport
     pub fn cancel_outstanding_method_calls(&self) {
         trace!("Cancelling outstanding method calls");
-        let calls = self.calls.lock().unwrap();
+        let calls = self.calls.lock().unwrap_or_else(|poisoned| {
+            trace!("Recovering waiting-call registry after a prior panic");
+            poisoned.into_inner()
+        });
         for (call_id, sender) in &*calls {
             trace!("Telling waiting method call {call_id:?} that the connection closed");
             if let Err(e) = sender.send(Err(ConnectionClosed {}.into())) {
@@ -111,5 +134,23 @@ mod tests {
         // note how they're in reverse order to that in which they were called!
         assert_eq!(cloned_resp, call_rx2.recv().unwrap().unwrap());
         assert_eq!(resp_clone, call_rx.recv().unwrap().unwrap());
+    }
+
+    #[test]
+    fn late_response_after_unregister_is_ignored() {
+        let waiting_calls = WaitingCallRegistry::new();
+        let call_rx = waiting_calls.register_call(431);
+        waiting_calls.unregister_call(431);
+        drop(call_rx);
+
+        // A deadline can unregister a request before Chromium's transport thread receives its
+        // response. That late response must not panic the process or poison the registry mutex.
+        waiting_calls
+            .resolve_call(Response {
+                call_id: 431,
+                result: Some(json! {true}),
+                error: None,
+            })
+            .expect("a late response must be harmless");
     }
 }

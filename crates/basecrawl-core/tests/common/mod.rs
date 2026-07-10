@@ -9,18 +9,22 @@
 //! so the HTTP semantics under test are identical regardless of which base is selected.
 #![allow(dead_code)]
 
+use base64::Engine;
+use basecrawl_core::ScrapeProof;
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+use x509_parser::prelude::parse_x509_certificate;
 
 /// httpbin-compatible bases in preference order (no trailing slash), ordered by observed
 /// reliability. All run the httpbin API; `nghttp2.org/httpbin` and `httpbin.org` are the reference
 /// Python httpbin (full endpoint set incl. brotli); `httpbingo.org` is a Go re-implementation kept
 /// as a last-resort fallback.
-const HTTPBIN_CANDIDATES: &[&str] = &[
+pub const HTTPBIN_CANDIDATES: &[&str] = &[
     "https://nghttp2.org/httpbin",
     "https://httpbin.org",
     "https://httpbingo.org",
@@ -65,22 +69,332 @@ fn probe_ok(base: &str) -> bool {
 /// Maximum attempts made by an explicitly best-effort open-web smoke check.
 pub const REMOTE_SMOKE_MAX_ATTEMPTS: usize = 3;
 
-/// Retry a best-effort open-web probe with a small, bounded exponential backoff.
+/// A transient availability failure independently identified from the crawler's structured
+/// outcome. Only these failures may exhaust retries and turn a real-origin smoke into a skip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransientOriginFailure {
+    Dns,
+    Connect,
+    Timeout,
+    Upstream5xx(u16),
+}
+
+impl std::fmt::Display for TransientOriginFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dns => formatter.write_str("DNS resolution failed"),
+            Self::Connect => formatter.write_str("origin connection failed"),
+            Self::Timeout => formatter.write_str("origin request timed out"),
+            Self::Upstream5xx(status) => {
+                write!(formatter, "origin returned upstream HTTP {status}")
+            }
+        }
+    }
+}
+
+/// A local crawler/proof contract failure. These failures are never silently converted into a
+/// remote-origin skip because rerunning cannot make a malformed or incomplete proof trustworthy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FatalSmokeFailure {
+    category: &'static str,
+    detail: String,
+}
+
+impl FatalSmokeFailure {
+    fn new(category: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for FatalSmokeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.category, self.detail)
+    }
+}
+
+/// The classification of one crawler process invocation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RemoteSmokeAttempt<T> {
+    Success(T),
+    Retryable(TransientOriginFailure),
+    Fatal(FatalSmokeFailure),
+}
+
+/// The final outcome of a bounded real-origin smoke check.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RemoteSmokeOutcome<T> {
+    Success(T),
+    Skipped(TransientOriginFailure),
+    Fatal(FatalSmokeFailure),
+}
+
+/// Retry a typed open-web outcome with a small, bounded exponential backoff.
 ///
-/// Exact parser and navigation assertions belong to [`fixture_url`]. This helper only supports
-/// intentionally qualitative smoke tests, where a transient public-origin refusal must not make
-/// the deterministic default-parallel suite fail.
-pub fn retry_open_web<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+/// Exact parser and navigation assertions belong to [`fixture_url`]. A fatal process, proof,
+/// schema, serialization, TLS, or certificate failure exits immediately; only independently
+/// classified transient origin failures can eventually become [`RemoteSmokeOutcome::Skipped`].
+pub fn retry_open_web<T>(
+    mut attempt: impl FnMut() -> RemoteSmokeAttempt<T>,
+) -> RemoteSmokeOutcome<T> {
     for index in 0..REMOTE_SMOKE_MAX_ATTEMPTS {
-        if let Some(value) = attempt() {
-            return Some(value);
+        match attempt() {
+            RemoteSmokeAttempt::Success(value) => return RemoteSmokeOutcome::Success(value),
+            RemoteSmokeAttempt::Fatal(failure) => return RemoteSmokeOutcome::Fatal(failure),
+            RemoteSmokeAttempt::Retryable(transient) => {
+                if index + 1 == REMOTE_SMOKE_MAX_ATTEMPTS {
+                    return RemoteSmokeOutcome::Skipped(transient);
+                }
+            }
         }
         if index + 1 < REMOTE_SMOKE_MAX_ATTEMPTS {
             let backoff = Duration::from_millis(250 * (1_u64 << index));
             thread::sleep(backoff);
         }
     }
-    None
+    unreachable!("the bounded retry loop always returns an outcome")
+}
+
+/// Classify the output from a real-origin crawler process.
+///
+/// A successful process must emit exactly one schema-valid, deserializable [`ScrapeProof`] with
+/// complete TLS evidence for `expected_host`. A non-success process is retryable only when its
+/// complete structured error envelope independently identifies DNS, connection, or timeout
+/// unavailability. HTTP 5xx is classified from a complete success proof's response status.
+pub fn classify_open_web_output(
+    output: &Output,
+    expected_host: &str,
+) -> RemoteSmokeAttempt<ScrapeProof> {
+    classify_open_web_process(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+        expected_host,
+    )
+}
+
+/// Classify raw process streams. Kept separate from [`classify_open_web_output`] so unit tests can
+/// prove that malformed JSON/proofs and fatal crawler errors never enter the skip path.
+pub fn classify_open_web_process(
+    succeeded: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    expected_host: &str,
+) -> RemoteSmokeAttempt<ScrapeProof> {
+    if succeeded {
+        if !stderr.is_empty() {
+            return RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+                "unexpected_success_stderr",
+                String::from_utf8_lossy(stderr),
+            ));
+        }
+        return classify_successful_open_web_proof(stdout, expected_host);
+    }
+
+    if !stdout.is_empty() {
+        return RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+            "unexpected_failure_stdout",
+            String::from_utf8_lossy(stdout),
+        ));
+    }
+
+    let envelope = match parse_error_envelope(stderr) {
+        Ok(envelope) => envelope,
+        Err(error) => return RemoteSmokeAttempt::Fatal(error),
+    };
+    let kind = envelope["error"]["kind"]
+        .as_str()
+        .expect("parse_error_envelope validates error.kind");
+    let message = envelope["error"]["message"]
+        .as_str()
+        .expect("parse_error_envelope validates error.message");
+
+    match kind {
+        "timeout" => RemoteSmokeAttempt::Retryable(TransientOriginFailure::Timeout),
+        "transport_error" => classify_transport_failure(message).map_or_else(
+            || {
+                RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+                    "unclassified_transport_error",
+                    message,
+                ))
+            },
+            RemoteSmokeAttempt::Retryable,
+        ),
+        _ => RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+            "crawler_error",
+            format!("{kind}: {message}"),
+        )),
+    }
+}
+
+fn classify_successful_open_web_proof(
+    stdout: &[u8],
+    expected_host: &str,
+) -> RemoteSmokeAttempt<ScrapeProof> {
+    let proof_value = match serde_json::from_slice::<Value>(stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            return RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+                "malformed_proof_json",
+                error.to_string(),
+            ));
+        }
+    };
+    if let Err(error) = validate_scrapeproof_schema(&proof_value) {
+        return RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new("proof_schema", error));
+    }
+    let proof = match serde_json::from_value::<ScrapeProof>(proof_value) {
+        Ok(proof) => proof,
+        Err(error) => {
+            return RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+                "proof_deserialization",
+                error.to_string(),
+            ));
+        }
+    };
+
+    match proof.response.status_code {
+        Some(status @ 500..=599) => {
+            RemoteSmokeAttempt::Retryable(TransientOriginFailure::Upstream5xx(status))
+        }
+        Some(200..=299) => match validate_open_web_tls(&proof, expected_host) {
+            Ok(()) => RemoteSmokeAttempt::Success(proof),
+            Err(error) => RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new("tls_evidence", error)),
+        },
+        Some(status) => RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+            "unexpected_http_status",
+            status.to_string(),
+        )),
+        None => RemoteSmokeAttempt::Fatal(FatalSmokeFailure::new(
+            "missing_response_status",
+            "successful crawler output omitted response.status_code",
+        )),
+    }
+}
+
+fn parse_error_envelope(stderr: &[u8]) -> Result<Value, FatalSmokeFailure> {
+    let envelope: Value = serde_json::from_slice(stderr).map_err(|error| {
+        FatalSmokeFailure::new(
+            "malformed_error_envelope",
+            format!("{error}: {}", String::from_utf8_lossy(stderr)),
+        )
+    })?;
+    let top = envelope.as_object().ok_or_else(|| {
+        FatalSmokeFailure::new(
+            "malformed_error_envelope",
+            "error output must be a JSON object",
+        )
+    })?;
+    if top.len() != 1 || !top.contains_key("error") {
+        return Err(FatalSmokeFailure::new(
+            "malformed_error_envelope",
+            "error output must contain exactly one top-level error object",
+        ));
+    }
+    let error = top["error"].as_object().ok_or_else(|| {
+        FatalSmokeFailure::new("malformed_error_envelope", "error must be a JSON object")
+    })?;
+    if error.get("kind").and_then(Value::as_str).is_none()
+        || error.get("message").and_then(Value::as_str).is_none()
+    {
+        return Err(FatalSmokeFailure::new(
+            "malformed_error_envelope",
+            "error.kind and error.message must be strings",
+        ));
+    }
+    Ok(envelope)
+}
+
+fn classify_transport_failure(message: &str) -> Option<TransientOriginFailure> {
+    let message = message.to_ascii_lowercase();
+    if [
+        "dns error",
+        "failed to lookup",
+        "name or service not known",
+        "no such host",
+        "temporary failure in name resolution",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        Some(TransientOriginFailure::Dns)
+    } else if [
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connect error",
+        "failed to connect",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        Some(TransientOriginFailure::Connect)
+    } else {
+        None
+    }
+}
+
+fn validate_scrapeproof_schema(proof: &Value) -> Result<(), String> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../basecrawl-proof/schema/scrapeproof.schema.json"
+    ))
+    .map_err(|error| format!("published schema is invalid JSON: {error}"))?;
+    let validator = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .should_validate_formats(true)
+        .compile(&schema)
+        .map_err(|error| format!("published schema does not compile: {error}"))?;
+    validator.validate(proof).map_err(|errors| {
+        errors
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn validate_open_web_tls(proof: &ScrapeProof, expected_host: &str) -> Result<(), String> {
+    let tls = &proof.tls;
+    if !matches!(tls.negotiated_version.as_deref(), Some("1.2") | Some("1.3")) {
+        return Err(format!(
+            "negotiated_version must be captured as TLS 1.2 or 1.3, got {:?}",
+            tls.negotiated_version
+        ));
+    }
+    if tls.sni.as_deref() != Some(expected_host) {
+        return Err(format!("SNI must be {expected_host}, got {:?}", tls.sni));
+    }
+    if tls.server_cert_chain_der.is_empty() {
+        return Err("server_cert_chain_der must contain at least one certificate".to_string());
+    }
+    for (index, entry) in tls.server_cert_chain_der.iter().enumerate() {
+        let der = base64::prelude::BASE64_STANDARD
+            .decode(entry)
+            .map_err(|error| format!("certificate #{index} is not valid base64 DER: {error}"))?;
+        if der.is_empty() {
+            return Err(format!("certificate #{index} is empty"));
+        }
+        let (remainder, _) = parse_x509_certificate(&der)
+            .map_err(|error| format!("certificate #{index} is not valid DER: {error}"))?;
+        if !remainder.is_empty() {
+            return Err(format!("certificate #{index} has trailing non-DER bytes"));
+        }
+    }
+    let transcript = tls
+        .handshake_transcript_hash
+        .as_deref()
+        .ok_or_else(|| "handshake_transcript_hash is missing".to_string())?;
+    if !matches!(transcript.len(), 64 | 96)
+        || !transcript.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(format!(
+            "handshake_transcript_hash must be lowercase 64/96-hex, got {transcript}"
+        ));
+    }
+    Ok(())
 }
 
 /// Return the deterministic test-origin base URL, backed by one loopback server per test binary.

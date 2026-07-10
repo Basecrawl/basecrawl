@@ -9,7 +9,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -282,7 +282,16 @@ fn no_js_mode_returns_source_without_rendering() {
 fn never_idle_page_aborts_at_render_timeout() {
     let url = format!("{}/neveridle", server_base());
     let start = Instant::now();
-    let out = run(&[&url, "--formats", "html", "--render-timeout", "4"]);
+    let child = Command::new(BIN)
+        .args([&url, "--formats", "html", "--render-timeout", "4"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn basecrawl binary");
+    let out = child
+        .wait_with_output()
+        .expect("must wait for the timed-out crawler to finish writing stderr");
     let elapsed = start.elapsed();
 
     assert!(
@@ -293,12 +302,28 @@ fn never_idle_page_aborts_at_render_timeout() {
         out.stdout.is_empty(),
         "no partial ScrapeProof on a render timeout"
     );
-    let err: Value = serde_json::from_slice(&out.stderr).expect("structured JSON error on stderr");
-    assert_eq!(err["error"]["kind"], "render_error");
-    let msg = err["error"]["message"].as_str().unwrap_or("");
+    let stderr = std::str::from_utf8(&out.stderr).expect("stderr must be UTF-8");
     assert!(
-        msg.to_lowercase().contains("tim"),
-        "render timeout error must clearly mention the timeout, got: {msg}"
+        !stderr.is_empty(),
+        "the completed process must emit one structured error envelope"
+    );
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "stderr must contain exactly one complete JSON error envelope: {stderr:?}"
+    );
+    let err: Value =
+        serde_json::from_str(stderr.trim_end()).expect("structured JSON error on complete stderr");
+    assert_eq!(
+        err.as_object().map(|object| object.len()),
+        Some(1),
+        "stderr must contain only the structured error envelope: {err}"
+    );
+    assert_eq!(err["error"]["kind"], "render_error");
+    assert_eq!(
+        err["error"]["message"],
+        "html render failed: render timed out after 4s: the page never reached network idle",
+        "render timeout error message must remain stable and complete"
     );
     assert!(
         elapsed < Duration::from_secs(15),
