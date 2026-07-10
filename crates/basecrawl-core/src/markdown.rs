@@ -23,9 +23,12 @@ pub fn to_markdown(html: &str, page_url: &Url) -> String {
     let base = base_href(&document)
         .and_then(|href| page_url.join(&href).ok())
         .unwrap_or_else(|| page_url.clone());
-    let converter = Converter { base };
+    let (root, preserve_semantic_headers) = main_content_root(&document);
+    let converter = Converter {
+        base,
+        preserve_semantic_headers,
+    };
 
-    let root = main_content_root(&document);
     let mut blocks: Vec<String> = Vec::new();
     converter.render_blocks(root, &mut blocks);
     let joined = blocks.join("\n\n");
@@ -43,25 +46,27 @@ fn base_href(document: &Html) -> Option<String> {
 }
 
 /// Choose the node whose subtree holds the primary content: the first `<main>`, `<article>`, or
-/// `[role=main]`, else `<body>`, else the document root.
-fn main_content_root(document: &Html) -> NodeRef<'_, Node> {
+/// `[role=main]`, else `<body>`, else the document root. Headers inside an explicitly selected
+/// content root are semantic content, while headers in a body fallback are page-level chrome.
+fn main_content_root(document: &Html) -> (NodeRef<'_, Node>, bool) {
     for candidate in ["main", "article", "[role=\"main\"]", "[role=main]"] {
         if let Ok(selector) = Selector::parse(candidate) {
             if let Some(el) = document.select(&selector).next() {
-                return *el;
+                return (*el, true);
             }
         }
     }
     if let Ok(body) = Selector::parse("body") {
         if let Some(el) = document.select(&body).next() {
-            return *el;
+            return (*el, false);
         }
     }
-    document.tree.root()
+    (document.tree.root(), false)
 }
 
 struct Converter {
     base: Url,
+    preserve_semantic_headers: bool,
 }
 
 /// Block-level HTML elements that break the surrounding inline flow.
@@ -127,7 +132,7 @@ impl Converter {
             match child.value() {
                 Node::Element(el) => {
                     let name = el.name();
-                    if is_skipped(name) || is_boilerplate(name) {
+                    if is_skipped(name) || self.is_boilerplate(name) {
                         continue;
                     }
                     if is_block(name) {
@@ -224,7 +229,7 @@ impl Converter {
                         nested.push((child, child_el.name() == "ol"));
                     }
                     Node::Element(child_el)
-                        if is_skipped(child_el.name()) || is_boilerplate(child_el.name()) => {}
+                        if is_skipped(child_el.name()) || self.is_boilerplate(child_el.name()) => {}
                     _ => inline.push_str(&self.inline_node(child)),
                 }
             }
@@ -304,14 +309,15 @@ impl Converter {
         }
     }
 
-    /// Render a `<pre>` as a fenced code block, preserving inner whitespace and newlines.
+    /// Render a `<pre>` as a fenced code block, preserving its inner text verbatim. A structural
+    /// newline is added only when needed to put the closing fence on its own line.
     fn render_pre(&self, node: NodeRef<'_, Node>) -> String {
         let lang = code_language(node).unwrap_or_default();
         let mut raw = String::new();
         collect_raw_text(node, &mut raw);
-        let body = raw.strip_prefix('\n').unwrap_or(&raw);
-        let body = body.trim_end_matches(['\n', ' ', '\t']);
-        format!("```{lang}\n{body}\n```")
+        let fence = code_fence(&raw);
+        let closing_prefix = if raw.ends_with('\n') { "" } else { "\n" };
+        format!("{fence}{lang}\n{raw}{closing_prefix}{fence}")
     }
 
     /// Render a `<blockquote>` by prefixing each line of its inner blocks with `> `.
@@ -404,6 +410,12 @@ impl Converter {
         }
         self.base.join(target).ok().map(String::from)
     }
+
+    /// Headers selected as descendants of main/article/role=main carry article semantics rather
+    /// than page chrome. Other boilerplate categories remain stripped at every depth.
+    fn is_boilerplate(&self, name: &str) -> bool {
+        is_boilerplate(name) && !(self.preserve_semantic_headers && name == "header")
+    }
 }
 
 /// Collect the verbatim text of a subtree without collapsing whitespace (for code blocks).
@@ -415,6 +427,21 @@ fn collect_raw_text(node: NodeRef<'_, Node>, out: &mut String) {
             _ => {}
         }
     }
+}
+
+/// Choose a backtick fence that cannot be closed by a backtick run inside the code content.
+fn code_fence(raw: &str) -> String {
+    let mut longest_run = 0;
+    let mut current_run = 0;
+    for ch in raw.chars() {
+        if ch == '`' {
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    "`".repeat((longest_run + 1).max(3))
 }
 
 /// Detect a fenced-code language hint from a `<code class="language-xxx">` (or `lang-xxx`).
@@ -518,18 +545,57 @@ fn flush_inline(inline: &mut String, blocks: &mut Vec<String>) {
     inline.clear();
 }
 
-/// Trim trailing spaces per line, collapse 3+ consecutive newlines to a blank-line separator, and
-/// trim the whole document.
+/// Normalize prose while treating fenced code as a verbatim region. Prose line endings are trimmed
+/// and excess blank lines are collapsed, but code content preserves trailing spaces, tabs, blank
+/// final lines, and internal newlines exactly.
 fn normalize(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
+    let mut fence_len = None;
+    let mut blank_lines = 0;
     for line in markdown.split('\n') {
-        out.push_str(line.trim_end());
+        if let Some(opening_len) = fence_len {
+            out.push_str(line);
+            out.push('\n');
+            if is_closing_fence(line, opening_len) {
+                fence_len = None;
+            }
+            blank_lines = 0;
+            continue;
+        }
+
+        if let Some(opening_len) = opening_fence_len(line) {
+            out.push_str(line);
+            out.push('\n');
+            fence_len = Some(opening_len);
+            blank_lines = 0;
+            continue;
+        }
+
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank_lines += 1;
+            if blank_lines > 1 {
+                continue;
+            }
+        } else {
+            blank_lines = 0;
+        }
+        out.push_str(line);
         out.push('\n');
     }
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
-    }
     out.trim().to_string()
+}
+
+/// Return the leading backtick-fence length for an opening fence line.
+fn opening_fence_len(line: &str) -> Option<usize> {
+    let len = line.bytes().take_while(|byte| *byte == b'`').count();
+    (len >= 3).then_some(len)
+}
+
+/// A closing fence is the matching-or-longer delimiter followed only by whitespace.
+fn is_closing_fence(line: &str, opening_len: usize) -> bool {
+    let len = line.bytes().take_while(|byte| *byte == b'`').count();
+    len >= opening_len && line[len..].trim().is_empty()
 }
 
 #[cfg(test)]
@@ -655,6 +721,51 @@ mod tests {
         assert!(!out.contains("Navigation menu"), "nav leaked:\n{out}");
         assert!(!out.contains("Site header"), "header leaked:\n{out}");
         assert!(!out.contains("Copyright footer"), "footer leaked:\n{out}");
+    }
+
+    #[test]
+    fn semantic_headers_inside_selected_main_survive_page_chrome_stripping() {
+        // VAL-CRAWL-027/031/033: outer page chrome must disappear, but a `<header>` that
+        // belongs to the selected content root carries semantic article headings.
+        let html = "<body>\
+            <header>Global site header</header>\
+            <nav>Global navigation</nav>\
+            <main>\
+              <header><h1>Article title</h1><h2>Overview</h2><h3>Details</h3></header>\
+              <p>Article body.</p>\
+            </main>\
+            <footer>Global footer</footer>\
+        </body>";
+        let out = md(html);
+
+        assert!(
+            out.contains("# Article title"),
+            "article h1 dropped:\n{out}"
+        );
+        assert!(out.contains("## Overview"), "article h2 dropped:\n{out}");
+        assert!(out.contains("### Details"), "article h3 dropped:\n{out}");
+        assert!(
+            out.contains("Article body."),
+            "article body dropped:\n{out}"
+        );
+        assert!(!out.contains("Global site header"), "chrome leaked:\n{out}");
+        assert!(!out.contains("Global navigation"), "chrome leaked:\n{out}");
+        assert!(!out.contains("Global footer"), "chrome leaked:\n{out}");
+    }
+
+    #[test]
+    fn fenced_code_remains_verbatim_through_normalization() {
+        // VAL-CRAWL-029/090: trailing spaces, tabs, blank final lines, and internal newlines
+        // are data inside a fenced block and must not be touched by markdown normalization.
+        let code = "let value = 1;  \t\n\n\tuse(value);  \n\n";
+        let html = format!(
+            "<main><pre><code class=\"language-rust\">{code}</code></pre><p>After</p></main>"
+        );
+        let out = md(&html);
+        let expected = format!("```rust\n{code}```\n\nAfter");
+
+        assert_eq!(out, expected);
+        assert_eq!(out, md(&html), "markdown must remain deterministic");
     }
 
     #[test]
