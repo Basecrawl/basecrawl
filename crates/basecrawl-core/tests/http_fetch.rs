@@ -142,8 +142,8 @@ fn gzip_deflate_brotli_are_transparently_decoded() {
 // VAL-CRAWL-023: request timeout is enforced.
 #[test]
 fn request_timeout_is_enforced() {
-    let start = std::time::Instant::now();
     let url = format!("{}/delay/10", httpbin_base());
+    let start = std::time::Instant::now();
     let out = run(&[&url, "--timeout", "3"]);
     let elapsed = start.elapsed();
     assert!(

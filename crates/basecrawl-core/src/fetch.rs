@@ -60,6 +60,11 @@ pub struct FetchConfig {
     ///
     /// The exact vector order is the defined wire order for caller-controlled field lines.
     pub headers: Vec<(String, String)>,
+    /// Origin that supplied [`Self::headers`]. Caller-controlled fields are emitted only when a
+    /// request target has the same normalized scheme, host, and effective port. `None` means the
+    /// URL passed to [`fetch`] is the initiating origin, preserving safe behavior for direct
+    /// `FetchConfig` users while still scoping every redirect hop.
+    pub credential_origin: Option<Url>,
     /// User-Agent presented to the origin.
     pub user_agent: String,
     /// Permit invalid TLS certificates only when the caller explicitly opts in. The secure
@@ -79,6 +84,7 @@ impl Default for FetchConfig {
         Self {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             headers: vec![("user-agent".to_string(), DEFAULT_USER_AGENT.to_string())],
+            credential_origin: None,
             user_agent: DEFAULT_USER_AGENT.to_string(),
             insecure: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -137,6 +143,36 @@ impl FetchConfig {
     pub(crate) fn wait_for_origin(&self, url: &Url) {
         self.origin_limiter.wait_for_turn(url, self.crawl_delay);
     }
+
+    /// Return caller-controlled headers only for the initiating origin.
+    ///
+    /// The controlled User-Agent is emitted separately by the HTTP serializer, so cross-origin
+    /// requests retain a browser-plausible identifier without transmitting any caller input.
+    fn caller_headers_for<'a>(
+        &'a self,
+        target: &Url,
+        credential_origin: &Url,
+    ) -> &'a [(String, String)] {
+        if same_origin(target, credential_origin) {
+            &self.headers
+        } else {
+            &[]
+        }
+    }
+}
+
+/// Compare normalized URL origins using scheme, case-insensitive host, and effective port.
+///
+/// This intentionally treats every scheme transition, host transition, port transition, and HTTPS
+/// downgrade as cross-origin. Paths, queries, and fragments do not determine whether a caller
+/// credential may be transmitted.
+pub(crate) fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left
+            .host_str()
+            .zip(right.host_str())
+            .is_some_and(|(left_host, right_host)| left_host.eq_ignore_ascii_case(right_host))
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 /// Outcome of a single HTTP fetch. `body` is the *decoded* response body (any transfer/content
@@ -263,6 +299,7 @@ fn validate_header_pair(name: &str, value: &str) -> Result<(), Error> {
 /// (including 4xx/5xx) is captured faithfully.
 pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
     let mut current = url.clone();
+    let credential_origin = config.credential_origin.as_ref().unwrap_or(url);
     let mut redirects: Vec<RedirectHop> = Vec::new();
     let mut tls = Tls::default();
     let mut egress_ip = None;
@@ -273,8 +310,8 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
         // spaced, including redirect hops and callers such as robots/sitemap/pagination.
         config.wait_for_origin(&current);
         let response = match current.scheme() {
-            "http" => fetch_http(&current, config)?,
-            "https" => fetch_https(&current, config)?,
+            "http" => fetch_http(&current, config, credential_origin)?,
+            "https" => fetch_https(&current, config, credential_origin)?,
             scheme => return Err(Error::UnsupportedScheme(scheme.to_string())),
         };
 
@@ -342,7 +379,11 @@ struct SingleResponse {
 /// `reqwest::HeaderMap` coalesces duplicate names and does not promise field-line ordering. The
 /// effective representation was validated before this point, so serializing it directly keeps the
 /// request hash, HTTP bytes, and HTTPS bytes aligned.
-fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> {
+fn fetch_http(
+    url: &Url,
+    config: &FetchConfig,
+    credential_origin: &Url,
+) -> Result<SingleResponse, Error> {
     let host = url
         .host_str()
         .ok_or_else(|| Error::InvalidUrl(url.to_string()))?;
@@ -357,7 +398,7 @@ fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> 
         .set_write_timeout(Some(config.timeout))
         .map_err(classify_io)?;
 
-    let request = build_http_request(url, host, port, config)?;
+    let request = build_http_request(url, host, port, config, credential_origin)?;
     stream.write_all(&request).map_err(classify_io)?;
     stream.flush().map_err(classify_io)?;
     let raw_limit = config
@@ -384,7 +425,11 @@ fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> 
 /// Perform an HTTPS request over a fresh rustls connection. No subprocess is involved: the
 /// connection that carries HTTP also exposes the authenticated chain and wire handshake material
 /// stored in [`Tls`]. TLS 1.3 is preferred and capture-complete.
-fn fetch_https(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> {
+fn fetch_https(
+    url: &Url,
+    config: &FetchConfig,
+    credential_origin: &Url,
+) -> Result<SingleResponse, Error> {
     let host = url
         .host_str()
         .ok_or_else(|| Error::InvalidUrl(url.to_string()))?;
@@ -419,7 +464,7 @@ fn fetch_https(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error>
         .clone();
     let tls = capture_tls_metadata(&connection, host, &capture, &handshake_wire)?;
 
-    let request = build_http_request(url, host, port, config)?;
+    let request = build_http_request(url, host, port, config, credential_origin)?;
     let mut stream = rustls::StreamOwned::new(connection, recorder);
     stream.write_all(&request).map_err(classify_io)?;
     stream.flush().map_err(classify_io)?;
@@ -491,6 +536,7 @@ fn build_http_request(
     host: &str,
     port: u16,
     config: &FetchConfig,
+    credential_origin: &Url,
 ) -> Result<Vec<u8>, Error> {
     let path = if url.path().is_empty() {
         "/"
@@ -507,13 +553,23 @@ fn build_http_request(
         format!("{host}:{port}")
     };
     let mut request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n"
+        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n",
     );
-    for (name, value) in &config.headers {
+    let mut emitted_user_agent = false;
+    for (name, value) in config.caller_headers_for(url, credential_origin) {
         validate_header_pair(name, value)?;
+        if name.eq_ignore_ascii_case("user-agent") {
+            emitted_user_agent = true;
+        }
         request.push_str(name);
         request.push_str(": ");
         request.push_str(value);
+        request.push_str("\r\n");
+    }
+    if !emitted_user_agent {
+        validate_header_pair("user-agent", &config.user_agent)?;
+        request.push_str("user-agent: ");
+        request.push_str(&config.user_agent);
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
@@ -1178,6 +1234,27 @@ mod tests {
     fn default_user_agent_is_browser_like() {
         assert!(DEFAULT_USER_AGENT.contains("Mozilla/5.0"));
         assert!(!DEFAULT_USER_AGENT.to_lowercase().contains("reqwest"));
+    }
+
+    #[test]
+    fn same_origin_requires_scheme_host_and_effective_port_match() {
+        let origin = Url::parse("https://Example.test/path").unwrap();
+        assert!(same_origin(
+            &origin,
+            &Url::parse("https://example.test:443/other").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("http://example.test/other").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("https://other.test/other").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("https://example.test:8443/other").unwrap()
+        ));
     }
 
     #[test]

@@ -124,8 +124,12 @@ pub struct RenderConfig {
     /// User-Agent presented to the origin (kept in parity with the HTTP fetch path).
     pub user_agent: String,
     /// Validated effective request headers, including the controlled User-Agent, sent in order to
-    /// the rendered document and every browser subresource.
+    /// same-origin rendered document and subresource requests.
     pub request_headers: Vec<(String, String)>,
+    /// Origin that supplied `request_headers`. The browser removes every caller-controlled field
+    /// before a request to another scheme, host, or effective port. `None` scopes headers to the
+    /// URL passed to `render`/`screenshot`, which is safe for standalone callers.
+    pub credential_origin: Option<Url>,
     /// Minimum interval between browser requests to one scheme/host/port origin.
     pub crawl_delay: Duration,
     /// Maximum non-document requests accepted during this render.
@@ -162,6 +166,7 @@ impl Default for RenderConfig {
             timeout: Duration::from_secs(DEFAULT_RENDER_TIMEOUT_SECS),
             user_agent: String::new(),
             request_headers: Vec::new(),
+            credential_origin: None,
             crawl_delay: Duration::ZERO,
             max_subresources: DEFAULT_MAX_RENDER_SUBRESOURCES,
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
@@ -235,6 +240,7 @@ fn configure_resource_guard(
     tab: &Tab,
     config: &RenderConfig,
     state: Arc<Mutex<RenderResourceState>>,
+    credential_origin: &Url,
 ) -> Result<(), RenderError> {
     let patterns = [
         Fetch::RequestPattern {
@@ -255,6 +261,7 @@ fn configure_resource_guard(
     let max_subresources = config.max_subresources as u64;
     let max_resource_bytes = config.max_resource_bytes;
     let request_headers = config.request_headers.clone();
+    let credential_origin = credential_origin.clone();
     tab.enable_request_interception(Arc::new(
         move |_transport, _session_id, paused: Fetch::events::RequestPausedEvent| {
             let is_document = paused.params.resource_Type == ResourceType::Document;
@@ -298,7 +305,11 @@ fn configure_resource_guard(
                 guard.last_request_at.insert(origin, Instant::now());
             }
             if is_document {
-                return continue_with_effective_headers(paused, &request_headers);
+                return continue_with_effective_headers(
+                    paused,
+                    &request_headers,
+                    &credential_origin,
+                );
             }
             if guard.usage.subresource_count >= max_subresources {
                 guard.usage.cap_exceeded = true;
@@ -308,22 +319,26 @@ fn configure_resource_guard(
                 });
             }
             guard.usage.subresource_count += 1;
-            continue_with_effective_headers(paused, &request_headers)
+            continue_with_effective_headers(paused, &request_headers, &credential_origin)
         },
     ))
     .map_err(|error| RenderError::Render(error.to_string()))
 }
 
-/// Resume a paused request with the shared effective caller-header list.
+/// Resume a paused request with caller headers restricted to their initiating origin.
 ///
 /// CDP's `Network.setExtraHTTPHeaders` takes an object, so it discards duplicate keys and has no
 /// field-order contract. `Fetch.continueRequest` accepts a header-entry list instead. Browser-owned
-/// fields remain present, while any case-insensitive collision with a controlled effective field is
-/// replaced by that one ordered occurrence.
+/// fields remain present. Any case-insensitive collision with a caller-controlled field is removed
+/// first, then re-added only when the paused request has the initiating scheme, host, and port.
+/// This guards cross-origin HTTP redirects, client navigations, iframes, and subresources even when
+/// Chromium has copied headers from a prior same-origin request into the paused request.
 fn continue_with_effective_headers(
     paused: Fetch::events::RequestPausedEvent,
     effective_headers: &[(String, String)],
+    credential_origin: &Url,
 ) -> RequestPausedDecision {
+    let is_same_origin = same_origin_url(&paused.params.request.url, credential_origin);
     let mut headers = paused
         .params
         .request
@@ -345,18 +360,21 @@ fn continue_with_effective_headers(
         })
         .unwrap_or_default();
     headers.retain(|header| {
-        !effective_headers
-            .iter()
-            .any(|(name, _)| header.name.eq_ignore_ascii_case(name))
+        !effective_headers.iter().any(|(name, _)| {
+            header.name.eq_ignore_ascii_case(name)
+                && (is_same_origin || !name.eq_ignore_ascii_case("user-agent"))
+        })
     });
-    headers.extend(
-        effective_headers
-            .iter()
-            .map(|(name, value)| Fetch::HeaderEntry {
-                name: name.clone(),
-                value: value.clone(),
-            }),
-    );
+    if is_same_origin {
+        headers.extend(
+            effective_headers
+                .iter()
+                .map(|(name, value)| Fetch::HeaderEntry {
+                    name: name.clone(),
+                    value: value.clone(),
+                }),
+        );
+    }
 
     RequestPausedDecision::Continue(Some(Fetch::ContinueRequest {
         request_id: paused.params.request_id,
@@ -374,6 +392,15 @@ fn origin_for_url(raw_url: &str) -> Option<RenderOrigin> {
         scheme: url.scheme().to_ascii_lowercase(),
         host: url.host_str()?.to_ascii_lowercase(),
         port: url.port_or_known_default()?,
+    })
+}
+
+/// Compare a browser request URL with the caller credential origin. Origin equality includes the
+/// scheme and effective port, so an HTTP→HTTPS transition and an HTTPS→HTTP downgrade are both
+/// cross-origin even when the hostname is unchanged.
+fn same_origin_url(raw_url: &str, credential_origin: &Url) -> bool {
+    origin_for_url(raw_url).is_some_and(|request_origin| {
+        origin_for_url(credential_origin.as_str()).is_some_and(|origin| request_origin == origin)
     })
 }
 
@@ -596,7 +623,12 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
     let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
-    configure_resource_guard(&tab, config, Arc::clone(&resource_state))?;
+    configure_resource_guard(
+        &tab,
+        config,
+        Arc::clone(&resource_state),
+        config.credential_origin.as_ref().unwrap_or(url),
+    )?;
 
     // Install the network in-flight tracker before any page script runs so the smart wait can see
     // fetch/XHR the page issues, including deferred requests.
@@ -864,8 +896,11 @@ pub struct ScreenshotConfig {
     /// User-Agent presented to the origin (kept in parity with the HTTP fetch path).
     pub user_agent: String,
     /// Validated effective request headers, including the controlled User-Agent, sent in order
-    /// during capture.
+    /// during same-origin capture requests.
     pub request_headers: Vec<(String, String)>,
+    /// Origin that supplied `request_headers`; caller fields are stripped before every
+    /// cross-origin document or subresource request.
+    pub credential_origin: Option<Url>,
     /// Minimum interval between browser requests to one origin during capture.
     pub crawl_delay: Duration,
     /// Maximum non-document requests accepted during capture.
@@ -888,6 +923,7 @@ impl Default for ScreenshotConfig {
             timeout: Duration::from_secs(DEFAULT_RENDER_TIMEOUT_SECS),
             user_agent: String::new(),
             request_headers: Vec::new(),
+            credential_origin: None,
             crawl_delay: Duration::ZERO,
             max_subresources: DEFAULT_MAX_RENDER_SUBRESOURCES,
             max_resource_bytes: DEFAULT_MAX_RENDER_BYTES,
@@ -948,12 +984,18 @@ pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, Re
     let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
     let resource_config = RenderConfig {
         request_headers: config.request_headers.clone(),
+        credential_origin: config.credential_origin.clone(),
         crawl_delay: config.crawl_delay,
         max_subresources: config.max_subresources,
         max_resource_bytes: config.max_resource_bytes,
         ..RenderConfig::default()
     };
-    configure_resource_guard(&tab, &resource_config, Arc::clone(&resource_state))?;
+    configure_resource_guard(
+        &tab,
+        &resource_config,
+        Arc::clone(&resource_state),
+        resource_config.credential_origin.as_ref().unwrap_or(url),
+    )?;
 
     tab.call_method(Emulation::SetDeviceMetricsOverride {
         width: config.width,
@@ -1099,6 +1141,15 @@ mod tests {
         assert!(cfg.actions.is_empty());
         assert_eq!(cfg.max_redirects, DEFAULT_MAX_REDIRECTS);
         assert_eq!(cfg.max_scrolls, DEFAULT_MAX_SCROLLS);
+    }
+
+    #[test]
+    fn browser_credential_scope_requires_scheme_host_and_effective_port_match() {
+        let origin = Url::parse("https://Example.test/path").unwrap();
+        assert!(same_origin_url("https://example.test:443/other", &origin));
+        assert!(!same_origin_url("http://example.test/other", &origin));
+        assert!(!same_origin_url("https://other.test/other", &origin));
+        assert!(!same_origin_url("https://example.test:8443/other", &origin));
     }
 
     #[test]

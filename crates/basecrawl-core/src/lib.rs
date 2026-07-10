@@ -152,6 +152,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let config = FetchConfig {
         timeout: Duration::from_secs(options.timeout_secs),
         headers: effective_headers,
+        credential_origin: Some(url.clone()),
         user_agent: DEFAULT_USER_AGENT.to_string(),
         insecure: options.insecure,
         max_body_bytes: options.max_body_bytes,
@@ -220,13 +221,14 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         && content_kind == ContentKind::Html
         && !body_str.trim().is_empty()
     {
-        config.wait_for_origin(&url);
+        config.wait_for_origin(&page_base);
         let mut rendered = html::render_page(
-            &url,
+            &page_base,
             basecrawl_render::RenderConfig {
                 timeout: Duration::from_secs(options.render_timeout_secs),
                 user_agent: config.user_agent.clone(),
                 request_headers: config.headers.clone(),
+                credential_origin: Some(url.clone()),
                 crawl_delay: config.crawl_delay,
                 max_subresources: options.max_render_subresources,
                 max_resource_bytes: options.max_render_bytes,
@@ -286,13 +288,14 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 value
             }
             Format::Screenshot => {
-                config.wait_for_origin(&url);
+                config.wait_for_origin(&page_base);
                 let shot = screenshot::capture(
-                    &url,
+                    &page_base,
                     basecrawl_render::ScreenshotConfig {
                         timeout: config.timeout,
                         user_agent: config.user_agent.clone(),
                         request_headers: config.headers.clone(),
+                        credential_origin: Some(url.clone()),
                         crawl_delay: config.crawl_delay,
                         max_subresources: options.max_render_subresources,
                         max_resource_bytes: options.max_render_bytes,
@@ -431,13 +434,14 @@ fn crawl_page(
     redact_sensitive_request_echoes(&mut body_str, &options.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
-        config.wait_for_origin(url);
+        config.wait_for_origin(&page_base);
         let mut rendered = html::render_page(
-            url,
+            &page_base,
             basecrawl_render::RenderConfig {
                 timeout: Duration::from_secs(options.render_timeout_secs),
                 user_agent: config.user_agent.clone(),
                 request_headers: config.headers.clone(),
+                credential_origin: Some(url.clone()),
                 crawl_delay: config.crawl_delay,
                 max_subresources: options.max_render_subresources,
                 max_resource_bytes: options.max_render_bytes,
