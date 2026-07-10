@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use url::Url;
@@ -107,15 +109,15 @@ struct Origin {
 }
 
 impl OriginLimiter {
-    fn wait_for_turn(&self, url: &Url, delay: Duration) {
+    fn wait_for_turn(&self, url: &Url, delay: Duration, deadline: Instant) -> Result<(), Error> {
         if delay.is_zero() {
-            return;
+            return Ok(());
         }
         let Some(host) = url.host_str() else {
-            return;
+            return Ok(());
         };
         let Some(port) = url.port_or_known_default() else {
-            return;
+            return Ok(());
         };
         let origin = Origin {
             scheme: url.scheme().to_ascii_lowercase(),
@@ -129,10 +131,15 @@ impl OriginLimiter {
         if let Some(previous) = requests.get(&origin) {
             let elapsed = previous.elapsed();
             if elapsed < delay {
-                std::thread::sleep(delay - elapsed);
+                let wait = delay - elapsed;
+                if wait >= remaining(deadline)? {
+                    return Err(deadline_elapsed());
+                }
+                thread::sleep(wait);
             }
         }
         requests.insert(origin, Instant::now());
+        Ok(())
     }
 }
 
@@ -140,8 +147,9 @@ impl FetchConfig {
     /// Apply this fetcher's shared per-origin limiter before a browser navigation reuses the same
     /// origin. Keeping this method on the config lets the core maintain one schedule across its
     /// direct Rust fetches and the subsequent Chromium render.
-    pub(crate) fn wait_for_origin(&self, url: &Url) {
-        self.origin_limiter.wait_for_turn(url, self.crawl_delay);
+    pub(crate) fn wait_for_origin_until(&self, url: &Url, deadline: Instant) -> Result<(), Error> {
+        self.origin_limiter
+            .wait_for_turn(url, self.crawl_delay, deadline)
     }
 
     /// Return caller-controlled headers only for the initiating origin.
@@ -298,6 +306,14 @@ fn validate_header_pair(name: &str, value: &str) -> Result<(), Error> {
 /// [`Error`]s and never as a fabricated HTTP status. Any HTTP status the terminal resource returns
 /// (including 4xx/5xx) is captured faithfully.
 pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
+    fetch_until(url, config, Instant::now() + config.timeout)
+}
+
+/// Perform a fetch while consuming the caller's absolute scrape deadline.
+///
+/// Every redirect hop and its DNS, connection, TLS, request-write, and body-read work receives
+/// only the time still available from this deadline.
+pub fn fetch_until(url: &Url, config: &FetchConfig, deadline: Instant) -> Result<Fetched, Error> {
     let mut current = url.clone();
     let credential_origin = config.credential_origin.as_ref().unwrap_or(url);
     let mut redirects: Vec<RedirectHop> = Vec::new();
@@ -308,10 +324,10 @@ pub fn fetch(url: &Url, config: &FetchConfig) -> Result<Fetched, Error> {
         // Record the request immediately before opening the connection. This is deliberately in
         // the redirect loop, rather than around `fetch`, so every physical same-origin request is
         // spaced, including redirect hops and callers such as robots/sitemap/pagination.
-        config.wait_for_origin(&current);
+        config.wait_for_origin_until(&current, deadline)?;
         let response = match current.scheme() {
-            "http" => fetch_http(&current, config, credential_origin)?,
-            "https" => fetch_https(&current, config, credential_origin)?,
+            "http" => fetch_http(&current, config, credential_origin, deadline)?,
+            "https" => fetch_https(&current, config, credential_origin, deadline)?,
             scheme => return Err(Error::UnsupportedScheme(scheme.to_string())),
         };
 
@@ -383,20 +399,16 @@ fn fetch_http(
     url: &Url,
     config: &FetchConfig,
     credential_origin: &Url,
+    deadline: Instant,
 ) -> Result<SingleResponse, Error> {
     let host = url
         .host_str()
         .ok_or_else(|| Error::InvalidUrl(url.to_string()))?;
     let port = url.port_or_known_default().unwrap_or(80);
-    let address = resolve_address(host, port)?;
-    let mut stream = TcpStream::connect_timeout(&address, config.timeout).map_err(classify_io)?;
+    let address = resolve_address(host, port, deadline)?;
+    let stream = TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(classify_io)?;
     let egress_ip = stream.local_addr().map_err(classify_io)?.ip();
-    stream
-        .set_read_timeout(Some(config.timeout))
-        .map_err(classify_io)?;
-    stream
-        .set_write_timeout(Some(config.timeout))
-        .map_err(classify_io)?;
+    let mut stream = DeadlineStream::new(stream, deadline);
 
     let request = build_http_request(url, host, port, config, credential_origin)?;
     stream.write_all(&request).map_err(classify_io)?;
@@ -404,11 +416,12 @@ fn fetch_http(
     let raw_limit = config
         .max_body_bytes
         .saturating_add(MAX_HTTP_RESPONSE_HEADER_BYTES);
-    let (raw_response, raw_truncated) = read_capped(&mut stream, raw_limit)?;
+    let (raw_response, raw_truncated) = read_capped(&mut stream, raw_limit, deadline)?;
     let (status_code, headers, body) = parse_http_response(&raw_response)?;
     let content_type = header_value(&headers, "content-type");
     let location = header_value(&headers, "location");
-    let (body, decoded_truncated) = decode_http_body(&headers, body, config.max_body_bytes)?;
+    let (body, decoded_truncated) =
+        decode_http_body(&headers, body, config.max_body_bytes, deadline)?;
 
     Ok(SingleResponse {
         status_code,
@@ -429,6 +442,7 @@ fn fetch_https(
     url: &Url,
     config: &FetchConfig,
     credential_origin: &Url,
+    deadline: Instant,
 ) -> Result<SingleResponse, Error> {
     let host = url
         .host_str()
@@ -436,13 +450,9 @@ fn fetch_https(
     let port = url.port_or_known_default().unwrap_or(443);
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| Error::InvalidUrl(format!("invalid HTTPS host '{host}'")))?;
-    let address = resolve_address(host, port)?;
-    let tcp = TcpStream::connect_timeout(&address, config.timeout).map_err(classify_io)?;
+    let address = resolve_address(host, port, deadline)?;
+    let tcp = TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(classify_io)?;
     let egress_ip = tcp.local_addr().map_err(classify_io)?.ip();
-    tcp.set_read_timeout(Some(config.timeout))
-        .map_err(classify_io)?;
-    tcp.set_write_timeout(Some(config.timeout))
-        .map_err(classify_io)?;
 
     let capture = Arc::new(TlsCaptureState::default());
     let client_config = tls_config(capture.clone(), config.insecure)?;
@@ -454,7 +464,7 @@ fn fetch_https(
     // Drive the handshake explicitly so the recorder has an exact, bounded wire view that ends at
     // the client Finished. This is intentionally before any HTTP application data is written.
     let wire = Arc::new(Mutex::new(HandshakeWire::default()));
-    let mut recorder = RecordingStream::new(tcp, wire.clone());
+    let mut recorder = RecordingStream::new(tcp, wire.clone(), deadline);
     while connection.is_handshaking() {
         connection.complete_io(&mut recorder).map_err(classify_io)?;
     }
@@ -471,11 +481,12 @@ fn fetch_https(
     let raw_limit = config
         .max_body_bytes
         .saturating_add(MAX_HTTP_RESPONSE_HEADER_BYTES);
-    let (raw_response, raw_truncated) = read_capped(&mut stream, raw_limit)?;
+    let (raw_response, raw_truncated) = read_capped(&mut stream, raw_limit, deadline)?;
     let (status_code, headers, body) = parse_http_response(&raw_response)?;
     let content_type = header_value(&headers, "content-type");
     let location = header_value(&headers, "location");
-    let (body, decoded_truncated) = decode_http_body(&headers, body, config.max_body_bytes)?;
+    let (body, decoded_truncated) =
+        decode_http_body(&headers, body, config.max_body_bytes, deadline)?;
     Ok(SingleResponse {
         status_code,
         headers_hash: hash_header_lines(&headers),
@@ -488,12 +499,27 @@ fn fetch_https(
     })
 }
 
-fn resolve_address(host: &str, port: u16) -> Result<std::net::SocketAddr, Error> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(classify_io)?
-        .next()
-        .ok_or_else(|| Error::Transport(format!("DNS resolution returned no addresses for {host}")))
+fn resolve_address(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<std::net::SocketAddr, Error> {
+    let host = host.to_string();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(classify_io)
+            .and_then(|mut addresses| {
+                addresses.next().ok_or_else(|| {
+                    Error::Transport(format!("DNS resolution returned no addresses for {host}"))
+                })
+            });
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(remaining(deadline)?)
+        .map_err(|_| deadline_elapsed())?
 }
 
 /// Build a rustls configuration with Mozilla roots. TLS 1.3 is preferred and fully captured, while
@@ -610,10 +636,11 @@ fn decode_http_body(
     headers: &Headers,
     mut body: Vec<u8>,
     max_body_bytes: usize,
+    deadline: Instant,
 ) -> Result<(Vec<u8>, bool), Error> {
     let mut truncated = false;
     if header_contains_token(headers, "transfer-encoding", "chunked") {
-        let (decoded, chunk_truncated) = decode_chunked(&body, max_body_bytes)?;
+        let (decoded, chunk_truncated) = decode_chunked(&body, max_body_bytes, deadline)?;
         body = decoded;
         truncated |= chunk_truncated;
     }
@@ -625,7 +652,7 @@ fn decode_http_body(
         .collect::<Vec<_>>();
     for encoding in encodings.iter().rev() {
         let (decoded, decoding_truncated) = match encoding.as_str() {
-            "gzip" => read_capped(GzDecoder::new(Cursor::new(body)), max_body_bytes)?,
+            "gzip" => read_capped(GzDecoder::new(Cursor::new(body)), max_body_bytes, deadline)?,
             "deflate" => {
                 // HTTP's historical `deflate` token is ambiguous in practice: some origins send
                 // raw DEFLATE while others send a zlib wrapper. Accept both forms, as reqwest did
@@ -634,19 +661,23 @@ fn decode_http_body(
                 match read_capped(
                     DeflateDecoder::new(Cursor::new(&compressed)),
                     max_body_bytes,
+                    deadline,
                 ) {
                     Ok(decoded) => decoded,
-                    Err(_) => {
-                        read_capped(ZlibDecoder::new(Cursor::new(&compressed)), max_body_bytes)
-                            .map_err(|error| {
-                                Error::Fetch(format!("could not decode deflate body: {error}"))
-                            })?
-                    }
+                    Err(_) => read_capped(
+                        ZlibDecoder::new(Cursor::new(&compressed)),
+                        max_body_bytes,
+                        deadline,
+                    )
+                    .map_err(|error| {
+                        Error::Fetch(format!("could not decode deflate body: {error}"))
+                    })?,
                 }
             }
             "br" => read_capped(
                 brotli::Decompressor::new(Cursor::new(body), 4096),
                 max_body_bytes,
+                deadline,
             )?,
             unsupported => {
                 return Err(Error::Fetch(format!(
@@ -661,9 +692,14 @@ fn decode_http_body(
     Ok((body, truncated || body_truncated))
 }
 
-fn decode_chunked(mut encoded: &[u8], max_body_bytes: usize) -> Result<(Vec<u8>, bool), Error> {
+fn decode_chunked(
+    mut encoded: &[u8],
+    max_body_bytes: usize,
+    deadline: Instant,
+) -> Result<(Vec<u8>, bool), Error> {
     let mut decoded = Vec::new();
     loop {
+        remaining(deadline)?;
         let Some(line_end) = encoded.windows(2).position(|bytes| bytes == b"\r\n") else {
             return Err(Error::Fetch(
                 "malformed chunked response: missing chunk length terminator".to_string(),
@@ -696,10 +732,15 @@ fn decode_chunked(mut encoded: &[u8], max_body_bytes: usize) -> Result<(Vec<u8>,
 /// Read no more than `max_body_bytes` and probe one additional byte to distinguish an exactly
 /// sized body from a truncated one. This is the single memory boundary used by all transport and
 /// decoder paths.
-fn read_capped<R: Read>(mut reader: R, max_body_bytes: usize) -> Result<(Vec<u8>, bool), Error> {
+fn read_capped<R: Read>(
+    mut reader: R,
+    max_body_bytes: usize,
+    deadline: Instant,
+) -> Result<(Vec<u8>, bool), Error> {
     let mut body = Vec::with_capacity(max_body_bytes.min(64 * 1024));
     let mut chunk = [0_u8; 8192];
     while body.len() < max_body_bytes {
+        remaining(deadline)?;
         let requested = (max_body_bytes - body.len()).min(chunk.len());
         let read = reader.read(&mut chunk[..requested]).map_err(classify_io)?;
         if read == 0 {
@@ -708,6 +749,7 @@ fn read_capped<R: Read>(mut reader: R, max_body_bytes: usize) -> Result<(Vec<u8>
         body.extend_from_slice(&chunk[..read]);
     }
     let mut probe = [0_u8; 1];
+    remaining(deadline)?;
     let body_truncated = reader.read(&mut probe).map_err(classify_io)? != 0;
     Ok((body, body_truncated))
 }
@@ -864,16 +906,22 @@ struct HandshakeWire {
 struct RecordingStream {
     inner: TcpStream,
     wire: Arc<Mutex<HandshakeWire>>,
+    deadline: Instant,
 }
 
 impl RecordingStream {
-    fn new(inner: TcpStream, wire: Arc<Mutex<HandshakeWire>>) -> Self {
-        Self { inner, wire }
+    fn new(inner: TcpStream, wire: Arc<Mutex<HandshakeWire>>, deadline: Instant) -> Self {
+        Self {
+            inner,
+            wire,
+            deadline,
+        }
     }
 }
 
 impl Read for RecordingStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        set_socket_read_timeout(&self.inner, self.deadline)?;
         let read = self.inner.read(buffer)?;
         if read != 0 {
             self.wire
@@ -888,6 +936,7 @@ impl Read for RecordingStream {
 
 impl Write for RecordingStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        set_socket_write_timeout(&self.inner, self.deadline)?;
         let written = self.inner.write(buffer)?;
         if written != 0 {
             self.wire
@@ -900,8 +949,66 @@ impl Write for RecordingStream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        set_socket_write_timeout(&self.inner, self.deadline)?;
         self.inner.flush()
     }
+}
+
+/// A TCP stream that derives each socket I/O timeout from the absolute scrape deadline.
+///
+/// Refreshing this before every read/write prevents a peer that drips bytes from obtaining a new
+/// full request timeout for each socket operation.
+struct DeadlineStream {
+    inner: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn new(inner: TcpStream, deadline: Instant) -> Self {
+        Self { inner, deadline }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        set_socket_read_timeout(&self.inner, self.deadline)?;
+        self.inner.read(buffer)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        set_socket_write_timeout(&self.inner, self.deadline)?;
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        set_socket_write_timeout(&self.inner, self.deadline)?;
+        self.inner.flush()
+    }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, Error> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(deadline_elapsed)
+}
+
+fn deadline_elapsed() -> Error {
+    Error::Timeout("scrape deadline exceeded".to_string())
+}
+
+fn socket_remaining(deadline: Instant) -> io::Result<Duration> {
+    remaining(deadline).map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error.to_string()))
+}
+
+fn set_socket_read_timeout(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
+    stream.set_read_timeout(Some(socket_remaining(deadline)?))
+}
+
+fn set_socket_write_timeout(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
+    stream.set_write_timeout(Some(socket_remaining(deadline)?))
 }
 
 fn capture_tls_metadata(

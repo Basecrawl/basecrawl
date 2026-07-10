@@ -4,7 +4,8 @@
 //! in `result.formats_produced.screenshot`. The screenshot is deliberately outside the
 //! deterministic `result_hash` surface (see [`crate::canonical`]).
 
-use basecrawl_render::{screenshot, Screenshot, ScreenshotConfig};
+use basecrawl_render::{screenshot_until, Screenshot, ScreenshotConfig};
+use std::time::Instant;
 use url::Url;
 
 use crate::error::Error;
@@ -13,7 +14,17 @@ use crate::error::Error;
 /// base64 wire form. A capture failure is surfaced as a structured [`Error`] so the scrape fails
 /// loudly rather than emitting a misleading screenshot value.
 pub fn capture(url: &Url, config: ScreenshotConfig) -> Result<Screenshot, Error> {
-    screenshot(url, &config).map_err(|e| Error::Render(e.to_string()))
+    let deadline = Instant::now() + config.timeout;
+    capture_until(url, config, deadline)
+}
+
+/// Capture while consuming the scrape-owned absolute deadline.
+pub fn capture_until(
+    url: &Url,
+    config: ScreenshotConfig,
+    deadline: Instant,
+) -> Result<Screenshot, Error> {
+    screenshot_until(url, &config, deadline).map_err(|e| Error::Render(e.to_string()))
 }
 
 /// Parse a `WIDTHxHEIGHT` viewport spec (e.g. `1280x800`) into `(width, height)`.

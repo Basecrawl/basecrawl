@@ -10,7 +10,11 @@ mod common;
 
 use common::httpbin_base;
 use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
+use std::thread;
 use std::time::Instant;
 
 const BIN: &str = env!("CARGO_BIN_EXE_basecrawl");
@@ -20,6 +24,40 @@ fn run(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to spawn basecrawl binary")
+}
+
+fn handle_redirect_loop(stream: TcpStream) {
+    let mut peer = stream.try_clone().expect("clone stream");
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+        return;
+    }
+    let mut line = String::new();
+    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        line.clear();
+    }
+    let response =
+        "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = peer.write_all(response.as_bytes());
+    let _ = peer.flush();
+}
+
+fn redirect_loop_base() -> &'static str {
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect-loop fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || handle_redirect_loop(stream));
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    })
 }
 
 /// Run a scrape and parse stdout as exactly one strict JSON object.
@@ -102,15 +140,14 @@ fn redirect_chain_metadata_is_captured() {
 // VAL-CRAWL-020: redirect loops are detected and bounded (no hang).
 #[test]
 fn redirect_loop_is_bounded_with_clear_error() {
-    let base = httpbin_base();
-    let url = format!("{base}/redirect/50");
+    let url = format!("{}/loop", redirect_loop_base());
     let start = Instant::now();
-    let out = run(&[&url, "--timeout", "20"]);
+    let out = run(&[&url, "--timeout", "5", "--robots", "ignore"]);
     let elapsed = start.elapsed();
 
     assert!(
         !out.status.success(),
-        "a 50-hop chain must exceed the hop cap and exit non-zero"
+        "a local redirect loop must exceed the hop cap and exit non-zero"
     );
     assert!(
         out.stdout.is_empty(),

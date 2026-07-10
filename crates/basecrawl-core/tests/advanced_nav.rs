@@ -404,3 +404,39 @@ fn client_redirect_loop_is_bounded() {
         "redirect loop must be bounded by the hop cap, not hang (took {elapsed:?})"
     );
 }
+
+#[test]
+fn wait_for_selector_still_tracks_and_bounds_client_redirects() {
+    let url = format!("{}/loop-a", server_base());
+    let start = Instant::now();
+    let out = run(&[
+        &url,
+        "--formats",
+        "html",
+        "--wait-for",
+        ".never-present",
+        "--render-timeout",
+        "30",
+    ]);
+    let elapsed = start.elapsed();
+
+    assert!(
+        !out.status.success(),
+        "a redirect loop must fail even while waiting for a selector"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no partial ScrapeProof on a selector wait interrupted by a redirect loop"
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).expect("structured JSON error on stderr");
+    assert_eq!(
+        err["error"]["kind"],
+        "too_many_redirects",
+        "--wait-for must not turn a redirect loop into a selector timeout: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "the redirect hop cap must win before the selector timeout ({elapsed:?})"
+    );
+}

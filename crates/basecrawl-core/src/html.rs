@@ -8,7 +8,8 @@
 //! content on a JS-rendered page while `rawHtml` continues to reflect the source. A single render is
 //! shared by both `html` and `markdown`, so producing both never launches more than one browser.
 
-use basecrawl_render::{render, RenderConfig, RenderError};
+use basecrawl_render::{render_until, RenderConfig, RenderError};
+use std::time::Instant;
 use url::Url;
 
 use crate::error::Error;
@@ -27,7 +28,17 @@ pub type RenderedPage = basecrawl_render::Rendered;
 /// bounded by `timeout`; any other failure is surfaced as a structured [`Error`] so the scrape
 /// fails loudly rather than emitting misleading output.
 pub fn render_page(url: &Url, config: RenderConfig) -> Result<RenderedPage, Error> {
-    match render(url, &config) {
+    let deadline = Instant::now() + config.timeout;
+    render_page_until(url, config, deadline)
+}
+
+/// Render while consuming the scrape-owned absolute deadline.
+pub fn render_page_until(
+    url: &Url,
+    config: RenderConfig,
+    deadline: Instant,
+) -> Result<RenderedPage, Error> {
+    match render_until(url, &config, deadline) {
         Ok(rendered) => Ok(rendered),
         Err(RenderError::TooManyRedirects { max }) => Err(Error::TooManyRedirects {
             max,

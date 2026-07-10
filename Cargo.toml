@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/headless_chrome"]
 members = [
     "bindings/node",
     "bindings/python",
@@ -45,3 +46,6 @@ napi-derive = "3"
 
 [profile.release]
 opt-level = 3
+
+[patch.crates-io]
+headless_chrome = { path = "vendor/headless_chrome" }

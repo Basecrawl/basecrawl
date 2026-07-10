@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -241,6 +242,7 @@ fn configure_resource_guard(
     config: &RenderConfig,
     state: Arc<Mutex<RenderResourceState>>,
     credential_origin: &Url,
+    deadline: Instant,
 ) -> Result<(), RenderError> {
     let patterns = [
         Fetch::RequestPattern {
@@ -262,6 +264,7 @@ fn configure_resource_guard(
     let max_resource_bytes = config.max_resource_bytes;
     let request_headers = config.request_headers.clone();
     let credential_origin = credential_origin.clone();
+    let timeout = config.timeout;
     tab.enable_request_interception(Arc::new(
         move |_transport, _session_id, paused: Fetch::events::RequestPausedEvent| {
             let is_document = paused.params.resource_Type == ResourceType::Document;
@@ -298,7 +301,20 @@ fn configure_resource_guard(
                     if let Some(previous) = guard.last_request_at.get(&origin) {
                         let elapsed = previous.elapsed();
                         if elapsed < crawl_delay {
-                            std::thread::sleep(crawl_delay - elapsed);
+                            let wait = crawl_delay - elapsed;
+                            let Ok(remaining) = remaining(deadline, timeout) else {
+                                return RequestPausedDecision::Fail(Fetch::FailRequest {
+                                    request_id: paused.params.request_id,
+                                    error_reason: ErrorReason::TimedOut,
+                                });
+                            };
+                            if wait >= remaining {
+                                return RequestPausedDecision::Fail(Fetch::FailRequest {
+                                    request_id: paused.params.request_id,
+                                    error_reason: ErrorReason::TimedOut,
+                                });
+                            }
+                            std::thread::sleep(wait);
                         }
                     }
                 }
@@ -418,9 +434,12 @@ fn declared_content_length(headers: &[Fetch::HeaderEntry]) -> Option<u64> {
 /// same static page produce byte-identical pixels (screenshot determinism), while
 /// `--disable-dev-shm-usage`/`--disable-gpu` keep Chromium stable in a container. Sandbox is
 /// disabled because the crawler runs as root. The returned browser is killed when dropped.
-fn launch_browser(timeout: Duration, window_size: (u32, u32)) -> Result<Browser, RenderError> {
+fn launch_browser(
+    deadline: Instant,
+    timeout: Duration,
+    window_size: (u32, u32),
+) -> Result<Browser, RenderError> {
     let chrome = resolve_chrome().ok_or(RenderError::ChromeNotFound)?;
-
     let args: Vec<&OsStr> = vec![
         OsStr::new("--disable-dev-shm-usage"),
         OsStr::new("--disable-gpu"),
@@ -434,11 +453,11 @@ fn launch_browser(timeout: Duration, window_size: (u32, u32)) -> Result<Browser,
         .sandbox(false)
         .window_size(Some(window_size))
         .args(args)
-        .idle_browser_timeout(timeout)
+        .idle_browser_timeout(remaining(deadline, timeout)?)
         .build()
-        .map_err(|e| RenderError::Launch(e.to_string()))?;
+        .map_err(|error| RenderError::Launch(error.to_string()))?;
 
-    Browser::new(options).map_err(|e| RenderError::Launch(e.to_string()))
+    Browser::new(options).map_err(|error| RenderError::Launch(error.to_string()))
 }
 
 /// In-page finalize script: inline embedded content, clean, and serialize (a single CDP round-trip).
@@ -612,26 +631,39 @@ return true;\
 /// [`RenderError::Timeout`] rather than hanging. The spawned browser is terminated when this
 /// function returns (its `Browser` handle is dropped), so no browser process is leaked.
 pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError> {
-    let deadline = Instant::now() + config.timeout;
-    let browser = launch_browser(config.timeout, (1280, 800))?;
+    render_until(url, config, Instant::now() + config.timeout)
+}
+
+/// Render `url` while consuming the caller-owned absolute scrape deadline.
+pub fn render_until(
+    url: &Url,
+    config: &RenderConfig,
+    deadline: Instant,
+) -> Result<Rendered, RenderError> {
+    let deadline = effective_deadline(deadline, config.timeout);
+    let browser = launch_browser(deadline, config.timeout, (1280, 800))?;
     let tab = browser
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
-    tab.set_default_timeout(config.timeout);
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
+        set_tab_deadline(&tab, deadline, config.timeout)?;
         tab.set_user_agent(&config.user_agent, None, None)
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
     let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     configure_resource_guard(
         &tab,
         config,
         Arc::clone(&resource_state),
         config.credential_origin.as_ref().unwrap_or(url),
+        deadline,
     )?;
 
     // Install the network in-flight tracker before any page script runs so the smart wait can see
     // fetch/XHR the page issues, including deferred requests.
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     tab.call_method(Page::AddScriptToEvaluateOnNewDocument {
         source: NETWORK_TRACKER_JS.to_string(),
         world_name: None,
@@ -640,6 +672,7 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
     })
     .map_err(|e| RenderError::Render(e.to_string()))?;
 
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     tab.navigate_to(url.as_str())
         .map_err(|e| RenderError::Render(e.to_string()))?;
     // `navigate_to` returns without waiting for the load to finish. We deliberately do NOT call
@@ -653,15 +686,7 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
         // An explicit selector is the authoritative capture signal (it also handles content injected
         // by a timer with no network activity, which a network-idle wait would miss).
         Some(selector) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(RenderError::Timeout(config.timeout));
-            }
-            tab.wait_for_element_with_custom_timeout(selector, remaining)
-                .map_err(|e| RenderError::WaitFor {
-                    selector: selector.clone(),
-                    detail: e.to_string(),
-                })?;
+            wait_for_selector_and_follow_redirects(&tab, selector, config, deadline)?;
         }
         None => {
             // Wait for network idle while following (and bounding) any client-side redirect.
@@ -670,21 +695,22 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
     }
     // Dismiss a cookie/consent overlay (best-effort) so the underlying page, not the banner, is the
     // captured content; let anything the dismissal reveals settle briefly.
-    if config.dismiss_consent && dismiss_consent(&tab) {
+    if config.dismiss_consent && dismiss_consent(&tab, deadline, config.timeout)? {
         settle_quiet(&tab, config.quiet_period, deadline);
     }
 
     // Collect infinite-scroll / lazy-loaded content by scrolling until the page stops growing.
     if config.auto_scroll {
-        auto_scroll(&tab, config, deadline);
+        auto_scroll(&tab, config, deadline)?;
     }
 
     // Execute the supplied scripted actions in order (click / scroll / wait / wait-for-selector).
     for action in &config.actions {
-        run_action(&tab, action, deadline)?;
+        run_action(&tab, action, config, deadline)?;
     }
 
     // Inline iframe/shadow content, strip scripts/styles, and serialize (one CDP round-trip).
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     let evaluated = tab
         .evaluate(CLEAN_AND_SERIALIZE, false)
         .map_err(|e| RenderError::Render(e.to_string()))?;
@@ -703,6 +729,22 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
         }
         _ => Err(RenderError::NoContent),
     }
+}
+
+fn effective_deadline(scrape_deadline: Instant, timeout: Duration) -> Instant {
+    scrape_deadline.min(Instant::now() + timeout)
+}
+
+fn remaining(deadline: Instant, timeout: Duration) -> Result<Duration, RenderError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or(RenderError::Timeout(timeout))
+}
+
+fn set_tab_deadline(tab: &Tab, deadline: Instant, timeout: Duration) -> Result<(), RenderError> {
+    tab.set_default_timeout(remaining(deadline, timeout)?);
+    Ok(())
 }
 
 /// The current top-frame URL with any fragment removed. Fragment-only changes are SPA hash routing,
@@ -743,14 +785,12 @@ fn settle_and_follow_redirects(
     let mut hops = 0usize;
 
     loop {
-        if Instant::now() >= deadline {
-            return Err(RenderError::Timeout(config.timeout));
-        }
+        set_tab_deadline(tab, deadline, config.timeout)?;
 
         let live = current_url_no_fragment(tab);
         if !is_committed_http(&live) {
             // The navigation has not committed to a real page yet (still about:blank).
-            std::thread::sleep(poll);
+            thread::sleep(poll.min(remaining(deadline, config.timeout)?));
             continue;
         }
 
@@ -770,7 +810,7 @@ fn settle_and_follow_redirects(
             }
             current = live;
             url_stable_since = Instant::now();
-            std::thread::sleep(poll);
+            thread::sleep(poll.min(remaining(deadline, config.timeout)?));
             continue;
         }
 
@@ -779,6 +819,7 @@ fn settle_and_follow_redirects(
             return Ok(());
         }
 
+        set_tab_deadline(tab, deadline, config.timeout)?;
         if let Some(snap) = probe_idle(tab) {
             let url_quiet_ms = url_stable_since.elapsed().as_millis() as i64;
             if snap.ready == "complete"
@@ -789,7 +830,65 @@ fn settle_and_follow_redirects(
                 return Ok(());
             }
         }
-        std::thread::sleep(poll);
+        thread::sleep(poll.min(remaining(deadline, config.timeout)?));
+    }
+}
+
+/// Poll selector presence and the committed top-frame URL in one deadline-bounded loop.
+///
+/// `Tab::wait_for_element_with_custom_timeout` cannot observe document URL changes while it
+/// blocks, allowing a client redirect loop to masquerade as a selector timeout. This loop makes
+/// selector waits use the same client redirect accounting as the network-idle path.
+fn wait_for_selector_and_follow_redirects(
+    tab: &Tab,
+    selector: &str,
+    config: &RenderConfig,
+    deadline: Instant,
+) -> Result<(), RenderError> {
+    let poll = Duration::from_millis(50);
+    let selector_probe = format!(
+        "document.querySelector({}) !== null",
+        js_string_literal(selector)
+    );
+    let mut current = String::new();
+    let mut committed = false;
+    let mut hops = 0usize;
+
+    loop {
+        set_tab_deadline(tab, deadline, config.timeout)?;
+        let live = current_url_no_fragment(tab);
+        if is_committed_http(&live) {
+            if !committed {
+                committed = true;
+                current = live;
+            } else if live != current {
+                if config.follow_client_redirects {
+                    hops += 1;
+                    if hops > config.max_redirects {
+                        return Err(RenderError::TooManyRedirects {
+                            max: config.max_redirects,
+                        });
+                    }
+                }
+                current = live;
+            }
+        }
+
+        set_tab_deadline(tab, deadline, config.timeout)?;
+        let present = tab
+            .evaluate(&selector_probe, false)
+            .map_err(|e| RenderError::WaitFor {
+                selector: selector.to_string(),
+                detail: e.to_string(),
+            })?
+            .value
+            .as_ref()
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if present {
+            return Ok(());
+        }
+        thread::sleep(poll.min(remaining(deadline, config.timeout)?));
     }
 }
 
@@ -808,7 +907,7 @@ fn settle_quiet(tab: &Tab, quiet: Duration, deadline: Instant) {
                 return;
             }
         }
-        std::thread::sleep(poll);
+        thread::sleep(poll.min(step_deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -816,26 +915,27 @@ fn settle_quiet(tab: &Tab, quiet: Duration, deadline: Instant) {
 /// control was clicked. The match is deliberately conservative (an accept-like label *inside* a
 /// consent-looking container or a fixed/sticky high-z-index overlay) so ordinary page buttons are
 /// left untouched.
-fn dismiss_consent(tab: &Tab) -> bool {
-    matches!(
+fn dismiss_consent(tab: &Tab, deadline: Instant, timeout: Duration) -> Result<bool, RenderError> {
+    set_tab_deadline(tab, deadline, timeout)?;
+    Ok(matches!(
         tab.evaluate(CONSENT_DISMISS_JS, false)
             .ok()
             .and_then(|r| r.value),
         Some(serde_json::Value::Bool(true))
-    )
+    ))
 }
 
 /// Collect infinite-scroll / lazy-loaded content by running the in-page auto-scroll loop as a single
 /// awaited CDP call, bounded by `max_scrolls` and the remaining render budget. Best-effort: any
 /// failure or deadline simply captures whatever has loaded so far.
-fn auto_scroll(tab: &Tab, config: &RenderConfig, deadline: Instant) {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return;
-    }
-    let budget_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+fn auto_scroll(tab: &Tab, config: &RenderConfig, deadline: Instant) -> Result<(), RenderError> {
+    let remaining_budget = remaining(deadline, config.timeout)?;
+    let budget_ms = remaining_budget.as_millis().min(u128::from(u64::MAX)) as u64;
     let js = build_auto_scroll_js(config.max_scrolls, budget_ms);
+    set_tab_deadline(tab, deadline, config.timeout)?;
     let _ = tab.evaluate(&js, true);
+    remaining(deadline, config.timeout)?;
+    Ok(())
 }
 
 /// Encode a string as a JSON string literal (also a valid JS string literal) so a selector can be
@@ -845,13 +945,19 @@ fn js_string_literal(s: &str) -> String {
 }
 
 /// Execute a single scripted [`Action`], bounded by the render `deadline`.
-fn run_action(tab: &Tab, action: &Action, deadline: Instant) -> Result<(), RenderError> {
+fn run_action(
+    tab: &Tab,
+    action: &Action,
+    config: &RenderConfig,
+    deadline: Instant,
+) -> Result<(), RenderError> {
     match action {
         Action::Click { selector } => {
             let js = format!(
                 "(function(){{var e=document.querySelector({});if(e){{e.click();return true;}}return false;}})()",
                 js_string_literal(selector)
             );
+            set_tab_deadline(tab, deadline, config.timeout)?;
             let _ = tab.evaluate(&js, false);
         }
         Action::Scroll { direction } => {
@@ -859,25 +965,16 @@ fn run_action(tab: &Tab, action: &Action, deadline: Instant) -> Result<(), Rende
                 ScrollDirection::Down => "window.scrollBy(0, window.innerHeight)",
                 ScrollDirection::Up => "window.scrollBy(0, -window.innerHeight)",
             };
+            set_tab_deadline(tab, deadline, config.timeout)?;
             let _ = tab.evaluate(js, false);
         }
         Action::Wait { milliseconds } => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            std::thread::sleep(Duration::from_millis(*milliseconds).min(remaining));
+            let remaining_budget = remaining(deadline, config.timeout)?;
+            std::thread::sleep(Duration::from_millis(*milliseconds).min(remaining_budget));
+            remaining(deadline, config.timeout)?;
         }
         Action::WaitForSelector { selector } => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(RenderError::WaitFor {
-                    selector: selector.clone(),
-                    detail: "render deadline exceeded".to_string(),
-                });
-            }
-            tab.wait_for_element_with_custom_timeout(selector, remaining)
-                .map_err(|e| RenderError::WaitFor {
-                    selector: selector.clone(),
-                    detail: e.to_string(),
-                })?;
+            wait_for_selector_and_follow_redirects(tab, selector, config, deadline)?;
         }
     }
     Ok(())
@@ -972,12 +1069,23 @@ document.body?document.body.offsetHeight:0)";
 /// than the viewport. Rendering the same static page twice produces byte-identical PNGs (fixed
 /// color profile + font hinting, no embedded timestamps). The spawned browser is killed on return.
 pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, RenderError> {
-    let browser = launch_browser(config.timeout, (config.width, config.height))?;
+    screenshot_until(url, config, Instant::now() + config.timeout)
+}
+
+/// Capture a screenshot while consuming the caller-owned absolute scrape deadline.
+pub fn screenshot_until(
+    url: &Url,
+    config: &ScreenshotConfig,
+    deadline: Instant,
+) -> Result<Screenshot, RenderError> {
+    let deadline = effective_deadline(deadline, config.timeout);
+    let browser = launch_browser(deadline, config.timeout, (config.width, config.height))?;
     let tab = browser
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
-    tab.set_default_timeout(config.timeout);
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
+        set_tab_deadline(&tab, deadline, config.timeout)?;
         tab.set_user_agent(&config.user_agent, None, None)
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
@@ -990,13 +1098,16 @@ pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, Re
         max_resource_bytes: config.max_resource_bytes,
         ..RenderConfig::default()
     };
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     configure_resource_guard(
         &tab,
         &resource_config,
         Arc::clone(&resource_state),
         resource_config.credential_origin.as_ref().unwrap_or(url),
+        deadline,
     )?;
 
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     tab.call_method(Emulation::SetDeviceMetricsOverride {
         width: config.width,
         height: config.height,
@@ -1015,12 +1126,22 @@ pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, Re
     })
     .map_err(|e| RenderError::Render(e.to_string()))?;
 
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     tab.navigate_to(url.as_str())
         .map_err(|e| RenderError::Render(e.to_string()))?;
-    tab.wait_until_navigated()
-        .map_err(|e| RenderError::Render(e.to_string()))?;
+    let navigation_config = RenderConfig {
+        timeout: config.timeout,
+        request_headers: config.request_headers.clone(),
+        credential_origin: config.credential_origin.clone(),
+        crawl_delay: config.crawl_delay,
+        max_subresources: config.max_subresources,
+        max_resource_bytes: config.max_resource_bytes,
+        ..RenderConfig::default()
+    };
+    settle_and_follow_redirects(&tab, &navigation_config, deadline)?;
 
     let clip_height = if config.full_page {
+        set_tab_deadline(&tab, deadline, config.timeout)?;
         content_height(&tab)?.max(config.height)
     } else {
         config.height
@@ -1033,6 +1154,7 @@ pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, Re
         scale: 1.0,
     };
 
+    set_tab_deadline(&tab, deadline, config.timeout)?;
     let data = tab
         .call_method(Page::CaptureScreenshot {
             format: Some(Page::CaptureScreenshotFormatOption::Png),
@@ -1051,6 +1173,7 @@ pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, Re
     if png.is_empty() {
         return Err(RenderError::NoContent);
     }
+    remaining(deadline, config.timeout)?;
     let resource_usage = resource_state
         .lock()
         .expect("render resource guard mutex must not be poisoned")

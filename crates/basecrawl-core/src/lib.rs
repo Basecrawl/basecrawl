@@ -30,7 +30,7 @@ use content::ContentKind;
 use fetch::{FetchConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 pub use basecrawl_proof::ScrapeProof;
@@ -132,6 +132,7 @@ impl Default for ScrapeOptions {
 /// URL is refused without a fetch and without emitting a proof.
 pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Error> {
     let url = url_validation::validate_url(raw_url)?;
+    let deadline = Instant::now() + Duration::from_secs(options.timeout_secs);
 
     let formats = if options.formats.is_empty() {
         format::default_set()
@@ -159,11 +160,11 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         crawl_delay: Duration::from_millis(options.crawl_delay_ms),
         ..FetchConfig::default()
     };
-    let robots_decision = robots::consult(&url, &config, options.robots_policy);
+    let robots_decision = robots::consult(&url, &config, options.robots_policy, deadline)?;
     if robots_decision.denies_fetch() {
         return Err(Error::RobotsDenied(robots_decision.to_value()));
     }
-    let fetched = fetch::fetch(&url, &config)?;
+    let fetched = fetch::fetch_until(&url, &config, deadline)?;
 
     // The request-side hashes cover the one validated ordered effective header list. The empty GET
     // body remains explicitly hashed.
@@ -202,7 +203,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     redact_sensitive_request_echoes(&mut body_str, &options.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let sitemap_urls = if formats.contains(&Format::Links) {
-        robots::discover_sitemap_urls(&url, &config, &robots_decision.sitemap_urls)
+        robots::discover_sitemap_urls(&url, &config, &robots_decision.sitemap_urls, deadline)?
     } else {
         Vec::new()
     };
@@ -221,8 +222,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         && content_kind == ContentKind::Html
         && !body_str.trim().is_empty()
     {
-        config.wait_for_origin(&page_base);
-        let mut rendered = html::render_page(
+        config.wait_for_origin_until(&page_base, deadline)?;
+        let mut rendered = html::render_page_until(
             &page_base,
             basecrawl_render::RenderConfig {
                 timeout: Duration::from_secs(options.render_timeout_secs),
@@ -237,6 +238,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 max_redirects: fetch::MAX_REDIRECTS,
                 ..basecrawl_render::RenderConfig::default()
             },
+            deadline,
         )?;
         redact_sensitive_request_echoes(&mut rendered.html, &options.headers);
         render_resource_usage = rendered.resource_usage;
@@ -288,8 +290,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 value
             }
             Format::Screenshot => {
-                config.wait_for_origin(&page_base);
-                let shot = screenshot::capture(
+                config.wait_for_origin_until(&page_base, deadline)?;
+                let shot = screenshot::capture_until(
                     &page_base,
                     basecrawl_render::ScreenshotConfig {
                         timeout: config.timeout,
@@ -303,6 +305,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                         height: options.viewport.1,
                         full_page: options.screenshot_full_page,
                     },
+                    deadline,
                 )?;
                 render_resource_usage.subresource_count = render_resource_usage
                     .subresource_count
@@ -350,11 +353,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             if !visited.insert(key.clone()) {
                 break;
             }
-            let Ok((page_markdown, page_html, page_base_next)) =
-                crawl_page(&next, options, &config)
-            else {
-                break;
-            };
+            let (page_markdown, page_html, page_base_next) =
+                crawl_page(&next, options, &config, deadline)?;
             if let Some(agg) = aggregated_markdown.as_mut() {
                 agg.push_str("\n\n");
                 agg.push_str(&page_markdown);
@@ -367,6 +367,10 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         if let Some(agg) = aggregated_markdown {
             formats_produced.insert(Format::Markdown.as_str().to_string(), Value::String(agg));
         }
+    }
+
+    if Instant::now() >= deadline {
+        return Err(Error::Timeout("scrape deadline exceeded".to_string()));
     }
 
     // `result_hash` covers only the deterministic result surface; `screenshot` (and `json`) are
@@ -426,16 +430,17 @@ fn crawl_page(
     url: &Url,
     options: &ScrapeOptions,
     config: &FetchConfig,
+    deadline: Instant,
 ) -> Result<(String, String, Url), Error> {
-    let fetched = fetch::fetch(url, config)?;
+    let fetched = fetch::fetch_until(url, config, deadline)?;
     let is_html = content::classify(fetched.content_type.as_deref()) == ContentKind::Html;
     let mut body_str =
         charset::decode_body(&fetched.body, fetched.content_type.as_deref(), is_html);
     redact_sensitive_request_echoes(&mut body_str, &options.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
-        config.wait_for_origin(&page_base);
-        let mut rendered = html::render_page(
+        config.wait_for_origin_until(&page_base, deadline)?;
+        let mut rendered = html::render_page_until(
             &page_base,
             basecrawl_render::RenderConfig {
                 timeout: Duration::from_secs(options.render_timeout_secs),
@@ -449,6 +454,7 @@ fn crawl_page(
                 max_redirects: fetch::MAX_REDIRECTS,
                 ..basecrawl_render::RenderConfig::default()
             },
+            deadline,
         )?;
         redact_sensitive_request_echoes(&mut rendered.html, &options.headers);
         rendered.html

@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Instant;
 use url::Url;
 
 /// The robots user-agent token used by the crawler policy evaluator.
@@ -141,10 +142,15 @@ struct ParsedRobots {
 /// Failure to retrieve, parse, or receive a successful robots document is observable as
 /// `unavailable`, but remains permissive. This follows the normal crawler convention that a
 /// transient policy fetch failure is not a deny rule.
-pub fn consult(url: &Url, config: &FetchConfig, policy: RobotsPolicy) -> RobotsDecision {
+pub fn consult(
+    url: &Url,
+    config: &FetchConfig,
+    policy: RobotsPolicy,
+    deadline: Instant,
+) -> Result<RobotsDecision, crate::Error> {
     let robots_url = robots_url(url);
     if policy == RobotsPolicy::Ignore {
-        return RobotsDecision {
+        return Ok(RobotsDecision {
             policy,
             fetched: false,
             status_code: None,
@@ -152,14 +158,21 @@ pub fn consult(url: &Url, config: &FetchConfig, policy: RobotsPolicy) -> RobotsD
             disposition: "ignored",
             matched_rule: None,
             sitemap_urls: Vec::new(),
-        };
+        });
     }
 
-    let Ok(fetched) = fetch::fetch(&robots_url, config) else {
-        return unavailable_decision(policy, robots_url, false, None);
+    let fetched = match fetch::fetch_until(&robots_url, config, deadline) {
+        Ok(fetched) => fetched,
+        Err(crate::Error::Timeout(message)) => return Err(crate::Error::Timeout(message)),
+        Err(_) => return Ok(unavailable_decision(policy, robots_url, false, None)),
     };
     if !(200..300).contains(&fetched.status_code) {
-        return unavailable_decision(policy, robots_url, true, Some(fetched.status_code));
+        return Ok(unavailable_decision(
+            policy,
+            robots_url,
+            true,
+            Some(fetched.status_code),
+        ));
     }
 
     let source = charset::decode_body(&fetched.body, fetched.content_type.as_deref(), false);
@@ -177,7 +190,7 @@ pub fn consult(url: &Url, config: &FetchConfig, policy: RobotsPolicy) -> RobotsD
             |rule| if rule.allow { "allowed" } else { "denied" },
         );
 
-    RobotsDecision {
+    Ok(RobotsDecision {
         policy,
         fetched: true,
         status_code: Some(fetched.status_code),
@@ -188,7 +201,7 @@ pub fn consult(url: &Url, config: &FetchConfig, policy: RobotsPolicy) -> RobotsD
             path: rule.path,
         }),
         sitemap_urls,
-    }
+    })
 }
 
 fn unavailable_decision(
@@ -216,7 +229,8 @@ pub fn discover_sitemap_urls(
     target: &Url,
     config: &FetchConfig,
     robots_sitemaps: &[Url],
-) -> Vec<String> {
+    deadline: Instant,
+) -> Result<Vec<String>, crate::Error> {
     let mut queue = Vec::with_capacity(1 + robots_sitemaps.len());
     queue.push(default_sitemap_url(target));
     queue.extend(robots_sitemaps.iter().cloned());
@@ -233,8 +247,10 @@ pub fn discover_sitemap_urls(
             continue;
         }
 
-        let Ok(fetched) = fetch::fetch(&sitemap_url, config) else {
-            continue;
+        let fetched = match fetch::fetch_until(&sitemap_url, config, deadline) {
+            Ok(fetched) => fetched,
+            Err(crate::Error::Timeout(message)) => return Err(crate::Error::Timeout(message)),
+            Err(_) => continue,
         };
         if !(200..300).contains(&fetched.status_code) {
             continue;
@@ -244,7 +260,7 @@ pub fn discover_sitemap_urls(
 
         for url in parsed.url_seeds {
             if seeds.len() >= MAX_SITEMAP_URLS {
-                return seeds;
+                return Ok(seeds);
             }
             if seen_seeds.insert(url.clone()) {
                 seeds.push(url);
@@ -253,7 +269,7 @@ pub fn discover_sitemap_urls(
         queue.extend(parsed.nested_sitemaps);
     }
 
-    seeds
+    Ok(seeds)
 }
 
 fn robots_url(target: &Url) -> Url {
