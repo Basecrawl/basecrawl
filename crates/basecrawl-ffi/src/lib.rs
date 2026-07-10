@@ -322,4 +322,17 @@ mod tests {
         let error: Value = serde_json::from_str(error.to_json_string()).unwrap();
         assert_eq!(error["error"]["kind"], "invalid_format");
     }
+
+    #[test]
+    fn ffi_rejects_duplicate_case_insensitive_header_names_before_transport() {
+        for options in [
+            r#"{"headers":[["X-Repeat","one"],["X-Repeat","two"]]}"#,
+            r#"{"headers":[["X-Case","one"],["x-case","two"]]}"#,
+        ] {
+            let error = scrape_json("http://127.0.0.1:1/", Some(options))
+                .expect_err("ambiguous binding headers must fail before connecting");
+            let error: Value = serde_json::from_str(error.to_json_string()).unwrap();
+            assert_eq!(error["error"]["kind"], "invalid_header");
+        }
+    }
 }

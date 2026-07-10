@@ -123,8 +123,8 @@ pub struct RenderConfig {
     pub timeout: Duration,
     /// User-Agent presented to the origin (kept in parity with the HTTP fetch path).
     pub user_agent: String,
-    /// Additional request headers, including M1 cleartext cookies and authorization values, sent
-    /// to the rendered document and every browser subresource.
+    /// Validated effective request headers, including the controlled User-Agent, sent in order to
+    /// the rendered document and every browser subresource.
     pub request_headers: Vec<(String, String)>,
     /// Minimum interval between browser requests to one scheme/host/port origin.
     pub crawl_delay: Duration,
@@ -254,6 +254,7 @@ fn configure_resource_guard(
     let crawl_delay = config.crawl_delay;
     let max_subresources = config.max_subresources as u64;
     let max_resource_bytes = config.max_resource_bytes;
+    let request_headers = config.request_headers.clone();
     tab.enable_request_interception(Arc::new(
         move |_transport, _session_id, paused: Fetch::events::RequestPausedEvent| {
             let is_document = paused.params.resource_Type == ResourceType::Document;
@@ -297,7 +298,7 @@ fn configure_resource_guard(
                 guard.last_request_at.insert(origin, Instant::now());
             }
             if is_document {
-                return RequestPausedDecision::Continue(None);
+                return continue_with_effective_headers(paused, &request_headers);
             }
             if guard.usage.subresource_count >= max_subresources {
                 guard.usage.cap_exceeded = true;
@@ -307,10 +308,64 @@ fn configure_resource_guard(
                 });
             }
             guard.usage.subresource_count += 1;
-            RequestPausedDecision::Continue(None)
+            continue_with_effective_headers(paused, &request_headers)
         },
     ))
     .map_err(|error| RenderError::Render(error.to_string()))
+}
+
+/// Resume a paused request with the shared effective caller-header list.
+///
+/// CDP's `Network.setExtraHTTPHeaders` takes an object, so it discards duplicate keys and has no
+/// field-order contract. `Fetch.continueRequest` accepts a header-entry list instead. Browser-owned
+/// fields remain present, while any case-insensitive collision with a controlled effective field is
+/// replaced by that one ordered occurrence.
+fn continue_with_effective_headers(
+    paused: Fetch::events::RequestPausedEvent,
+    effective_headers: &[(String, String)],
+) -> RequestPausedDecision {
+    let mut headers = paused
+        .params
+        .request
+        .headers
+        .0
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| Fetch::HeaderEntry {
+                    name: name.clone(),
+                    value: value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string()),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    headers.retain(|header| {
+        !effective_headers
+            .iter()
+            .any(|(name, _)| header.name.eq_ignore_ascii_case(name))
+    });
+    headers.extend(
+        effective_headers
+            .iter()
+            .map(|(name, value)| Fetch::HeaderEntry {
+                name: name.clone(),
+                value: value.clone(),
+            }),
+    );
+
+    RequestPausedDecision::Continue(Some(Fetch::ContinueRequest {
+        request_id: paused.params.request_id,
+        url: None,
+        method: None,
+        post_data: None,
+        headers: Some(headers),
+        intercept_response: None,
+    }))
 }
 
 fn origin_for_url(raw_url: &str) -> Option<RenderOrigin> {
@@ -538,15 +593,6 @@ pub fn render(url: &Url, config: &RenderConfig) -> Result<Rendered, RenderError>
     tab.set_default_timeout(config.timeout);
     if !config.user_agent.is_empty() {
         tab.set_user_agent(&config.user_agent, None, None)
-            .map_err(|e| RenderError::Render(e.to_string()))?;
-    }
-    if !config.request_headers.is_empty() {
-        let headers: HashMap<&str, &str> = config
-            .request_headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        tab.set_extra_http_headers(headers)
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
     let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
@@ -817,7 +863,8 @@ pub struct ScreenshotConfig {
     pub timeout: Duration,
     /// User-Agent presented to the origin (kept in parity with the HTTP fetch path).
     pub user_agent: String,
-    /// Additional request headers, including M1 cleartext credentials, sent during capture.
+    /// Validated effective request headers, including the controlled User-Agent, sent in order
+    /// during capture.
     pub request_headers: Vec<(String, String)>,
     /// Minimum interval between browser requests to one origin during capture.
     pub crawl_delay: Duration,
@@ -898,17 +945,9 @@ pub fn screenshot(url: &Url, config: &ScreenshotConfig) -> Result<Screenshot, Re
         tab.set_user_agent(&config.user_agent, None, None)
             .map_err(|e| RenderError::Render(e.to_string()))?;
     }
-    if !config.request_headers.is_empty() {
-        let headers: HashMap<&str, &str> = config
-            .request_headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        tab.set_extra_http_headers(headers)
-            .map_err(|e| RenderError::Render(e.to_string()))?;
-    }
     let resource_state = Arc::new(Mutex::new(RenderResourceState::default()));
     let resource_config = RenderConfig {
+        request_headers: config.request_headers.clone(),
         crawl_delay: config.crawl_delay,
         max_subresources: config.max_subresources,
         max_resource_bytes: config.max_resource_bytes,

@@ -11,7 +11,7 @@
 use basecrawl_proof::{CompletenessManifest, FormatCompleteness};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Result formats that contribute to the deterministic quorum surface, in canonical order.
 /// `screenshot` and `json` are intentionally absent (see module docs).
@@ -49,20 +49,14 @@ pub fn result_hash(formats_produced: &BTreeMap<String, Value>) -> String {
 
 /// Hash the canonical request header surface.
 ///
-/// Header names are HTTP case-insensitive, so names are lowercased. Pairs are sorted as a set
-/// before hashing, which makes semantically identical header input deterministic regardless of
-/// caller order. The caller supplies the default User-Agent explicitly because it is a real
-/// outbound request header even when the user did not pass `--header`.
-pub fn headers_hash(headers: &[(String, String)], user_agent: &str) -> String {
-    let mut canonical_headers: BTreeSet<(String, String)> = BTreeSet::new();
-    canonical_headers.insert(("user-agent".to_string(), user_agent.to_string()));
-    for (name, value) in headers {
-        canonical_headers.insert((name.to_ascii_lowercase(), value.clone()));
-    }
-
+/// Header names are HTTP case-insensitive, so names are lowercased for the digest. Occurrences and
+/// the caller-defined effective-field sequence are retained exactly: the effective list has
+/// already been validated by [`crate::fetch::effective_headers`] and is emitted in this same order
+/// by the direct transports and Chromium interception path.
+pub fn headers_hash(headers: &[(String, String)]) -> String {
     let mut hasher = Sha256::new();
-    for (name, value) in canonical_headers {
-        hasher.update(name.as_bytes());
+    for (name, value) in headers {
+        hasher.update(name.to_ascii_lowercase().as_bytes());
         hasher.update([0u8]);
         hasher.update(value.as_bytes());
         hasher.update([0u8]);
@@ -245,13 +239,11 @@ mod tests {
 
     #[test]
     fn request_digest_binds_every_input() {
-        let headers = headers_hash(
-            &[
-                ("X-Z".to_string(), "z".to_string()),
-                ("X-A".to_string(), "a".to_string()),
-            ],
-            "basecrawl/1",
-        );
+        let headers = headers_hash(&[
+            ("User-Agent".to_string(), "basecrawl/1".to_string()),
+            ("X-Z".to_string(), "z".to_string()),
+            ("X-A".to_string(), "a".to_string()),
+        ]);
         let body = body_hash(b"body");
         let baseline = request_hash("GET", "https://example.com/", &headers, &body);
         assert_eq!(
@@ -277,23 +269,31 @@ mod tests {
     }
 
     #[test]
-    fn header_digest_is_case_and_order_independent() {
-        let first = headers_hash(
-            &[
-                ("X-Alpha".to_string(), "a".to_string()),
-                ("x-beta".to_string(), "b".to_string()),
-            ],
-            "basecrawl/1",
-        );
-        let second = headers_hash(
-            &[
-                ("X-BETA".to_string(), "b".to_string()),
-                ("x-alpha".to_string(), "a".to_string()),
-            ],
-            "basecrawl/1",
-        );
-        assert_eq!(first, second);
-        assert_ne!(first, headers_hash(&[], "basecrawl/1"));
+    fn header_digest_normalizes_name_case_but_binds_sequence_and_multiplicity() {
+        let first = headers_hash(&[
+            ("User-Agent".to_string(), "basecrawl/1".to_string()),
+            ("X-Alpha".to_string(), "a".to_string()),
+            ("x-beta".to_string(), "b".to_string()),
+        ]);
+        let case_variant = headers_hash(&[
+            ("user-agent".to_string(), "basecrawl/1".to_string()),
+            ("x-alpha".to_string(), "a".to_string()),
+            ("X-BETA".to_string(), "b".to_string()),
+        ]);
+        let reordered = headers_hash(&[
+            ("User-Agent".to_string(), "basecrawl/1".to_string()),
+            ("x-beta".to_string(), "b".to_string()),
+            ("X-Alpha".to_string(), "a".to_string()),
+        ]);
+        let repeated = headers_hash(&[
+            ("User-Agent".to_string(), "basecrawl/1".to_string()),
+            ("X-Alpha".to_string(), "a".to_string()),
+            ("X-Alpha".to_string(), "a".to_string()),
+            ("x-beta".to_string(), "b".to_string()),
+        ]);
+        assert_eq!(first, case_variant);
+        assert_ne!(first, reordered);
+        assert_ne!(first, repeated);
     }
 
     #[test]

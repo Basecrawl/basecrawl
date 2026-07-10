@@ -146,9 +146,12 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         return Err(Error::StructuredExtractionUnsupported);
     }
 
+    // Build this once before robots/DNS/rendering. It is the single validated ordered effective
+    // header list shared by request hashing, direct HTTP/HTTPS, and Chromium.
+    let effective_headers = fetch::effective_headers(&options.headers, DEFAULT_USER_AGENT)?;
     let config = FetchConfig {
         timeout: Duration::from_secs(options.timeout_secs),
-        headers: options.headers.clone(),
+        headers: effective_headers,
         user_agent: DEFAULT_USER_AGENT.to_string(),
         insecure: options.insecure,
         max_body_bytes: options.max_body_bytes,
@@ -161,10 +164,9 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     }
     let fetched = fetch::fetch(&url, &config)?;
 
-    // The request-side hashes cover exactly the emitted HTTP request inputs. The empty GET body
-    // remains explicitly hashed, and the browser-like default User-Agent is included in the
-    // canonical header surface because it is sent on every request.
-    let headers_hash = canonical::headers_hash(&config.headers, &config.user_agent);
+    // The request-side hashes cover the one validated ordered effective header list. The empty GET
+    // body remains explicitly hashed.
+    let headers_hash = canonical::headers_hash(&config.headers);
     let body_hash = canonical::body_hash(&[]);
     let request_hash =
         canonical::request_hash(DEFAULT_METHOD, url.as_str(), &headers_hash, &body_hash);
@@ -196,7 +198,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             content_kind == ContentKind::Html,
         )
     };
-    redact_sensitive_request_echoes(&mut body_str, &config.headers);
+    redact_sensitive_request_echoes(&mut body_str, &options.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let sitemap_urls = if formats.contains(&Format::Links) {
         robots::discover_sitemap_urls(&url, &config, &robots_decision.sitemap_urls)
@@ -234,7 +236,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 ..basecrawl_render::RenderConfig::default()
             },
         )?;
-        redact_sensitive_request_echoes(&mut rendered.html, &config.headers);
+        redact_sensitive_request_echoes(&mut rendered.html, &options.headers);
         render_resource_usage = rendered.resource_usage;
         Some(rendered.html)
     } else {
@@ -426,7 +428,7 @@ fn crawl_page(
     let is_html = content::classify(fetched.content_type.as_deref()) == ContentKind::Html;
     let mut body_str =
         charset::decode_body(&fetched.body, fetched.content_type.as_deref(), is_html);
-    redact_sensitive_request_echoes(&mut body_str, &config.headers);
+    redact_sensitive_request_echoes(&mut body_str, &options.headers);
     let page_base = Url::parse(&fetched.final_url).unwrap_or_else(|_| url.clone());
     let source = if options.render_enabled && is_html && !body_str.trim().is_empty() {
         config.wait_for_origin(url);
@@ -444,7 +446,7 @@ fn crawl_page(
                 ..basecrawl_render::RenderConfig::default()
             },
         )?;
-        redact_sensitive_request_echoes(&mut rendered.html, &config.headers);
+        redact_sensitive_request_echoes(&mut rendered.html, &options.headers);
         rendered.html
     } else {
         body_str

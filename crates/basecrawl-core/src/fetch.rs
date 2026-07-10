@@ -15,9 +15,9 @@ use rustls::client::{ClientConnection, Resumption, WebPkiServerVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -56,7 +56,9 @@ type Headers = Vec<(String, Vec<u8>)>;
 pub struct FetchConfig {
     /// Whole-request timeout. A slow endpoint aborts near this bound rather than blocking.
     pub timeout: Duration,
-    /// Extra request headers to send, as already-parsed `(name, value)` pairs.
+    /// Validated effective request headers, including the controlled default User-Agent.
+    ///
+    /// The exact vector order is the defined wire order for caller-controlled field lines.
     pub headers: Vec<(String, String)>,
     /// User-Agent presented to the origin.
     pub user_agent: String,
@@ -76,7 +78,7 @@ impl Default for FetchConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            headers: Vec::new(),
+            headers: vec![("user-agent".to_string(), DEFAULT_USER_AGENT.to_string())],
             user_agent: DEFAULT_USER_AGENT.to_string(),
             insecure: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -163,7 +165,7 @@ pub struct Fetched {
     pub fetched_at: OffsetDateTime,
 }
 
-/// Parse a single `Name: Value` header specification.
+/// Parse and validate a single `Name: Value` header specification.
 ///
 /// The name is the text before the first colon; the value is everything after it (trimmed of one
 /// leading space, HTTP-style). An empty name or a missing colon is an [`Error::InvalidHeader`].
@@ -176,7 +178,75 @@ pub fn parse_header(spec: &str) -> Result<(String, String), Error> {
         return Err(Error::InvalidHeader("<redacted>".to_string()));
     }
     let value = value.strip_prefix(' ').unwrap_or(value).trim_end();
+    validate_header_pair(name, value)?;
     Ok((name.to_string(), value.to_string()))
+}
+
+/// Build the one validated header representation used for hashing and every transport.
+///
+/// Header names are case-insensitive in HTTP, so accepting two spellings of one name would make
+/// duplicate-field ordering transport-sensitive. Basecrawl therefore rejects those ambiguous
+/// inputs before robots, DNS, or any socket work. Effective names are lowercased before emission,
+/// so case-only input changes do not produce different field bytes. The controlled User-Agent is
+/// always first in the effective list and cannot be caller-overridden, which prevents HTTP and
+/// HTTPS from emitting different User-Agent multiplicities.
+pub fn effective_headers(
+    headers: &[(String, String)],
+    user_agent: &str,
+) -> Result<Vec<(String, String)>, Error> {
+    validate_header_pair("User-Agent", user_agent)?;
+
+    let mut seen = HashSet::new();
+    let mut effective = Vec::with_capacity(headers.len() + 1);
+    effective.push(("user-agent".to_string(), user_agent.to_string()));
+    seen.insert("user-agent".to_string());
+
+    for (name, value) in headers {
+        validate_header_pair(name, value)?;
+        let normalized = name.to_ascii_lowercase();
+        if is_transport_managed_header(&normalized) {
+            return Err(Error::InvalidHeader(name.to_string()));
+        }
+        if !seen.insert(normalized.clone()) {
+            return Err(Error::InvalidHeader(name.to_string()));
+        }
+        effective.push((normalized, value.clone()));
+    }
+    Ok(effective)
+}
+
+/// Direct HTTP/HTTPS write these field lines themselves, and Chromium owns the matching protocol
+/// fields. Allowing callers to add another occurrence would make their wire semantics diverge.
+fn is_transport_managed_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "user-agent"
+            | "connection"
+            | "accept-encoding"
+            | "content-length"
+            | "transfer-encoding"
+            | "trailer"
+            | "te"
+            | "upgrade"
+    )
+}
+
+/// Reject field names that cannot be emitted as an HTTP/1.1 field line and values that would
+/// smuggle a second line. This validation is shared by the CLI and every FFI caller.
+fn validate_header_pair(name: &str, value: &str) -> Result<(), Error> {
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+    let valid_value = value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f));
+    if valid_name && valid_value {
+        Ok(())
+    } else {
+        Err(Error::InvalidHeader(name.to_string()))
+    }
 }
 
 /// Perform a blocking HTTP GET against a validated URL, following redirects to the final resource.
@@ -267,48 +337,47 @@ struct SingleResponse {
     egress_ip: Option<IpAddr>,
 }
 
-/// Preserve the existing reqwest path for plaintext HTTP. HTTPS is intentionally handled by
-/// [`fetch_https`] so TLS evidence comes from the same in-process connection that carried the HTTP
-/// request and response.
+/// Perform plaintext HTTP with the same raw HTTP/1.1 request serializer used by HTTPS.
+///
+/// `reqwest::HeaderMap` coalesces duplicate names and does not promise field-line ordering. The
+/// effective representation was validated before this point, so serializing it directly keeps the
+/// request hash, HTTP bytes, and HTTPS bytes aligned.
 fn fetch_http(url: &Url, config: &FetchConfig) -> Result<SingleResponse, Error> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    for (name, value) in &config.headers {
-        let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| Error::InvalidHeader(name.to_string()))?;
-        let header_value = reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| Error::InvalidHeader(name.to_string()))?;
-        headers.insert(header_name, header_value);
-    }
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(&config.user_agent)
-        .timeout(config.timeout)
-        .default_headers(headers)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| Error::Fetch(error_chain(&e)))?;
-    let response = client.get(url.clone()).send().map_err(classify)?;
-    let status_code = response.status().as_u16();
-    let headers_hash = hash_headers(response.headers());
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let location = response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let (body, body_truncated) = read_capped(response, config.max_body_bytes)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::InvalidUrl(url.to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let address = resolve_address(host, port)?;
+    let mut stream = TcpStream::connect_timeout(&address, config.timeout).map_err(classify_io)?;
+    let egress_ip = stream.local_addr().map_err(classify_io)?.ip();
+    stream
+        .set_read_timeout(Some(config.timeout))
+        .map_err(classify_io)?;
+    stream
+        .set_write_timeout(Some(config.timeout))
+        .map_err(classify_io)?;
+
+    let request = build_http_request(url, host, port, config)?;
+    stream.write_all(&request).map_err(classify_io)?;
+    stream.flush().map_err(classify_io)?;
+    let raw_limit = config
+        .max_body_bytes
+        .saturating_add(MAX_HTTP_RESPONSE_HEADER_BYTES);
+    let (raw_response, raw_truncated) = read_capped(&mut stream, raw_limit)?;
+    let (status_code, headers, body) = parse_http_response(&raw_response)?;
+    let content_type = header_value(&headers, "content-type");
+    let location = header_value(&headers, "location");
+    let (body, decoded_truncated) = decode_http_body(&headers, body, config.max_body_bytes)?;
+
     Ok(SingleResponse {
         status_code,
-        headers_hash,
+        headers_hash: hash_header_lines(&headers),
         content_type,
         location,
         body,
-        body_truncated,
+        body_truncated: raw_truncated || decoded_truncated,
         tls: None,
-        egress_ip: source_ip_for(url),
+        egress_ip: Some(egress_ip),
     })
 }
 
@@ -382,25 +451,6 @@ fn resolve_address(host: &str, port: u16) -> Result<std::net::SocketAddr, Error>
         .ok_or_else(|| Error::Transport(format!("DNS resolution returned no addresses for {host}")))
 }
 
-/// Infer the source address an HTTP client uses for `url`.
-///
-/// Reqwest's blocking response API does not expose its local socket address. A connected UDP socket
-/// asks the operating system for the same route selection without sending a packet. If route
-/// introspection is unavailable, the caller emits a syntactically valid unspecified address rather
-/// than leaking or inventing a textual value.
-fn source_ip_for(url: &Url) -> Option<IpAddr> {
-    let host = url.host_str()?;
-    let port = url.port_or_known_default()?;
-    let destination = (host, port).to_socket_addrs().ok()?.next()?;
-    let bind = match destination {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => "[::]:0",
-    };
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(destination).ok()?;
-    socket.local_addr().ok().map(|address| address.ip())
-}
-
 /// Build a rustls configuration with Mozilla roots. TLS 1.3 is preferred and fully captured, while
 /// TLS 1.2 remains enabled only so invalid-certificate test origins can reach the certificate
 /// verifier and be rejected with the correct security error instead of a version-negotiation error.
@@ -451,19 +501,16 @@ fn build_http_request(
         Some(query) => format!("{path}?{query}"),
         None => path.to_string(),
     };
-    let host_header = if port == 443 {
+    let host_header = if url.port().is_none() {
         host.to_string()
     } else {
         format!("{host}:{port}")
     };
     let mut request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {}\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n",
-        config.user_agent
+        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n"
     );
     for (name, value) in &config.headers {
-        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
-            return Err(Error::InvalidHeader(name.to_string()));
-        }
+        validate_header_pair(name, value)?;
         request.push_str(name);
         request.push_str(": ");
         request.push_str(value);
@@ -1055,48 +1102,6 @@ fn classify_io(error: io::Error) -> Error {
     } else {
         Error::Transport(message)
     }
-}
-
-/// Classify a `reqwest` transport failure into a structured [`Error`]. Timeouts are reported
-/// distinctly; every other send/read failure (DNS, connect, reset) is a transport error, never an
-/// HTTP status.
-fn classify(err: reqwest::Error) -> Error {
-    if err.is_timeout() {
-        Error::Timeout(error_chain(&err))
-    } else {
-        Error::Transport(error_chain(&err))
-    }
-}
-
-/// Flatten an error and its source chain into a single message so the root cause (e.g. the DNS
-/// lookup failure behind a connect error) is preserved for the caller.
-fn error_chain(err: &dyn std::error::Error) -> String {
-    let mut msg = err.to_string();
-    let mut source = err.source();
-    while let Some(inner) = source {
-        let text = inner.to_string();
-        if !msg.contains(&text) {
-            msg.push_str(": ");
-            msg.push_str(&text);
-        }
-        source = inner.source();
-    }
-    msg
-}
-
-fn hash_headers(headers: &reqwest::header::HeaderMap) -> String {
-    let mut lines: Vec<String> = headers
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "{}: {}",
-                name.as_str(),
-                String::from_utf8_lossy(value.as_bytes())
-            )
-        })
-        .collect();
-    lines.sort();
-    sha256_hex(lines.join("\n").as_bytes())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
