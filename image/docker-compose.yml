@@ -1,0 +1,13 @@
+services:
+  basecrawl:
+    image: "docker.io/mathiiss/basecrawl-cvm@sha256:c19d252fec7bb3e3e71c9281da1101312d5f2f09ec15d404a7ff373b3a6dbdd8"
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+    command:
+      - "/usr/local/bin/basecrawl --help >/dev/null && exec sleep infinity"
+    restart: "unless-stopped"
+    volumes:
+      - type: "bind"
+        source: "/var/run/dstack.sock"
+        target: "/var/run/dstack.sock"

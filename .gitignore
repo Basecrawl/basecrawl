@@ -7,6 +7,7 @@
 /bindings/python/.venv/
 /bindings/python/**/__pycache__/
 /bindings/python/python/basecrawl/_basecrawl*.so
+/image/**/__pycache__/
 
 # Secrets (never commit)
 .env
