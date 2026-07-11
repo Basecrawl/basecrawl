@@ -1,0 +1,86 @@
+{
+  "captured_at": "2026-07-11T22:51:00Z",
+  "cleanup": {
+    "delete_command": "phala cvms delete cvm_dw1Ax7wM --yes",
+    "delete_response_path": "/tmp/basecrawl-quote-delete.json",
+    "mission_cvm_absent": true,
+    "note": "Mission-created CVM absent after deletion; the retained post-delete inventory contains only the protected user-owned OpenClaw CVM.",
+    "post_delete_inventory_path": "/tmp/basecrawl-quote-cvms-after.json",
+    "post_delete_total": 1,
+    "user_owned_cvm_preserved": true
+  },
+  "cleanup_required": true,
+  "compose_commit": "adbe4003be63c1d0bd6111fc2e4d322b0cf28384",
+  "compose_event": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
+  "compose_file_sha256": "4778611a0654dab542e1a2149d3b16275e81c0293dba652ad1424a54b0338740",
+  "dcap_qvl": {
+    "advisory_ids": [],
+    "decode_path": "/tmp/basecrawl-quote-20260711-decode.json",
+    "mr_td": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+    "pck_chain_roles": [
+      "Leaf PCK",
+      "PCK CA",
+      "Root CA"
+    ],
+    "pck_fmspc": "20a06f000000",
+    "pckinfo_path": "/tmp/basecrawl-quote-20260711-pckinfo.json",
+    "platform_status": "UpToDate",
+    "qe_status": "UpToDate",
+    "quote_version": 4,
+    "report_data": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "rt_mr0": "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+    "rt_mr1": "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+    "rt_mr2": "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858",
+    "rt_mr3": "b84947add72a9ec85d3c069fba3a08d3a694d9a4a52b5d0ad1e3d73fb18d4c4eeffd1587d0a6b9da0fccd2144ba1d7ce",
+    "status": "UpToDate",
+    "td_attributes": "0000001000000000",
+    "tee_type": 129,
+    "verify_path": "/tmp/basecrawl-quote-20260711-verify.json"
+  },
+  "evidence_sha256": {
+    "basecrawl-quote-20260711-decode.json": "4ba160c8de526388a366cb894da8175ea7a513cfacdb6f7c3d2dd89cec6e9b22",
+    "basecrawl-quote-20260711-event-log.json": "8bdc3226331cce28e287688342f888e3fda73183b65a3f64eb3f94c82824652d",
+    "basecrawl-quote-20260711-pckinfo.json": "6fab1f1e281eafa4e5a1bd283dd25a92f16f2b58a5d80053f28d487db8c519cc",
+    "basecrawl-quote-20260711-response.json": "284e37d32157c76066729470576c4f096bb75f689cd878c6e0005e7d095c4fe2",
+    "basecrawl-quote-20260711-verify.json": "3237ff854f05a7ce95b8340c3c956ade209966a60ecabdb45f11454c0af28498",
+    "basecrawl-quote-20260711-vm-config.json": "d2707d15349b474d386f9405f6a1498926720cb15c404d555dd7ec2814749e91",
+    "basecrawl-quote-20260711.hex": "6ce77c84e9dcc8262edbab02877a9c4ca08bf7fffed58ed9c9f97c447cd50474"
+  },
+  "feature": "in-cvm-quote-generation",
+  "get_quote": {
+    "event_count": 30,
+    "event_log_path": "/tmp/basecrawl-quote-20260711-event-log.json",
+    "min_quote_hex_length": 1264,
+    "quote_hex_length": 10020,
+    "quote_path": "/tmp/basecrawl-quote-20260711.hex",
+    "response_path": "/tmp/basecrawl-quote-20260711-response.json",
+    "returned_report_data": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "submitted_report_data": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "vm_config_path": "/tmp/basecrawl-quote-20260711-vm-config.json"
+  },
+  "image_digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+  "live": {
+    "app_id": "bd003bdb2818d54e93ef23e5490f3292b54685b7",
+    "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
+    "cvm_id": "cvm_dw1Ax7wM",
+    "name": "basecrawl-quote-20260711-2238",
+    "node": "prod9",
+    "os_image": {
+      "is_dev": false,
+      "name": "dstack-0.5.9",
+      "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+      "version": "0.5.9"
+    },
+    "status": "running",
+    "teepod_id": 18,
+    "vm_uuid": "fa022b0c-0d8c-4066-9c02-e008010f3490"
+  },
+  "os_image_event": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+  "published_registry": {
+    "config_digest": "sha256:2083d4eb9c5467458f1b49a56b0fa6e5dd5acb6e39a668a68ec3f4bb29470bfe",
+    "manifest_digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+    "reproducible_build_digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+  },
+  "repository": "docker.io/mathiiss/basecrawl-cvm",
+  "source_commit": "c4e91c5c678e056da88913acfc8638fb395159d2"
+}
