@@ -257,19 +257,24 @@ impl Error {
                 // scrub anything URL-shaped defensively.
                 std::borrow::Cow::Owned(strip_url_shaped(detail))
             }
-            Error::Transport(detail)
-            | Error::Fetch(detail)
-            | Error::Render(detail)
-            | Error::Timeout(detail)
-            | Error::CertificateValidation(detail)
-            | Error::TlsCapture(detail)
-            | Error::DocumentExtraction(detail)
-            | Error::EgressMetadata(detail)
-            | Error::Attestation(detail)
-            | Error::EnclaveSignature(detail)
-            | Error::Io(detail)
-            | Error::InvalidActions(detail)
-            | Error::InvalidViewport(detail) => std::borrow::Cow::Owned(strip_url_shaped(detail)),
+            // Preserve thiserror Display prefixes (e.g. "request timed out:", "html render
+            // failed:") so host-visible messages stay stable under redaction. Strip any
+            // residual URL-shaped text from the full Display string, not only the bare detail.
+            Error::Transport(_)
+            | Error::Fetch(_)
+            | Error::Render(_)
+            | Error::Timeout(_)
+            | Error::CertificateValidation(_)
+            | Error::TlsCapture(_)
+            | Error::DocumentExtraction(_)
+            | Error::EgressMetadata(_)
+            | Error::Attestation(_)
+            | Error::EnclaveSignature(_)
+            | Error::Io(_)
+            | Error::InvalidActions(_)
+            | Error::InvalidViewport(_) => {
+                std::borrow::Cow::Owned(strip_url_shaped(&self.to_string()))
+            }
             other => std::borrow::Cow::Owned(other.to_string()),
         }
     }
