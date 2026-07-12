@@ -79,11 +79,13 @@ class MeasurementAllowlistTests(unittest.TestCase):
         )
 
     def test_reconciliation_record_is_complete_and_reconciled(self) -> None:
+        allowlist_before = ALLOWLIST_PATH.read_bytes()
         result = measurements.validate_reconciliation(
             RECONCILIATION_PATH,
             allowlist_path=ALLOWLIST_PATH,
             app_compose_path=APP_COMPOSE_PATH,
         )
+        self.assertEqual(ALLOWLIST_PATH.read_bytes(), allowlist_before)
         self.assertEqual(result["status"], "reconciled")
         self.assertEqual(
             result["canonical_measurement"]["compose_hash"],
@@ -95,6 +97,172 @@ class MeasurementAllowlistTests(unittest.TestCase):
             result["image"]["build_digest"],
             "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
         )
+        self.assertIn("execution_record_path", result["evidence_bundle"])
+
+    def test_deployment_summaries_are_exactly_two_and_cross_checked(self) -> None:
+        mutations = (
+            lambda record: record["reconciliation_deployments"]["first"].update(
+                automatic_placement=False
+            ),
+            lambda record: record["reconciliation_deployments"]["first"].update(
+                requested_region="us-west"
+            ),
+            lambda record: record["reconciliation_deployments"]["first"].update(
+                requested_node_id=18
+            ),
+            lambda record: record["reconciliation_deployments"]["first"].update(
+                instance_type="tdx.medium"
+            ),
+            lambda record: record["reconciliation_deployments"]["first"].update(
+                image="dstack-dev-0.5.9-de9c74f0"
+            ),
+            lambda record: record["reconciliation_deployments"].update(
+                third=copy.deepcopy(record["reconciliation_deployments"]["first"])
+            ),
+        )
+        allowlist_before = ALLOWLIST_PATH.read_bytes()
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+                    record = json.loads(RECONCILIATION_PATH.read_text())
+                    mutate(record)
+                    path = root / "measurement-reconciliation.json"
+                    path.write_text(json.dumps(record))
+                    with self.assertRaises(measurements.MeasurementAllowlistError):
+                        measurements.validate_reconciliation(
+                            path,
+                            allowlist_path=ALLOWLIST_PATH,
+                            app_compose_path=APP_COMPOSE_PATH,
+                        )
+                    self.assertEqual(ALLOWLIST_PATH.read_bytes(), allowlist_before)
+
+    def test_deployment_identity_must_match_live_evidence_and_info(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            deployment_path = root / record["live_evidence"][0]["deployment_path"]
+            deployment = json.loads(deployment_path.read_text())
+            deployment["cvm_id"] = "cvm_wrong"
+            deployment_path.write_text(json.dumps(deployment))
+            measurements.write_evidence_manifest(
+                root / record["evidence_bundle"]["manifest_path"]
+            )
+            path = root / "measurement-reconciliation.json"
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "deployment",
+            ):
+                measurements.validate_reconciliation(
+                    path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_duplicate_deployment_identity_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            record["live_evidence"][1]["app_id"] = record["live_evidence"][0]["app_id"]
+            path = root / "measurement-reconciliation.json"
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "independent",
+            ):
+                measurements.validate_reconciliation(
+                    path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_current_compose_artifacts_are_bound_byte_for_byte(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            retained = root / record["image"]["compose_file"]
+            retained.write_bytes(retained.read_bytes() + b"\n")
+            measurements.write_evidence_manifest(
+                root / record["evidence_bundle"]["manifest_path"]
+            )
+            path = root / "measurement-reconciliation.json"
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "Compose",
+            ):
+                measurements.validate_reconciliation(
+                    path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_cleanup_is_scoped_to_exact_deployments_and_protected_cvm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            inventory_path = root / record["cleanup"]["inventory_path"]
+            inventory = json.loads(inventory_path.read_text())
+            inventory["deleted_mission_cvms"].append("cvm_MeD2Y9wQ")
+            inventory_path.write_text(json.dumps(inventory))
+            measurements.write_evidence_manifest(
+                root / record["evidence_bundle"]["manifest_path"]
+            )
+            path = root / "measurement-reconciliation.json"
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "cleanup",
+            ):
+                measurements.validate_reconciliation(
+                    path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_execution_record_covers_full_redacted_lifecycle(self) -> None:
+        record = measurements.validate_reconciliation(
+            RECONCILIATION_PATH,
+            allowlist_path=ALLOWLIST_PATH,
+            app_compose_path=APP_COMPOSE_PATH,
+        )
+        execution_path = IMAGE_DIR / record["evidence_bundle"]["execution_record_path"]
+        execution = json.loads(execution_path.read_text())
+        self.assertEqual(
+            [event["stage"] for event in execution["events"]],
+            [
+                "deployment",
+                "evidence_capture",
+                "validation",
+                "deletion",
+                "deployment",
+                "evidence_capture",
+                "validation",
+                "deletion",
+                "final_inventory",
+            ],
+        )
+        self.assertNotIn("secret", execution_path.read_text().lower())
+
+    def test_duplicate_json_keys_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "measurement-reconciliation.json"
+            path.write_text('{"status":"reconciled","status":"reconciled"}')
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "duplicate JSON key",
+            ):
+                measurements.validate_reconciliation(
+                    path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
 
     def test_bundle_is_repository_local_and_hash_manifested(self) -> None:
         record = json.loads(RECONCILIATION_PATH.read_text())

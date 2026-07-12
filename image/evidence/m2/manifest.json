@@ -23,6 +23,7 @@
     "deployments/second/event-log.json": "fb5487c8dc213f55d044553728a442754063ea916c45a8b55d7492aaecb56ada",
     "deployments/second/info.json": "bc196e4621a4e3cd5dc3769db444d432150c1a780bdf691bf5226978879c69f7",
     "deployments/second/quote.hex": "37cb987e99a8296ffb73073ec302b36b24e195b6bd35192392a7096a5113477e",
+    "execution/reconciliation.json": "74698fb254eddcfe86ae76904eb96e99533d7033d6af56d26f38e99fdb25cad1",
     "measurement/dstack-mr-invocation.json": "92121d3b528c19fcf08661a0f0949be802590274a2313a82fc35e054f3bbaf2a",
     "measurement/dstack-mr-output.json": "bad10fca4371bc867cca359aeb7e74cccae282fbeec13240f19ee90a96027c24"
   },

@@ -39,7 +39,13 @@ CATALOG_SLUG = "dstack-0.5.9-bd369a8c"
 CATALOG_OS_IMAGE_HASH = (
     "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033"
 )
+APPLICATION_IMAGE_REF = (
+    "docker.io/mathiiss/basecrawl-cvm@sha256:"
+    "57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+)
 MEASUREMENT_QEMU_VERSION = "8.0.0"
+PROTECTED_CVM_ID = "cvm_MeD2Y9wQ"
+PROTECTED_CVM_NAME = "dstack-app-nlv7j"
 
 DSTACK_RUNTIME_EVENT_TYPE = 0x08000001
 RTMR3_INDEX = 3
@@ -62,6 +68,38 @@ EXPECTED_RUNTIME_EVENTS = (
     "system-ready",
 )
 EVIDENCE_MANIFEST_VERSION = 1
+DEPLOYMENT_FIELDS = frozenset(
+    {
+        "app_id",
+        "automatic_placement",
+        "compose_hash",
+        "cvm_id",
+        "cvm_name",
+        "image_ref",
+        "instance_type",
+        "os_image",
+        "requested_node_id",
+        "requested_region",
+        "vm_uuid",
+        "created",
+        "deleted",
+    }
+)
+DEPLOYMENT_SUMMARY_FIELDS = frozenset(
+    {
+        "app_id",
+        "automatic_placement",
+        "compose_hash",
+        "cvm_id",
+        "cvm_name",
+        "image",
+        "image_ref",
+        "instance_type",
+        "requested_node_id",
+        "requested_region",
+        "vm_uuid",
+    }
+)
 
 
 class MeasurementAllowlistError(ValueError):
@@ -112,10 +150,22 @@ def phala_app_compose_hash(compose: Mapping[str, Any] | str | Path) -> str:
     return hashlib.sha256(normalize_app_compose(compose).encode("utf-8")).hexdigest()
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise MeasurementAllowlistError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _load_json(path: Path, label: str) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (OSError, json.JSONDecodeError, MeasurementAllowlistError) as exc:
         raise MeasurementAllowlistError(f"cannot load {label} {path}: {exc}") from exc
 
 
@@ -354,6 +404,12 @@ def validate_reconciliation(
         "evidence_bundle.manifest_path",
     )
     verify_evidence_manifest(manifest_path)
+    execution_path = _repository_relative_path(
+        record_root,
+        bundle.get("execution_record_path"),
+        "evidence_bundle.execution_record_path",
+    )
+    execution_record = _load_json(execution_path, "execution record")
     canonical = _validate_entry(
         record.get("canonical_measurement", {}),
         label="canonical_measurement",
@@ -369,14 +425,31 @@ def validate_reconciliation(
     image = record.get("image")
     if (
         not isinstance(image, Mapping)
-        or image.get("image_ref")
-        != "docker.io/mathiiss/basecrawl-cvm@sha256:"
-        "57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+        or image.get("image_ref") != APPLICATION_IMAGE_REF
         or image.get("build_digest")
         != "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
         or image.get("all_service_images_digest_pinned") is not True
     ):
         raise MeasurementAllowlistError("application image identity is not pinned")
+    retained_compose = _repository_relative_path(
+        record_root,
+        image.get("compose_file"),
+        "image.compose_file",
+    )
+    retained_app_compose = _repository_relative_path(
+        record_root,
+        image.get("phala_app_compose"),
+        "image.phala_app_compose",
+    )
+    current_compose = Path(__file__).resolve().with_name("docker-compose.yml")
+    if (
+        not current_compose.is_file()
+        or retained_compose.read_bytes() != current_compose.read_bytes()
+        or retained_app_compose.read_bytes() != app_compose.read_bytes()
+    ):
+        raise MeasurementAllowlistError(
+            "retained Compose artifacts do not match current source"
+        )
 
     catalog = record.get("catalog")
     if (
@@ -504,14 +577,28 @@ def validate_reconciliation(
         raise MeasurementAllowlistError(
             "live evidence deployments are not independent"
         )
+    deployment_summaries = _validate_deployment_summaries(
+        record.get("reconciliation_deployments"),
+        live_evidence=live_evidence,
+        canonical=canonical,
+    )
+    deployment_records: list[dict[str, Any]] = []
     for index, evidence in enumerate(live_evidence):
-        _validate_live_evidence(
-            evidence,
-            index=index,
-            canonical=canonical,
-            allowlisted_compose_hash=canonical["compose_hash"],
-            root=record_root,
+        deployment_records.append(
+            _validate_live_evidence(
+                evidence,
+                index=index,
+                canonical=canonical,
+                allowlisted_compose_hash=canonical["compose_hash"],
+                root=record_root,
+                deployment_summary=deployment_summaries[index],
+            )
         )
+    for field in ("app_id", "cvm_name", "cvm_id", "vm_uuid"):
+        if len({deployment[field] for deployment in deployment_records}) != 2:
+            raise MeasurementAllowlistError(
+                f"deployment {field} values are not independent"
+            )
     replay_record = record.get("live_event_replay")
     if not isinstance(replay_record, Mapping) or not isinstance(
         replay_record.get("evidence"), list
@@ -553,17 +640,41 @@ def validate_reconciliation(
         ),
         "cleanup inventory",
     )
+    if not isinstance(cleanup, Mapping):
+        raise MeasurementAllowlistError("cleanup inventory does not prove ownership cleanup")
+    expected_deleted = {deployment["cvm_name"] for deployment in deployment_records}
+    protected = (
+        cleanup_inventory.get("protected_user_cvm")
+        if isinstance(cleanup_inventory, Mapping)
+        else None
+    )
+    deleted = (
+        cleanup_inventory.get("deleted_mission_cvms")
+        if isinstance(cleanup_inventory, Mapping)
+        else None
+    )
     if (
-        not isinstance(cleanup, Mapping)
-        or cleanup.get("mission_owned_cvm_total_after_cleanup") != 0
+        cleanup.get("mission_owned_cvm_total_after_cleanup") != 0
+        or cleanup.get("account_cvm_total_after_cleanup") != 1
         or cleanup.get("protected_user_cvm_preserved") is not True
         or cleanup.get("temporary_cvms_deleted") is not True
         or cleanup_inventory.get("mission_owned_cvm_total") != 0
-        or cleanup_inventory.get("protected_user_cvm", {}).get("cvm_id")
-        != "cvm_MeD2Y9wQ"
-        or cleanup_inventory.get("protected_user_cvm", {}).get("preserved") is not True
+        or cleanup_inventory.get("account_cvm_total") != 1
+        or not isinstance(deleted, list)
+        or len(deleted) != 2
+        or set(deleted) != expected_deleted
+        or PROTECTED_CVM_ID in deleted
+        or not isinstance(protected, Mapping)
+        or protected.get("cvm_id") != PROTECTED_CVM_ID
+        or protected.get("cvm_name") != PROTECTED_CVM_NAME
+        or protected.get("status") != "running"
+        or protected.get("preserved") is not True
     ):
         raise MeasurementAllowlistError("cleanup inventory does not prove ownership cleanup")
+    _validate_execution_record(
+        execution_record,
+        deployment_records=deployment_records,
+    )
     quote_verification = record.get("live_quote_verification")
     if (
         not isinstance(quote_verification, Mapping)
@@ -574,6 +685,96 @@ def validate_reconciliation(
     ):
         raise MeasurementAllowlistError("live quote TCB posture is not fully UpToDate")
     return dict(record)
+
+
+def _validate_deployment_summaries(
+    value: Any,
+    *,
+    live_evidence: list[Any],
+    canonical: Mapping[str, str],
+) -> list[Mapping[str, Any]]:
+    if not isinstance(value, Mapping) or set(value) != {"first", "second"}:
+        raise MeasurementAllowlistError(
+            "exactly two reconciliation deployment summaries are required"
+        )
+    summaries: list[Mapping[str, Any]] = []
+    for index, name in enumerate(("first", "second")):
+        summary = value.get(name)
+        evidence = live_evidence[index]
+        if (
+            not isinstance(summary, Mapping)
+            or set(summary) != DEPLOYMENT_SUMMARY_FIELDS
+            or not isinstance(evidence, Mapping)
+            or summary.get("app_id") != evidence.get("app_id")
+            or summary.get("cvm_name") != evidence.get("cvm_name")
+            or summary.get("automatic_placement") is not True
+            or summary.get("instance_type") != "tdx.small"
+            or summary.get("image") != CATALOG_SLUG
+            or summary.get("requested_region") is not None
+            or summary.get("requested_node_id") is not None
+            or summary.get("image_ref") != APPLICATION_IMAGE_REF
+            or summary.get("compose_hash") != canonical["compose_hash"]
+            or not isinstance(summary.get("cvm_id"), str)
+            or not summary.get("cvm_id")
+            or not isinstance(summary.get("vm_uuid"), str)
+            or not summary.get("vm_uuid")
+        ):
+            raise MeasurementAllowlistError(
+                f"reconciliation deployment summary {name} drift"
+            )
+        summaries.append(summary)
+    for field in ("app_id", "cvm_name", "cvm_id", "vm_uuid"):
+        if len({summary[field] for summary in summaries}) != 2:
+            raise MeasurementAllowlistError(
+                f"reconciliation deployment {field} values are not independent"
+            )
+    return summaries
+
+
+def _validate_execution_record(
+    value: Any,
+    *,
+    deployment_records: list[dict[str, Any]],
+) -> None:
+    expected_events = [
+        {"deployment": "first", "stage": "deployment", "status": "created"},
+        {
+            "deployment": "first",
+            "stage": "evidence_capture",
+            "status": "complete",
+        },
+        {"deployment": "first", "stage": "validation", "status": "passed"},
+        {"deployment": "first", "stage": "deletion", "status": "deleted"},
+        {"deployment": "second", "stage": "deployment", "status": "created"},
+        {
+            "deployment": "second",
+            "stage": "evidence_capture",
+            "status": "complete",
+        },
+        {"deployment": "second", "stage": "validation", "status": "passed"},
+        {"deployment": "second", "stage": "deletion", "status": "deleted"},
+        {
+            "deployment": None,
+            "stage": "final_inventory",
+            "status": "ownership_clean",
+        },
+    ]
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"version", "redacted", "events"}
+        or value.get("version") != 1
+        or value.get("redacted") is not True
+        or value.get("events") != expected_events
+        or len(deployment_records) != 2
+        or any(
+            deployment.get("created") is not True
+            or deployment.get("deleted") is not True
+            for deployment in deployment_records
+        )
+    ):
+        raise MeasurementAllowlistError(
+            "immutable redacted execution record is incomplete"
+        )
 
 
 def _catalog_artifacts_match(catalog: Mapping[str, Any], *, root: Path) -> bool:
@@ -660,7 +861,8 @@ def _validate_live_evidence(
     canonical: Mapping[str, str],
     allowlisted_compose_hash: str,
     root: Path,
-) -> None:
+    deployment_summary: Mapping[str, Any],
+) -> dict[str, Any]:
     if not isinstance(evidence, Mapping):
         raise MeasurementAllowlistError(f"live_evidence[{index}] must be an object")
     quote_path = evidence.get("quote_path")
@@ -818,11 +1020,19 @@ def _validate_live_evidence(
     info = _load_json(info_file, "live /Info")
     deployment = _load_json(deployment_file, "deployment record")
     os_info = info.get("os") if isinstance(info, Mapping) else None
+    resource = info.get("resource") if isinstance(info, Mapping) else None
     if (
         not isinstance(info, Mapping)
         or info.get("status") != "running"
         or info.get("app_id") != app_id
         or info.get("name") != evidence.get("cvm_name")
+        or info.get("id") != deployment_summary.get("cvm_id")
+        or info.get("vm_uuid") != deployment_summary.get("vm_uuid")
+        or not isinstance(resource, Mapping)
+        or resource.get("instance_type") != "tdx.small"
+        or resource.get("vcpu") != 1
+        or resource.get("memory_in_gb") != 2
+        or resource.get("gpus") != 0
         or not isinstance(os_info, Mapping)
         or os_info.get("name") != "dstack-0.5.9"
         or os_info.get("version") != "0.5.9"
@@ -832,16 +1042,20 @@ def _validate_live_evidence(
     ):
         raise MeasurementAllowlistError(f"live_evidence[{index}] /Info identity drift")
     if (
-        deployment.get("app_id") != app_id
+        not isinstance(deployment, Mapping)
+        or set(deployment) != DEPLOYMENT_FIELDS
+        or deployment.get("app_id") != app_id
         or deployment.get("cvm_name") != evidence.get("cvm_name")
+        or deployment.get("cvm_id") != info.get("id")
+        or deployment.get("vm_uuid") != info.get("vm_uuid")
+        or deployment.get("cvm_id") != deployment_summary.get("cvm_id")
+        or deployment.get("vm_uuid") != deployment_summary.get("vm_uuid")
         or deployment.get("instance_type") != "tdx.small"
         or deployment.get("os_image") != CATALOG_SLUG
         or deployment.get("automatic_placement") is not True
         or deployment.get("requested_region") is not None
         or deployment.get("requested_node_id") is not None
-        or deployment.get("image_ref")
-        != "docker.io/mathiiss/basecrawl-cvm@sha256:"
-        "57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+        or deployment.get("image_ref") != APPLICATION_IMAGE_REF
         or deployment.get("compose_hash") != allowlisted_compose_hash
         or deployment.get("created") is not True
         or deployment.get("deleted") is not True
@@ -865,6 +1079,7 @@ def _validate_live_evidence(
         )
     if evidence.get("rtmr3") != signed["rtmr3"]:
         raise MeasurementAllowlistError(f"live_evidence[{index}] recorded RTMR3 drift")
+    return dict(deployment)
 
 
 def _verify_quote(quote: bytes, *, quote_path: Path, index: int) -> None:

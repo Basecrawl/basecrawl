@@ -1,0 +1,51 @@
+{
+  "events": [
+    {
+      "deployment": "first",
+      "stage": "deployment",
+      "status": "created"
+    },
+    {
+      "deployment": "first",
+      "stage": "evidence_capture",
+      "status": "complete"
+    },
+    {
+      "deployment": "first",
+      "stage": "validation",
+      "status": "passed"
+    },
+    {
+      "deployment": "first",
+      "stage": "deletion",
+      "status": "deleted"
+    },
+    {
+      "deployment": "second",
+      "stage": "deployment",
+      "status": "created"
+    },
+    {
+      "deployment": "second",
+      "stage": "evidence_capture",
+      "status": "complete"
+    },
+    {
+      "deployment": "second",
+      "stage": "validation",
+      "status": "passed"
+    },
+    {
+      "deployment": "second",
+      "stage": "deletion",
+      "status": "deleted"
+    },
+    {
+      "deployment": null,
+      "stage": "final_inventory",
+      "status": "ownership_clean"
+    }
+  ],
+  "redacted": true,
+  "version": 1
+}

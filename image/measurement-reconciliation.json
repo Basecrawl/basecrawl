@@ -53,6 +53,7 @@
     "version": "dstack-mr-cli 0.1.0"
   },
   "evidence_bundle": {
+    "execution_record_path": "evidence/m2/execution/reconciliation.json",
     "manifest_path": "evidence/m2/manifest.json",
     "version": 1
   },
@@ -229,20 +230,28 @@
     "first": {
       "app_id": "bd003bdb2818d54e93ef23e5490f3292b54685b7",
       "automatic_placement": true,
+      "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
+      "cvm_id": "cvm_dw1Ax7wM",
       "cvm_name": "basecrawl-quote-20260711-2238",
+      "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
       "image": "dstack-0.5.9-bd369a8c",
       "instance_type": "tdx.small",
       "requested_node_id": null,
-      "requested_region": null
+      "requested_region": null,
+      "vm_uuid": "fa022b0c-0d8c-4066-9c02-e008010f3490"
     },
     "second": {
       "app_id": "ba6462953533760fc71ba76e4c5243143c57cdc0",
       "automatic_placement": true,
+      "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
+      "cvm_id": "cvm_vKGDVVw8",
       "cvm_name": "basecrawl-reconcile-20260711-f01368",
+      "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
       "image": "dstack-0.5.9-bd369a8c",
       "instance_type": "tdx.small",
       "requested_node_id": null,
-      "requested_region": null
+      "requested_region": null,
+      "vm_uuid": "23c04619-1332-40f9-807f-67df541996e1"
     }
   },
   "source_pins": {
