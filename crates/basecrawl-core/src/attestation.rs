@@ -189,14 +189,14 @@ fn normalize_report_data(input: &str) -> Result<String, QuoteRequestError> {
         return Err(QuoteRequestError::InvalidReportData);
     }
     let input_bytes = decode_hex(input).ok_or(QuoteRequestError::InvalidReportData)?;
-    let normalized = if input_bytes.len() > TD_REPORT_DATA_BYTES {
+    let field_value = if input_bytes.len() > TD_REPORT_DATA_BYTES {
         use sha2::{Digest, Sha256};
         Sha256::digest(input_bytes).to_vec()
     } else {
-        let mut padded = vec![0_u8; TD_REPORT_DATA_BYTES];
-        padded[..input_bytes.len()].copy_from_slice(&input_bytes);
-        padded
+        input_bytes
     };
+    let mut normalized = vec![0_u8; TD_REPORT_DATA_BYTES];
+    normalized[..field_value.len()].copy_from_slice(&field_value);
     Ok(encode_hex(&normalized))
 }
 

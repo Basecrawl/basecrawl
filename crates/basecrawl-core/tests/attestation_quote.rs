@@ -1,6 +1,7 @@
 use basecrawl_core::attestation::{
     get_quote_at, quote_measurement, quote_report_data, QuoteRequestError,
 };
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -74,7 +75,7 @@ fn socket_path(label: &str) -> PathBuf {
     ))
 }
 
-fn serve_once(path: &PathBuf, body: String) -> thread::JoinHandle<()> {
+fn serve_once(path: &PathBuf, body: String) -> thread::JoinHandle<Vec<u8>> {
     let listener = UnixListener::bind(path).unwrap();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -86,6 +87,7 @@ fn serve_once(path: &PathBuf, body: String) -> thread::JoinHandle<()> {
             body
         );
         stream.write_all(response.as_bytes()).unwrap();
+        request
     })
 }
 
@@ -110,6 +112,107 @@ fn get_quote_posts_a_full_report_data_value_and_validates_the_response() {
     assert!(response.quote.len() >= 1264);
     assert!(!response.event_log.is_null());
     assert!(!response.vm_config.is_null());
+}
+
+#[test]
+fn get_quote_sha256_reduces_overlong_report_data_instead_of_truncating_it() {
+    let path = socket_path("sha256-overlong");
+    let input = "ab".repeat(65);
+    let digest = Sha256::digest([0xab; 65]);
+    let expected = format!(
+        "{}{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "00".repeat(32)
+    );
+    let body = serde_json::json!({
+        "quote": quote_fixture(&expected),
+        "event_log": [{"event": "fixture"}],
+        "report_data": expected,
+        "vm_config": {"cpu": 1}
+    })
+    .to_string();
+    let server = serve_once(&path, body);
+
+    let response = get_quote_at(&path, &input).unwrap();
+
+    let request = String::from_utf8(server.join().unwrap()).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(request.contains(&format!(r#""report_data":"{expected}""#)));
+    assert_eq!(response.report_data, expected);
+    assert_eq!(quote_report_data(&response.quote).unwrap(), expected);
+    assert_ne!(response.report_data, "ab".repeat(64));
+}
+
+#[test]
+fn get_quote_left_aligns_and_zero_pads_short_report_data() {
+    let path = socket_path("short");
+    let input = "ab".repeat(32);
+    let expected = format!("{input}{}", "00".repeat(32));
+    let body = serde_json::json!({
+        "quote": quote_fixture(&expected),
+        "event_log": [{"event": "fixture"}],
+        "report_data": expected,
+        "vm_config": {"cpu": 1}
+    })
+    .to_string();
+    let server = serve_once(&path, body);
+
+    let response = get_quote_at(&path, &input).unwrap();
+
+    let request = String::from_utf8(server.join().unwrap()).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(request.contains(&format!(r#""report_data":"{expected}""#)));
+    assert_eq!(response.report_data, expected);
+    assert_eq!(quote_report_data(&response.quote).unwrap(), expected);
+}
+
+#[test]
+fn get_quote_rejects_malformed_report_data_before_opening_the_socket() {
+    let path = socket_path("malformed");
+    for input in ["0", "gg", "01xz"] {
+        let error = get_quote_at(&path, input).unwrap_err();
+        assert!(
+            matches!(error, QuoteRequestError::InvalidReportData),
+            "unexpected error for {input:?}: {error}"
+        );
+    }
+    assert!(!path.exists());
+}
+
+#[test]
+fn get_quote_preserves_json_encoded_event_log_and_vm_config_strings() {
+    let path = socket_path("raw-json-strings");
+    let event_log = r#"[{"event":"fixture"}]"#;
+    let vm_config = r#"{"cpu":1}"#;
+    let body = serde_json::json!({
+        "quote": quote_fixture(REPORT_DATA),
+        "event_log": event_log,
+        "report_data": REPORT_DATA,
+        "vm_config": vm_config
+    })
+    .to_string();
+    let server = serve_once(&path, body);
+
+    let response = get_quote_at(&path, REPORT_DATA).unwrap();
+
+    server.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    assert_eq!(
+        response.event_log,
+        serde_json::Value::String(event_log.into())
+    );
+    assert_eq!(
+        response.vm_config,
+        serde_json::Value::String(vm_config.into())
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response.to_canonical_json()).unwrap()
+            ["event_log"],
+        event_log
+    );
 }
 
 #[test]

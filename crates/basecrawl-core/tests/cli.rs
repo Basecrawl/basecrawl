@@ -237,3 +237,29 @@ fn attestation_and_signature_absent_or_null_at_m1() {
         "sdk_signature.sig must be null at M1"
     );
 }
+
+// VAL-TEE-026
+#[test]
+fn unavailable_dstack_socket_fails_closed_without_emitting_a_scrapeproof() {
+    let out = run(&[
+        TARGET,
+        "--formats",
+        "rawHtml",
+        "--no-js",
+        "--attest",
+        "--task-id",
+        "TEE-SOCKET-FAIL",
+        "--nonce",
+        "NONCE-SOCKET-FAIL",
+    ]);
+
+    assert!(!out.status.success(), "missing socket must exit non-zero");
+    assert!(
+        out.stdout.is_empty(),
+        "no ScrapeProof or placeholder attestation may be emitted"
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).expect("structured JSON error on stderr");
+    assert_eq!(err["error"]["kind"], "attestation_error");
+    assert!(err["error"]["message"].as_str().unwrap().contains("socket"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("attestation"));
+}

@@ -166,7 +166,12 @@ def parse_get_quote(payload: str | bytes, submitted_report_data: str) -> dict[st
         if field not in response or response[field] in (None, "", [], {}):
             raise AttestationError(f"GetQuote response is missing {field}")
     returned = response["report_data"]
-    if not isinstance(returned, str) or normalize_report_data(returned) != expected:
+    if (
+        not isinstance(returned, str)
+        or len(returned) != REPORT_DATA_BYTES * 2
+        or any(char not in "0123456789abcdefABCDEF" for char in returned)
+        or returned.lower() != expected
+    ):
         raise AttestationError("GetQuote response report_data does not match submitted value")
     quote = response["quote"]
     if not isinstance(quote, str):

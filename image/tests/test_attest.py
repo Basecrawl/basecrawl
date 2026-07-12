@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,11 +21,11 @@ import attest
 REPORT_DATA = bytes(range(64)).hex()
 
 
-def valid_quote() -> str:
+def valid_quote(report_data: str = REPORT_DATA) -> str:
     quote = bytearray(48 + 584)
     quote[0:2] = (4).to_bytes(2, "little")
     quote[4:8] = (0x81).to_bytes(4, "little")
-    quote[48 + 520 : 48 + 584] = bytes.fromhex(REPORT_DATA)
+    quote[48 + 520 : 48 + 584] = bytes.fromhex(report_data)
     qe_certification = bytearray(384 + 64)
     qe_certification += (32).to_bytes(2, "little")
     qe_certification += bytes(range(32))
@@ -111,22 +114,131 @@ class AttestationClientTests(unittest.TestCase):
                 REPORT_DATA,
             )
 
+    def test_parse_get_quote_preserves_json_encoded_wire_strings(self) -> None:
+        event_log = '[{"event":"fixture"}]'
+        vm_config = '{"cpu":1}'
+        response = attest.parse_get_quote(
+            json.dumps(
+                {
+                    "quote": valid_quote(),
+                    "event_log": event_log,
+                    "report_data": REPORT_DATA,
+                    "vm_config": vm_config,
+                }
+            ),
+            REPORT_DATA,
+        )
+        self.assertEqual(response["event_log"], event_log)
+        self.assertEqual(response["vm_config"], vm_config)
+
+    def test_parse_get_quote_rejects_noncanonical_returned_report_data(self) -> None:
+        for returned in ("0102", "ab" * 65):
+            with self.subTest(returned_length=len(returned)):
+                expected = attest.normalize_report_data(returned)
+                with self.assertRaisesRegex(attest.AttestationError, "report_data"):
+                    attest.parse_get_quote(
+                        json.dumps(
+                            {
+                                "quote": valid_quote(expected),
+                                "event_log": [{"event": "fixture"}],
+                                "report_data": returned,
+                                "vm_config": {"cpu": 1},
+                            }
+                        ),
+                        returned,
+                    )
+
+    def test_request_quote_posts_sha256_reduced_overlong_report_data(
+        self,
+    ) -> None:
+        overlong = "ab" * 65
+        expected = hashlib.sha256(bytes.fromhex(overlong)).hexdigest() + "00" * 32
+
+        def respond(_path: Path, body: bytes, _timeout: float) -> bytes:
+            self.assertEqual(json.loads(body), {"report_data": expected})
+            return json.dumps(
+                {
+                    "quote": valid_quote(expected),
+                    "event_log": [{"event": "fixture"}],
+                    "report_data": expected,
+                    "vm_config": {"cpu": 1},
+                }
+            ).encode()
+
+        with mock.patch("attest._http_post_unix", side_effect=respond):
+            response = attest.request_quote(overlong)
+        self.assertEqual(response["report_data"], expected)
+        self.assertNotEqual(response["report_data"], overlong[: 64 * 2])
+
+    def test_request_quote_left_aligns_and_zero_pads_short_report_data(self) -> None:
+        short = "ab" * 32
+        expected = short + "00" * 32
+
+        def respond(_path: Path, body: bytes, _timeout: float) -> bytes:
+            self.assertEqual(json.loads(body), {"report_data": expected})
+            return json.dumps(
+                {
+                    "quote": valid_quote(expected),
+                    "event_log": [{"event": "fixture"}],
+                    "report_data": expected,
+                    "vm_config": {"cpu": 1},
+                }
+            ).encode()
+
+        with mock.patch("attest._http_post_unix", side_effect=respond):
+            response = attest.request_quote(short)
+        self.assertEqual(response["report_data"], expected)
+
+    def test_request_quote_rejects_malformed_hex_before_socket_access(self) -> None:
+        with mock.patch("attest._http_post_unix") as post:
+            for malformed in ("", "0", "gg", "01xz"):
+                with self.subTest(report_data=malformed):
+                    with self.assertRaisesRegex(attest.AttestationError, "hexadecimal"):
+                        attest.request_quote(malformed)
+        post.assert_not_called()
+
+    def test_request_quote_fails_closed_when_socket_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing = Path(temp_dir) / "missing.sock"
+            with self.assertRaisesRegex(attest.AttestationError, "socket unavailable"):
+                attest.request_quote(REPORT_DATA, socket_path=missing)
+
+    def test_cli_socket_failure_writes_no_quote_response_or_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            quote_out = root / "quote.hex"
+            response_out = root / "response.json"
+            attestation_out = root / "attestation.json"
+            args = [
+                "attest.py",
+                "--report-data",
+                REPORT_DATA,
+                "--socket",
+                str(root / "missing.sock"),
+                "--quote-out",
+                str(quote_out),
+                "--response-out",
+                str(response_out),
+                "--attestation-out",
+                str(attestation_out),
+            ]
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", args),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(attest.main(), 1)
+            self.assertFalse(quote_out.exists())
+            self.assertFalse(response_out.exists())
+            self.assertFalse(attestation_out.exists())
+            result = json.loads(stdout.getvalue())
+            self.assertFalse(result["attestation"])
+            self.assertIn("socket unavailable", result["error"])
+
     def test_forged_quote_has_enough_bytes_but_no_signature(self) -> None:
         forged = attest.hand_assembled_quote(REPORT_DATA)
         self.assertLess(len(forged), attest.MIN_QUOTE_HEX_LEN)
         self.assertEqual(forged[(48 + 520) * 2 : (48 + 584) * 2], REPORT_DATA)
-
-    def test_overlong_report_data_is_sha512_reduced_and_short_data_is_padded(
-        self,
-    ) -> None:
-        overlong = "ab" * 65
-        reduced = attest.normalize_report_data(overlong)
-        self.assertEqual(
-            reduced,
-            hashlib.sha256(bytes.fromhex(overlong)).hexdigest() + "00" * 32,
-        )
-        short = attest.normalize_report_data("0102")
-        self.assertEqual(short, "0102" + "00" * 62)
 
     def test_decode_quote_requires_every_tdx_register_and_production_attributes(
         self,
