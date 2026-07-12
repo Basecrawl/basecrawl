@@ -232,6 +232,7 @@ dependencies = [
  "basecrawl-seal",
  "brotli",
  "clap",
+ "crypto_box",
  "ed25519-dalek",
  "ego-tree",
  "encoding_rs",

@@ -11,6 +11,16 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod security;
+pub use security::{
+    assert_security_invariants, security_critical_tls_params, security_snapshot_for_seed,
+    CertificateValidationPolicy, OfferedTlsVersions, SecurityCriticalTlsParams,
+    SeedSecuritySnapshot, REQUIRED_NEGOTIATED_TLS_VERSION, SECURITY_TLS13_CIPHER_SUITE_IANA,
+    SECURITY_TLS_GROUP_ALLOWLIST,
+};
+
+// generate_validated is defined below next to generate.
+
 /// Domain separation for seed normalizers (normalize arbitrary bytes → 64-hex seed).
 const SEED_DOMAIN_TAG: &[u8] = b"basecrawl/fingerprint-seed/v1\0";
 
@@ -241,6 +251,12 @@ pub fn resolve_seed(
 }
 
 /// Generate a deterministic fingerprint profile from `seed` inside the allowlisted parameter space.
+///
+/// Security-critical TLS parameters are constant across every seed (cert validation stays strong,
+/// TLS 1.3 remains required, cert/transcript capture stays enabled). Only non-security dimensions
+/// are seed-selected. Generated profiles are checked against
+/// [`security::assert_security_invariants`] so a regressor that smuggled a weak cipher or
+/// weakened cert policy into the seed path fails closed (VAL-ANTIBOT-038, BOT-08).
 pub fn generate(seed_input: &str) -> FingerprintProfile {
     let seed = normalize_seed(seed_input);
     let stream = SeedStream::new(&seed);
@@ -311,6 +327,15 @@ pub fn generate(seed_input: &str) -> FingerprintProfile {
         ja4,
         platform,
     }
+}
+
+/// Generate a profile and fail closed if it escapes the security invariants
+/// (VAL-ANTIBOT-038 / BOT-08). Production scrape paths should use this rather
+/// than the pure [`generate`] when they are about to drive real TLS.
+pub fn generate_validated(seed_input: &str) -> Result<FingerprintProfile, String> {
+    let profile = generate(seed_input);
+    security::assert_security_invariants(&profile)?;
+    Ok(profile)
 }
 
 /// True when every field of `profile` falls inside [`parameter_space`].

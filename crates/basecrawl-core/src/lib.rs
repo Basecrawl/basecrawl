@@ -175,7 +175,13 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         options.nonce.as_deref(),
         &format!("GET\0{}", url.as_str()),
     );
-    let fingerprint = basecrawl_fp::generate(&fingerprint_seed);
+    // Fail closed if a seed ever selects a weak security surface (VAL-ANTIBOT-038 / BOT-08).
+    // Non-security dimensions (JA3/JA4, headers, UA, viewport, tz, locale, canvas) still vary.
+    let fingerprint = basecrawl_fp::generate_validated(&fingerprint_seed).map_err(|detail| {
+        Error::TlsCapture(format!(
+            "fingerprint seed violated security-critical TLS invariants: {detail}"
+        ))
+    })?;
 
     // Seed chooses viewport when the caller left the measured-image default; an explicit
     // non-default viewport from the CLI/SDK wins.

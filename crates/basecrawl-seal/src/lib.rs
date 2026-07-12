@@ -49,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod antibot_feedback;
 pub mod browser_dns;
 pub mod dns;
 pub mod error;
@@ -58,6 +59,13 @@ pub mod redact;
 pub mod result;
 pub mod task;
 
+pub use antibot_feedback::{
+    classify_coarse_from_status_and_markers, decrypt_antibot_feedback_as_miner_host,
+    maybe_seal_failure_feedback, miner_visible_contains_marker, seal_antibot_feedback,
+    unseal_antibot_feedback_with_committee_secret, AntibotFeedbackPlaintext, CoarseFailureHint,
+    SealedAntibotFeedback, ANTIBOT_FEEDBACK_DOMAIN, ANTIBOT_FEEDBACK_KIND,
+    ANTIBOT_FEEDBACK_RECIPIENT, ANTIBOT_FEEDBACK_SUITE,
+};
 pub use browser_dns::{
     chrome_dns_isolation_proxy_arg, document_host_needs_sealed_resolve, global_sealed_socks_proxy,
     preflight_document_dns, SealedSocksProxy, SEALED_BROWSER_DNS_MARKER,
