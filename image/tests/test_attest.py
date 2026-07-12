@@ -19,10 +19,22 @@ REPORT_DATA = bytes(range(64)).hex()
 
 
 def valid_quote() -> str:
-    quote = bytearray(48 + 584 + 4)
+    quote = bytearray(48 + 584)
     quote[0:2] = (4).to_bytes(2, "little")
     quote[4:8] = (0x81).to_bytes(4, "little")
     quote[48 + 520 : 48 + 584] = bytes.fromhex(REPORT_DATA)
+    qe_certification = bytearray(384 + 64)
+    qe_certification += (32).to_bytes(2, "little")
+    qe_certification += bytes(range(32))
+    qe_certification += (5).to_bytes(2, "little")
+    qe_certification += (1).to_bytes(4, "little")
+    qe_certification += b"\x42"
+    signature_data = bytearray(b"\x11" * 64 + b"\x22" * 64)
+    signature_data += (6).to_bytes(2, "little")
+    signature_data += len(qe_certification).to_bytes(4, "little")
+    signature_data += qe_certification
+    quote += len(signature_data).to_bytes(4, "little")
+    quote += signature_data
     return quote.hex()
 
 
@@ -101,7 +113,7 @@ class AttestationClientTests(unittest.TestCase):
 
     def test_forged_quote_has_enough_bytes_but_no_signature(self) -> None:
         forged = attest.hand_assembled_quote(REPORT_DATA)
-        self.assertGreaterEqual(len(forged), attest.MIN_QUOTE_HEX_LEN)
+        self.assertLess(len(forged), attest.MIN_QUOTE_HEX_LEN)
         self.assertEqual(forged[(48 + 520) * 2 : (48 + 584) * 2], REPORT_DATA)
 
     def test_overlong_report_data_is_sha512_reduced_and_short_data_is_padded(
@@ -119,9 +131,7 @@ class AttestationClientTests(unittest.TestCase):
     def test_decode_quote_requires_every_tdx_register_and_production_attributes(
         self,
     ) -> None:
-        completed = mock.Mock(
-            returncode=0, stdout=json.dumps(valid_decode()), stderr=""
-        )
+        completed = mock.Mock(returncode=0, stdout=json.dumps(valid_decode()), stderr="")
         with mock.patch("attest.subprocess.run", return_value=completed):
             decoded = attest.decode_quote(Path("/tmp/quote.hex"))
         self.assertEqual(decoded["report"]["TD10"]["rt_mr3"], "55" * 48)
@@ -146,9 +156,7 @@ class AttestationClientTests(unittest.TestCase):
             attest.decode_quote(Path("/tmp/quote.hex"))
 
     def test_pckinfo_requires_tdx_identity_and_intel_rooted_chain(self) -> None:
-        completed = mock.Mock(
-            returncode=0, stdout=json.dumps(valid_pckinfo()), stderr=""
-        )
+        completed = mock.Mock(returncode=0, stdout=json.dumps(valid_pckinfo()), stderr="")
         with mock.patch("attest.subprocess.run", return_value=completed):
             pckinfo = attest.inspect_pckinfo(Path("/tmp/quote.hex"))
         self.assertEqual(pckinfo["fmspc"], "20a06f000000")
@@ -170,6 +178,33 @@ class AttestationClientTests(unittest.TestCase):
         self.assertEqual(attestation["measurement"]["rtmr3"], "55" * 48)
         self.assertEqual(attestation["report_data"], REPORT_DATA)
         self.assertEqual(json.loads(json.dumps(attestation)), attestation)
+
+    def test_parser_and_emitter_reject_truncated_certification_data(self) -> None:
+        truncated = valid_quote()[:-2]
+        payload = json.dumps(
+            {
+                "quote": truncated,
+                "event_log": [{"event": "fixture"}],
+                "report_data": REPORT_DATA,
+                "vm_config": {"cpu": 1},
+            }
+        )
+        with self.assertRaisesRegex(attest.AttestationError, "truncated|structure"):
+            attest.parse_get_quote(payload, REPORT_DATA)
+        with self.assertRaisesRegex(attest.AttestationError, "truncated|structure"):
+            attest.build_tier2_attestation(truncated, valid_decode())
+
+    def test_parser_rejects_nonzero_bytes_after_declared_quote(self) -> None:
+        payload = json.dumps(
+            {
+                "quote": valid_quote() + "01",
+                "event_log": [{"event": "fixture"}],
+                "report_data": REPORT_DATA,
+                "vm_config": {"cpu": 1},
+            }
+        )
+        with self.assertRaisesRegex(attest.AttestationError, "structure"):
+            attest.parse_get_quote(payload, REPORT_DATA)
 
 
 if __name__ == "__main__":

@@ -15,13 +15,36 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-MIN_QUOTE_LEN = 48 + 520 + 64
-MIN_QUOTE_HEX_LEN = MIN_QUOTE_LEN * 2
 SOCKET_PATH = Path("/var/run/dstack.sock")
 REPORT_DATA_BYTES = 64
 QUOTE_HEADER_BYTES = 48
+TD_REPORT_BYTES = 584
 TD_REPORT_DATA_OFFSET = 520
 TD_REPORT_DATA_BYTES = 64
+SIGNATURE_DATA_LENGTH_BYTES = 4
+ECDSA_SIGNATURE_BYTES = 64
+ECDSA_ATTESTATION_KEY_BYTES = 64
+CERTIFICATION_HEADER_BYTES = 6
+QE_REPORT_BYTES = 384
+QE_REPORT_SIGNATURE_BYTES = 64
+AUTHENTICATION_DATA_LENGTH_BYTES = 2
+MIN_CERTIFICATION_DATA_BYTES = 1
+SIGNATURE_DATA_LENGTH_OFFSET = QUOTE_HEADER_BYTES + TD_REPORT_BYTES
+SIGNATURE_DATA_OFFSET = SIGNATURE_DATA_LENGTH_OFFSET + SIGNATURE_DATA_LENGTH_BYTES
+MIN_SIGNATURE_DATA_BYTES = (
+    ECDSA_SIGNATURE_BYTES
+    + ECDSA_ATTESTATION_KEY_BYTES
+    + CERTIFICATION_HEADER_BYTES
+    + QE_REPORT_BYTES
+    + QE_REPORT_SIGNATURE_BYTES
+    + AUTHENTICATION_DATA_LENGTH_BYTES
+    + CERTIFICATION_HEADER_BYTES
+    + MIN_CERTIFICATION_DATA_BYTES
+)
+MIN_QUOTE_LEN = SIGNATURE_DATA_OFFSET + MIN_SIGNATURE_DATA_BYTES
+MIN_QUOTE_HEX_LEN = MIN_QUOTE_LEN * 2
+QE_REPORT_CERTIFICATION_DATA_TYPE = 6
+PCK_CERTIFICATE_CHAIN_DATA_TYPE = 5
 TD_MEASUREMENT_HEX_LEN = 48 * 2
 TD_ATTRIBUTES_HEX_LEN = 8 * 2
 
@@ -32,11 +55,7 @@ class AttestationError(RuntimeError):
 
 def normalize_report_data(report_data: str) -> str:
     value = report_data.strip().lower()
-    if (
-        not value
-        or len(value) % 2
-        or any(char not in "0123456789abcdef" for char in value)
-    ):
+    if not value or len(value) % 2 or any(char not in "0123456789abcdef" for char in value):
         raise AttestationError("report_data must be non-empty, even-length hexadecimal")
     payload = bytes.fromhex(value)
     if len(payload) > REPORT_DATA_BYTES:
@@ -52,12 +71,71 @@ def _quote_shape(quote_hex: str, report_data: str) -> None:
     ):
         raise AttestationError("quote is missing, malformed, or truncated")
     quote = bytes.fromhex(quote_hex)
-    if (
-        len(quote) < QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES
-        or int.from_bytes(quote[0:2], "little") != 4
-        or int.from_bytes(quote[4:8], "little") != 0x81
-    ):
+    if int.from_bytes(quote[0:2], "little") != 4 or int.from_bytes(quote[4:8], "little") != 0x81:
         raise AttestationError("quote is not an Intel TDX v4 quote")
+    signature_data_length = int.from_bytes(
+        quote[
+            SIGNATURE_DATA_LENGTH_OFFSET : SIGNATURE_DATA_LENGTH_OFFSET
+            + SIGNATURE_DATA_LENGTH_BYTES
+        ],
+        "little",
+    )
+    if signature_data_length < MIN_SIGNATURE_DATA_BYTES:
+        raise AttestationError(
+            "quote structure is malformed or truncated: signature data is too short"
+        )
+    declared_end = SIGNATURE_DATA_OFFSET + signature_data_length
+    if declared_end > len(quote):
+        raise AttestationError(
+            "quote structure is malformed or truncated: declared signature data is truncated"
+        )
+    if any(quote[declared_end:]):
+        raise AttestationError(
+            "quote structure is malformed: non-zero bytes follow declared signature data"
+        )
+    signature_data = quote[SIGNATURE_DATA_OFFSET:declared_end]
+    cursor = ECDSA_SIGNATURE_BYTES + ECDSA_ATTESTATION_KEY_BYTES
+    outer_type = _read_uint(signature_data, cursor, 2)
+    outer_length = _read_uint(signature_data, cursor + 2, 4)
+    if outer_type != QE_REPORT_CERTIFICATION_DATA_TYPE:
+        raise AttestationError("quote structure is malformed: no QE report certification envelope")
+    cursor += CERTIFICATION_HEADER_BYTES
+    outer_end = cursor + outer_length
+    if outer_end != len(signature_data):
+        raise AttestationError(
+            "quote structure is malformed or truncated: "
+            "QE certification length does not match signature data"
+        )
+    minimum_qe_certification = (
+        QE_REPORT_BYTES
+        + QE_REPORT_SIGNATURE_BYTES
+        + AUTHENTICATION_DATA_LENGTH_BYTES
+        + CERTIFICATION_HEADER_BYTES
+        + MIN_CERTIFICATION_DATA_BYTES
+    )
+    if outer_length < minimum_qe_certification:
+        raise AttestationError(
+            "quote structure is malformed or truncated: QE report certification data is truncated"
+        )
+    cursor += QE_REPORT_BYTES + QE_REPORT_SIGNATURE_BYTES
+    authentication_data_length = _read_uint(signature_data, cursor, 2)
+    cursor += AUTHENTICATION_DATA_LENGTH_BYTES + authentication_data_length
+    if cursor + CERTIFICATION_HEADER_BYTES > outer_end:
+        raise AttestationError(
+            "quote structure is malformed or truncated: authentication data is truncated"
+        )
+    certification_type = _read_uint(signature_data, cursor, 2)
+    certification_data_length = _read_uint(signature_data, cursor + 2, 4)
+    if certification_type != PCK_CERTIFICATE_CHAIN_DATA_TYPE:
+        raise AttestationError("quote structure is malformed: no PCK certificate-chain data")
+    if certification_data_length < MIN_CERTIFICATION_DATA_BYTES:
+        raise AttestationError("quote structure is malformed: PCK certification data is empty")
+    cursor += CERTIFICATION_HEADER_BYTES
+    if cursor + certification_data_length != outer_end:
+        raise AttestationError(
+            "quote structure is malformed or truncated: "
+            "PCK certification data length does not match quote"
+        )
     embedded = quote[
         QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET : QUOTE_HEADER_BYTES
         + TD_REPORT_DATA_OFFSET
@@ -65,6 +143,15 @@ def _quote_shape(quote_hex: str, report_data: str) -> None:
     ].hex()
     if embedded != report_data:
         raise AttestationError("quote report_data does not match submitted report_data")
+
+
+def _read_uint(value: bytes, offset: int, size: int) -> int:
+    end = offset + size
+    if end > len(value):
+        raise AttestationError(
+            "quote structure is malformed or truncated: missing length or type field"
+        )
+    return int.from_bytes(value[offset:end], "little")
 
 
 def parse_get_quote(payload: str | bytes, submitted_report_data: str) -> dict[str, Any]:
@@ -80,9 +167,7 @@ def parse_get_quote(payload: str | bytes, submitted_report_data: str) -> dict[st
             raise AttestationError(f"GetQuote response is missing {field}")
     returned = response["report_data"]
     if not isinstance(returned, str) or normalize_report_data(returned) != expected:
-        raise AttestationError(
-            "GetQuote response report_data does not match submitted value"
-        )
+        raise AttestationError("GetQuote response report_data does not match submitted value")
     quote = response["quote"]
     if not isinstance(quote, str):
         raise AttestationError("GetQuote quote must be hexadecimal text")
@@ -110,9 +195,7 @@ def _http_post_unix(path: Path, body: bytes, timeout: float) -> bytes:
             while chunk := client.recv(64 * 1024):
                 chunks.append(chunk)
     except OSError as error:
-        raise AttestationError(
-            f"dstack guest-agent socket unavailable: {error}"
-        ) from error
+        raise AttestationError(f"dstack guest-agent socket unavailable: {error}") from error
     response = b"".join(chunks)
     separator = response.find(b"\r\n\r\n")
     if separator < 0:
@@ -179,9 +262,7 @@ def verify_quote(quote_path: Path) -> subprocess.CompletedProcess[str]:
         timeout=90,
     )
     if result.returncode != 0:
-        raise AttestationError(
-            f"dcap-qvl rejected quote {quote_path}: {result.stderr.strip()}"
-        )
+        raise AttestationError(f"dcap-qvl rejected quote {quote_path}: {result.stderr.strip()}")
     try:
         verdict = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -205,9 +286,7 @@ def decode_quote(quote_path: Path) -> dict[str, Any]:
         timeout=30,
     )
     if result.returncode != 0:
-        raise AttestationError(
-            f"dcap-qvl could not decode quote: {result.stderr.strip()}"
-        )
+        raise AttestationError(f"dcap-qvl could not decode quote: {result.stderr.strip()}")
     try:
         decoded = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -283,8 +362,7 @@ def inspect_pckinfo(quote_path: Path) -> dict[str, Any]:
             or issuer not in certificate.get("issuer", "")
         ):
             raise AttestationError(
-                "PCK certificate chain must be Leaf PCK -> PCK Platform CA -> "
-                "Intel SGX Root CA"
+                "PCK certificate chain must be Leaf PCK -> PCK Platform CA -> Intel SGX Root CA"
             )
     return pckinfo
 

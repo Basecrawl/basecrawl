@@ -16,15 +16,36 @@ use thiserror::Error;
 /// The dstack socket mounted by the Phala CVM image.
 pub const DEFAULT_DSTACK_SOCKET: &str = "/var/run/dstack.sock";
 
-/// A TDX quote is at least a v4 header, TD10 report, and signature-length field.  Real quotes
-/// include certification data and are substantially larger, but this lower bound rejects
-/// hand-assembled/truncated values before they can be emitted as an attestation.
-pub const MIN_QUOTE_HEX_LEN: usize = (48 + 520 + 64) * 2;
+/// Minimum structurally complete TDX v4 quote: header, TD10 report, signature length, ECDSA
+/// signature and key, QE report certification envelope, and one certification-data byte.
+pub const MIN_QUOTE_HEX_LEN: usize = MIN_QUOTE_BYTES * 2;
 const QUOTE_HEADER_BYTES: usize = 48;
+const TD_REPORT_BYTES: usize = 584;
 const TD_REPORT_DATA_OFFSET: usize = 520;
 const TD_REPORT_DATA_BYTES: usize = 64;
+const SIGNATURE_DATA_LENGTH_BYTES: usize = 4;
+const ECDSA_SIGNATURE_BYTES: usize = 64;
+const ECDSA_ATTESTATION_KEY_BYTES: usize = 64;
+const CERTIFICATION_HEADER_BYTES: usize = 6;
+const QE_REPORT_BYTES: usize = 384;
+const QE_REPORT_SIGNATURE_BYTES: usize = 64;
+const AUTHENTICATION_DATA_LENGTH_BYTES: usize = 2;
+const MIN_CERTIFICATION_DATA_BYTES: usize = 1;
+const SIGNATURE_DATA_LENGTH_OFFSET: usize = QUOTE_HEADER_BYTES + TD_REPORT_BYTES;
+const SIGNATURE_DATA_OFFSET: usize = SIGNATURE_DATA_LENGTH_OFFSET + SIGNATURE_DATA_LENGTH_BYTES;
+const MIN_SIGNATURE_DATA_BYTES: usize = ECDSA_SIGNATURE_BYTES
+    + ECDSA_ATTESTATION_KEY_BYTES
+    + CERTIFICATION_HEADER_BYTES
+    + QE_REPORT_BYTES
+    + QE_REPORT_SIGNATURE_BYTES
+    + AUTHENTICATION_DATA_LENGTH_BYTES
+    + CERTIFICATION_HEADER_BYTES
+    + MIN_CERTIFICATION_DATA_BYTES;
+const MIN_QUOTE_BYTES: usize = SIGNATURE_DATA_OFFSET + MIN_SIGNATURE_DATA_BYTES;
 const QUOTE_VERSION: u16 = 4;
 const TDX_TEE_TYPE: u32 = 0x81;
+const QE_REPORT_CERTIFICATION_DATA_TYPE: u16 = 6;
+const PCK_CERTIFICATE_CHAIN_DATA_TYPE: u16 = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
@@ -62,6 +83,9 @@ pub enum QuoteRequestError {
     #[error("dstack quote is not an Intel TDX v4 quote")]
     InvalidQuoteHeader,
 
+    #[error("dstack quote structure is malformed or truncated: {0}")]
+    MalformedQuote(&'static str),
+
     #[error("dstack quote report_data does not match the guest-agent response")]
     QuoteReportDataMismatch,
 
@@ -90,12 +114,7 @@ impl QuoteResponse {
 /// Decode the TD10 measurement registers from a validated quote.
 pub fn quote_measurement(quote_hex: &str) -> Result<TdxMeasurement, QuoteRequestError> {
     let quote = decode_hex(quote_hex).ok_or(QuoteRequestError::InvalidQuote)?;
-    if quote.len() < QUOTE_HEADER_BYTES + 520 {
-        return Err(QuoteRequestError::QuoteTooShort {
-            actual: quote_hex.len(),
-            minimum: MIN_QUOTE_HEX_LEN,
-        });
-    }
+    validate_tdx_v4_quote(&quote)?;
     Ok(TdxMeasurement {
         mrtd: encode_hex(&quote[48 + 136..48 + 184]),
         rtmr0: encode_hex(&quote[48 + 328..48 + 376]),
@@ -111,17 +130,7 @@ pub fn quote_measurement(quote_hex: &str) -> Result<TdxMeasurement, QuoteRequest
 /// quote carries the expected ScrapeProof binding.
 pub fn quote_report_data(quote_hex: &str) -> Result<String, QuoteRequestError> {
     let quote = decode_hex(quote_hex).ok_or(QuoteRequestError::InvalidQuote)?;
-    if quote.len() < QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES {
-        return Err(QuoteRequestError::QuoteTooShort {
-            actual: quote_hex.len(),
-            minimum: MIN_QUOTE_HEX_LEN,
-        });
-    }
-    if u16::from_le_bytes([quote[0], quote[1]]) != QUOTE_VERSION
-        || u32::from_le_bytes([quote[4], quote[5], quote[6], quote[7]]) != TDX_TEE_TYPE
-    {
-        return Err(QuoteRequestError::InvalidQuoteHeader);
-    }
+    validate_tdx_v4_quote(&quote)?;
     Ok(encode_hex(
         &quote[QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET
             ..QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES],
@@ -205,19 +214,7 @@ fn validate_quote_response(
         return Err(QuoteRequestError::MissingField("vm_config"));
     }
     let quote = decode_hex(&response.quote).ok_or(QuoteRequestError::InvalidQuote)?;
-    let quote_hex_len = response.quote.len();
-    if quote_hex_len < MIN_QUOTE_HEX_LEN {
-        return Err(QuoteRequestError::QuoteTooShort {
-            actual: quote_hex_len,
-            minimum: MIN_QUOTE_HEX_LEN,
-        });
-    }
-    if quote.len() < QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES
-        || u16::from_le_bytes([quote[0], quote[1]]) != QUOTE_VERSION
-        || u32::from_le_bytes([quote[4], quote[5], quote[6], quote[7]]) != TDX_TEE_TYPE
-    {
-        return Err(QuoteRequestError::InvalidQuoteHeader);
-    }
+    validate_tdx_v4_quote(&quote)?;
     let embedded_report_data = quote_report_data(&response.quote)?;
     response.quote = encode_hex(&quote);
     response.report_data = response.report_data.to_ascii_lowercase();
@@ -231,6 +228,132 @@ fn validate_quote_response(
         return Err(QuoteRequestError::QuoteReportDataMismatch);
     }
     Ok(response)
+}
+
+fn validate_tdx_v4_quote(quote: &[u8]) -> Result<(), QuoteRequestError> {
+    if quote.len() < MIN_QUOTE_BYTES {
+        return Err(QuoteRequestError::QuoteTooShort {
+            actual: quote.len() * 2,
+            minimum: MIN_QUOTE_HEX_LEN,
+        });
+    }
+    if u16::from_le_bytes([quote[0], quote[1]]) != QUOTE_VERSION
+        || u32::from_le_bytes([quote[4], quote[5], quote[6], quote[7]]) != TDX_TEE_TYPE
+    {
+        return Err(QuoteRequestError::InvalidQuoteHeader);
+    }
+
+    let signature_data_length = read_u32(quote, SIGNATURE_DATA_LENGTH_OFFSET)? as usize;
+    if signature_data_length < MIN_SIGNATURE_DATA_BYTES {
+        return Err(QuoteRequestError::MalformedQuote(
+            "signature data is too short",
+        ));
+    }
+    let declared_quote_end = SIGNATURE_DATA_OFFSET
+        .checked_add(signature_data_length)
+        .ok_or(QuoteRequestError::MalformedQuote(
+            "signature data length overflow",
+        ))?;
+    if declared_quote_end > quote.len() {
+        return Err(QuoteRequestError::MalformedQuote(
+            "declared signature data is truncated",
+        ));
+    }
+    if quote[declared_quote_end..].iter().any(|byte| *byte != 0) {
+        return Err(QuoteRequestError::MalformedQuote(
+            "non-zero bytes follow declared signature data",
+        ));
+    }
+
+    let signature_data = &quote[SIGNATURE_DATA_OFFSET..declared_quote_end];
+    let mut cursor = ECDSA_SIGNATURE_BYTES + ECDSA_ATTESTATION_KEY_BYTES;
+    let outer_type = read_u16(signature_data, cursor)?;
+    let outer_length = read_u32(signature_data, cursor + 2)? as usize;
+    if outer_type != QE_REPORT_CERTIFICATION_DATA_TYPE {
+        return Err(QuoteRequestError::MalformedQuote(
+            "signature data has no QE report certification envelope",
+        ));
+    }
+    cursor += CERTIFICATION_HEADER_BYTES;
+    let outer_end = cursor
+        .checked_add(outer_length)
+        .ok_or(QuoteRequestError::MalformedQuote(
+            "QE certification data length overflow",
+        ))?;
+    if outer_end != signature_data.len() {
+        return Err(QuoteRequestError::MalformedQuote(
+            "QE certification data length does not match signature data",
+        ));
+    }
+    if outer_length
+        < QE_REPORT_BYTES
+            + QE_REPORT_SIGNATURE_BYTES
+            + AUTHENTICATION_DATA_LENGTH_BYTES
+            + CERTIFICATION_HEADER_BYTES
+            + MIN_CERTIFICATION_DATA_BYTES
+    {
+        return Err(QuoteRequestError::MalformedQuote(
+            "QE report certification data is truncated",
+        ));
+    }
+
+    cursor += QE_REPORT_BYTES + QE_REPORT_SIGNATURE_BYTES;
+    let authentication_data_length = read_u16(signature_data, cursor)? as usize;
+    cursor += AUTHENTICATION_DATA_LENGTH_BYTES;
+    cursor =
+        cursor
+            .checked_add(authentication_data_length)
+            .ok_or(QuoteRequestError::MalformedQuote(
+                "authentication data length overflow",
+            ))?;
+    if cursor + CERTIFICATION_HEADER_BYTES > outer_end {
+        return Err(QuoteRequestError::MalformedQuote(
+            "authentication data is truncated",
+        ));
+    }
+    let certification_type = read_u16(signature_data, cursor)?;
+    let certification_data_length = read_u32(signature_data, cursor + 2)? as usize;
+    if certification_type != PCK_CERTIFICATE_CHAIN_DATA_TYPE {
+        return Err(QuoteRequestError::MalformedQuote(
+            "QE report has no PCK certificate-chain data",
+        ));
+    }
+    if certification_data_length < MIN_CERTIFICATION_DATA_BYTES {
+        return Err(QuoteRequestError::MalformedQuote(
+            "PCK certification data is empty",
+        ));
+    }
+    cursor += CERTIFICATION_HEADER_BYTES;
+    let certification_end =
+        cursor
+            .checked_add(certification_data_length)
+            .ok_or(QuoteRequestError::MalformedQuote(
+                "PCK certification data length overflow",
+            ))?;
+    if certification_end != outer_end {
+        return Err(QuoteRequestError::MalformedQuote(
+            "PCK certification data is truncated or has trailing bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn read_u16(value: &[u8], offset: usize) -> Result<u16, QuoteRequestError> {
+    let bytes = value
+        .get(offset..offset + 2)
+        .ok_or(QuoteRequestError::MalformedQuote(
+            "missing two-byte length or type field",
+        ))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(value: &[u8], offset: usize) -> Result<u32, QuoteRequestError> {
+    let bytes = value
+        .get(offset..offset + 4)
+        .ok_or(QuoteRequestError::MalformedQuote(
+            "missing four-byte length field",
+        ))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn is_empty_json(value: &Value) -> bool {
