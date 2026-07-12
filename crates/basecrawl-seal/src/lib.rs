@@ -12,6 +12,10 @@
 //!   scrape target (VAL-CONF-013), complementing the in-process rustls TLS 1.3
 //!   terminator that already keeps HTTP application data off the host wire
 //!   (VAL-CONF-014);
+//! * **sealed browser DNS isolation** — an in-process SOCKS5 CONNECT proxy
+//!   that resolves domain names only through the DoH pin and is required by
+//!   headless Chromium via `--proxy-server=socks5://…`, failing closed if the
+//!   proxy cannot be established (VAL-CONF-013 residual for render/screenshot);
 //! * **result sealing to the validator committee threshold public key** —
 //!   the ScrapeProof result body is sealed to the committee, never to the
 //!   miner, so the host-visible sealed-result payload stays opaque ciphertext
@@ -45,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser_dns;
 pub mod dns;
 pub mod error;
 pub mod identity;
@@ -53,6 +58,10 @@ pub mod redact;
 pub mod result;
 pub mod task;
 
+pub use browser_dns::{
+    chrome_dns_isolation_proxy_arg, document_host_needs_sealed_resolve, global_sealed_socks_proxy,
+    preflight_document_dns, SealedSocksProxy, SEALED_BROWSER_DNS_MARKER,
+};
 pub use dns::{
     build_query, is_loopback_name, parse_answers, resolve_for_connect, NameResolver,
     PinnedResolver, ResolveResult, ResolverEndpoint, ResolverMode, DEFAULT_DOH_ENDPOINT,

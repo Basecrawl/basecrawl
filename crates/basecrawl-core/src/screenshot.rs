@@ -32,6 +32,7 @@ pub fn capture_until(
             Error::Timeout("scrape deadline exceeded while waiting for crawl delay".to_string())
         }
         RenderError::ResourceBudgetExceeded => Error::ResourceBudgetExceeded,
+        RenderError::DnsIsolation(detail) => Error::DnsIsolation(detail),
         RenderError::DocumentPolicyDenied(detail) => Error::from_document_policy_denial(detail),
         error => Error::Render(error.to_string()),
     })

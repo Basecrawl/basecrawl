@@ -51,6 +51,7 @@ pub fn render_page_until(
             "scrape deadline exceeded while waiting for crawl delay".to_string(),
         )),
         Err(RenderError::ResourceBudgetExceeded) => Err(Error::ResourceBudgetExceeded),
+        Err(RenderError::DnsIsolation(detail)) => Err(Error::DnsIsolation(detail)),
         Err(RenderError::DocumentPolicyDenied(detail)) => {
             Err(Error::from_document_policy_denial(detail))
         }

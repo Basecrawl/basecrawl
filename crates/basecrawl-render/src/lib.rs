@@ -77,6 +77,11 @@ pub enum RenderError {
     ChromeNotFound,
     #[error("failed to launch headless browser: {0}")]
     Launch(String),
+    /// Sealed browser DNS (DoH → SOCKS5) could not be established before Chromium start.
+    ///
+    /// Fail-closed for VAL-CONF-013: render must never fall back to host system DNS.
+    #[error("sealed browser DNS isolation failed: {0}")]
+    DnsIsolation(String),
     #[error("failed to render page: {0}")]
     Render(String),
     #[error("render timed out after {0:?}: the page never reached network idle")]
@@ -809,24 +814,46 @@ fn declared_content_length(headers: &[Fetch::HeaderEntry]) -> Option<u64> {
 /// same static page produce byte-identical pixels (screenshot determinism), while
 /// `--disable-dev-shm-usage`/`--disable-gpu` keep Chromium stable in a container. Sandbox is
 /// disabled because the crawler runs as root. The returned browser is killed when dropped.
+///
+/// # DNS isolation (VAL-CONF-013)
+///
+/// Every Chromium launch is forced through an in-process sealed SOCKS5 proxy that resolves
+/// domain names exclusively via pin-by-IP DoH (`basecrawl_seal::PinnedResolver`) and dials
+/// targets by IP. Chromium hands hostnames to the SOCKS proxy (ATYP=domain) rather than the
+/// host stub for navigated origins. If the sealed SOCKS path cannot be established, launch
+/// fails closed with [`RenderError::DnsIsolation`] and no Chromium target is created.
 fn launch_browser(
     deadline: Instant,
     timeout: Duration,
     window_size: (u32, u32),
 ) -> Result<Browser, RenderError> {
     let chrome = resolve_chrome().ok_or(RenderError::ChromeNotFound)?;
+    let proxy = basecrawl_seal::global_sealed_socks_proxy().map_err(|error| {
+        RenderError::DnsIsolation(format!(
+            "could not establish sealed DoH SOCKS path before Chromium launch ({error})"
+        ))
+    })?;
+    // Owned String: LaunchOptions takes `&str` for proxy_server but we must keep storage alive
+    // for the duration of `Browser::new_with_deadline`.
+    let proxy_server = proxy.proxy_server_arg();
+    // Bypass SOCKS for loopback only so local fixtures / CDP keep working without a sealed
+    // resolve. Every non-loopback hostname still reaches the sealed SOCKS path, which resolves
+    // via pin-by-IP DoH and dials by IP (VAL-CONF-013 for render/screenshot).
+    let proxy_bypass = "--proxy-bypass-list=127.0.0.1;localhost;::1";
     let args: Vec<&OsStr> = vec![
         OsStr::new("--disable-dev-shm-usage"),
         OsStr::new("--disable-gpu"),
         OsStr::new("--hide-scrollbars"),
         OsStr::new("--force-color-profile=srgb"),
         OsStr::new("--font-render-hinting=none"),
+        OsStr::new(proxy_bypass),
     ];
     let options = LaunchOptions::default_builder()
         .path(Some(chrome))
         .headless(true)
         .sandbox(false)
         .window_size(Some(window_size))
+        .proxy_server(Some(proxy_server.as_str()))
         .args(args)
         .idle_browser_timeout(remaining(deadline, timeout)?)
         .build()
@@ -834,6 +861,48 @@ fn launch_browser(
 
     Browser::new_with_deadline(options, deadline)
         .map_err(|error| RenderError::Launch(error.to_string()))
+}
+
+/// Fail-closed preflight: resolve the document hostname through sealed DoH **before** any
+/// Chromium target/navigation is created. IP literals and loopback names short-circuit.
+fn preflight_sealed_document_dns(url: &Url, deadline: Instant) -> Result<(), RenderError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| RenderError::DnsIsolation("document URL has no host".into()))?;
+    if !basecrawl_seal::document_host_needs_sealed_resolve(host) {
+        return Ok(());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| RenderError::DnsIsolation("document URL has no port".into()))?;
+    let remaining = remaining_or_dns(deadline)?;
+    basecrawl_seal::preflight_document_dns(
+        host,
+        port,
+        Instant::now() + remaining,
+        &basecrawl_seal::PinnedResolver::doh(),
+    )
+    .map_err(|error| {
+        RenderError::DnsIsolation(format!(
+            "sealed DoH preflight for browser document failed ({error})"
+        ))
+    })?;
+    // Also ensure the SOCKS path is up before Browser::new so launch cannot race a Fail-open DNS.
+    let _ = basecrawl_seal::global_sealed_socks_proxy().map_err(|error| {
+        RenderError::DnsIsolation(format!(
+            "sealed browser SOCKS unavailable before target creation ({error})"
+        ))
+    })?;
+    Ok(())
+}
+
+fn remaining_or_dns(deadline: Instant) -> Result<Duration, RenderError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| {
+            RenderError::DnsIsolation("deadline expired before sealed DNS preflight".into())
+        })
 }
 
 /// In-page finalize script: inline embedded content, clean, and serialize (a single CDP round-trip).
@@ -1021,6 +1090,8 @@ pub fn render_until(
         RenderResourceBudget::new(config.max_subresources, config.max_resource_bytes)
     });
     resource_budget.ensure_available()?;
+    // VAL-CONF-013: sealed DoH preflight + SOCKS readiness before any Chromium target exists.
+    preflight_sealed_document_dns(url, deadline)?;
     let browser = launch_browser(deadline, config.timeout, (1280, 800))?;
     let tab = browser
         .new_tab()
@@ -1486,6 +1557,8 @@ pub fn screenshot_until(
         RenderResourceBudget::new(config.max_subresources, config.max_resource_bytes)
     });
     resource_budget.ensure_available()?;
+    // VAL-CONF-013: sealed DoH preflight + SOCKS readiness before any Chromium target exists.
+    preflight_sealed_document_dns(url, deadline)?;
     let browser = launch_browser(deadline, config.timeout, (config.width, config.height))?;
     let tab = browser
         .new_tab()

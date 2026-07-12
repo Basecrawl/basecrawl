@@ -91,6 +91,10 @@ pub enum Error {
     #[error("html render failed: {0}")]
     Render(String),
 
+    /// Sealed browser DoH/SOCKS DNS isolation could not be established (VAL-CONF-013 fail-closed).
+    #[error("sealed browser DNS isolation failed: {0}")]
+    DnsIsolation(String),
+
     #[error("the scrape-owned browser request or byte budget was exhausted")]
     ResourceBudgetExceeded,
 
@@ -133,6 +137,7 @@ impl Error {
             Error::Redirect(_) => "redirect_error",
             Error::Fetch(_) => "fetch_error",
             Error::Render(_) => "render_error",
+            Error::DnsIsolation(_) => "dns_isolation",
             Error::ResourceBudgetExceeded => "resource_budget_exceeded",
             Error::DocumentExtraction(_) => "document_extraction",
             Error::EgressMetadata(_) => "egress_metadata_error",
@@ -263,6 +268,7 @@ impl Error {
             Error::Transport(_)
             | Error::Fetch(_)
             | Error::Render(_)
+            | Error::DnsIsolation(_)
             | Error::Timeout(_)
             | Error::CertificateValidation(_)
             | Error::TlsCapture(_)
