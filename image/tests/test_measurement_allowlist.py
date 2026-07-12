@@ -199,6 +199,139 @@ class MeasurementAllowlistTests(unittest.TestCase):
                     app_compose_path=APP_COMPOSE_PATH,
                 )
 
+    def test_malformed_live_identity_values_fail_with_structured_error(self) -> None:
+        malformed_values = (None, "", "   ", 7, ["nested"], {"nested": "value"})
+        for field in ("app_id", "cvm_name"):
+            for malformed in malformed_values:
+                with self.subTest(field=field, malformed=malformed):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+                        record = json.loads(RECONCILIATION_PATH.read_text())
+                        record["live_evidence"][0][field] = malformed
+                        path = root / "measurement-reconciliation.json"
+                        path.write_text(json.dumps(record))
+                        with self.assertRaisesRegex(
+                            measurements.MeasurementAllowlistError,
+                            rf"live_evidence\[0\]\.{field} must be a non-empty string",
+                        ):
+                            measurements.validate_reconciliation(
+                                path,
+                                allowlist_path=ALLOWLIST_PATH,
+                                app_compose_path=APP_COMPOSE_PATH,
+                            )
+
+    def test_malformed_summary_cvm_id_fails_before_uniqueness_check(self) -> None:
+        for malformed in (None, "", "   ", 7, ["nested"], {"nested": "value"}):
+            with self.subTest(malformed=malformed):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+                    record = json.loads(RECONCILIATION_PATH.read_text())
+                    record["reconciliation_deployments"]["first"]["cvm_id"] = malformed
+                    path = root / "measurement-reconciliation.json"
+                    path.write_text(json.dumps(record))
+                    with self.assertRaisesRegex(
+                        measurements.MeasurementAllowlistError,
+                        (
+                            "reconciliation_deployments.first.cvm_id "
+                            "must be a non-empty string"
+                        ),
+                    ):
+                        measurements.validate_reconciliation(
+                            path,
+                            allowlist_path=ALLOWLIST_PATH,
+                            app_compose_path=APP_COMPOSE_PATH,
+                        )
+
+    def test_protected_identity_is_rejected_from_every_deployment(self) -> None:
+        mutations = (
+            ("app_id", measurements.PROTECTED_CVM_NAME),
+            ("cvm_name", measurements.PROTECTED_CVM_NAME),
+        )
+        for field, protected in mutations:
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+                    record = json.loads(RECONCILIATION_PATH.read_text())
+                    record["live_evidence"][0][field] = protected
+                    path = root / "measurement-reconciliation.json"
+                    path.write_text(json.dumps(record))
+                    with self.assertRaisesRegex(
+                        measurements.MeasurementAllowlistError,
+                        "protected CVM identity",
+                    ):
+                        measurements.validate_reconciliation(
+                            path,
+                            allowlist_path=ALLOWLIST_PATH,
+                            app_compose_path=APP_COMPOSE_PATH,
+                        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            record["reconciliation_deployments"]["first"]["cvm_id"] = (
+                measurements.PROTECTED_CVM_ID
+            )
+            path = root / "measurement-reconciliation.json"
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "protected CVM identity",
+            ):
+                measurements.validate_reconciliation(
+                    path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_protected_identity_is_rejected_from_deletion_records(self) -> None:
+        deployment = {
+            "cvm_id": "cvm_mission",
+            "cvm_name": "basecrawl-mission",
+        }
+        event = {
+            "request": {
+                "cvm_id": measurements.PROTECTED_CVM_ID,
+                "cvm_name": measurements.PROTECTED_CVM_NAME,
+                "operation": "phala cvms delete",
+            },
+            "response": {
+                "cvm_id": measurements.PROTECTED_CVM_ID,
+                "deleted": True,
+                "status": "deleted",
+            },
+        }
+        with self.assertRaisesRegex(
+            measurements.MeasurementAllowlistError,
+            "protected CVM identity",
+        ):
+            measurements._validate_deletion_event(event, deployment=deployment)
+
+    def test_mission_and_protected_inventories_are_disjoint_by_id_and_name(
+        self,
+    ) -> None:
+        deployment = {
+            "app_id": "app_mission",
+            "cvm_id": "cvm_mission",
+            "cvm_name": "basecrawl-mission",
+        }
+        measurements._validate_mission_protected_disjoint([deployment])
+        for field, protected in (
+            ("cvm_id", measurements.PROTECTED_CVM_ID),
+            ("cvm_name", measurements.PROTECTED_CVM_NAME),
+        ):
+            with self.subTest(field=field):
+                overlapping = copy.deepcopy(deployment)
+                overlapping[field] = protected
+                with self.assertRaisesRegex(
+                    measurements.MeasurementAllowlistError,
+                    "mission-owned and protected CVM inventories overlap",
+                ):
+                    measurements._validate_mission_protected_disjoint([overlapping])
+
     def test_current_compose_artifacts_are_bound_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -222,28 +355,33 @@ class MeasurementAllowlistTests(unittest.TestCase):
                 )
 
     def test_cleanup_is_scoped_to_exact_deployments_and_protected_cvm(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
-            record = json.loads(RECONCILIATION_PATH.read_text())
-            inventory_path = root / record["cleanup"]["inventory_path"]
-            inventory = json.loads(inventory_path.read_text())
-            inventory["deleted_mission_cvms"].append("cvm_MeD2Y9wQ")
-            inventory_path.write_text(json.dumps(inventory))
-            measurements.write_evidence_manifest(
-                root / record["evidence_bundle"]["manifest_path"]
-            )
-            path = root / "measurement-reconciliation.json"
-            path.write_text(json.dumps(record))
-            with self.assertRaisesRegex(
-                measurements.MeasurementAllowlistError,
-                "cleanup",
-            ):
-                measurements.validate_reconciliation(
-                    path,
-                    allowlist_path=ALLOWLIST_PATH,
-                    app_compose_path=APP_COMPOSE_PATH,
-                )
+        for protected in (
+            measurements.PROTECTED_CVM_ID,
+            measurements.PROTECTED_CVM_NAME,
+        ):
+            with self.subTest(protected=protected):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+                    record = json.loads(RECONCILIATION_PATH.read_text())
+                    inventory_path = root / record["cleanup"]["inventory_path"]
+                    inventory = json.loads(inventory_path.read_text())
+                    inventory["deleted_mission_cvms"].append(protected)
+                    inventory_path.write_text(json.dumps(inventory))
+                    measurements.write_evidence_manifest(
+                        root / record["evidence_bundle"]["manifest_path"]
+                    )
+                    path = root / "measurement-reconciliation.json"
+                    path.write_text(json.dumps(record))
+                    with self.assertRaisesRegex(
+                        measurements.MeasurementAllowlistError,
+                        "protected CVM identity",
+                    ):
+                        measurements.validate_reconciliation(
+                            path,
+                            allowlist_path=ALLOWLIST_PATH,
+                            app_compose_path=APP_COMPOSE_PATH,
+                        )
 
     def test_execution_record_covers_full_redacted_lifecycle(self) -> None:
         record = measurements.validate_reconciliation(

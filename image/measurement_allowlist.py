@@ -113,6 +113,57 @@ class MeasurementAllowlistError(ValueError):
     """The validator measurement configuration is malformed or inconsistent."""
 
 
+def _validate_identity_value(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise MeasurementAllowlistError(f"{label} must be a non-empty string")
+    return value
+
+
+def _reject_protected_identity(value: str, *, label: str) -> None:
+    if value in {PROTECTED_CVM_ID, PROTECTED_CVM_NAME}:
+        raise MeasurementAllowlistError(
+            f"{label} contains protected CVM identity {value}"
+        )
+
+
+def _validate_deployment_identity(
+    value: Mapping[str, Any],
+    *,
+    label: str,
+    fields: tuple[str, ...] = ("app_id", "cvm_id", "cvm_name"),
+) -> dict[str, str]:
+    identity: dict[str, str] = {}
+    for field in fields:
+        item = _validate_identity_value(value.get(field), label=f"{label}.{field}")
+        _reject_protected_identity(item, label=f"{label}.{field}")
+        identity[field] = item
+    return identity
+
+
+def _validate_mission_protected_disjoint(
+    deployments: Iterable[Mapping[str, Any]],
+) -> None:
+    mission_ids: set[str] = set()
+    mission_names: set[str] = set()
+    for index, deployment in enumerate(deployments):
+        mission_ids.add(
+            _validate_identity_value(
+                deployment.get("cvm_id"),
+                label=f"mission_owned_cvms[{index}].cvm_id",
+            )
+        )
+        mission_names.add(
+            _validate_identity_value(
+                deployment.get("cvm_name"),
+                label=f"mission_owned_cvms[{index}].cvm_name",
+            )
+        )
+    if PROTECTED_CVM_ID in mission_ids or PROTECTED_CVM_NAME in mission_names:
+        raise MeasurementAllowlistError(
+            "mission-owned and protected CVM inventories overlap"
+        )
+
+
 def _canonical_json_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -574,16 +625,19 @@ def validate_reconciliation(
         raise MeasurementAllowlistError(
             "exactly two live evidence records are required"
         )
-    app_ids = [
-        evidence.get("app_id")
-        for evidence in live_evidence
-        if isinstance(evidence, Mapping)
-    ]
-    cvm_names = [
-        evidence.get("cvm_name")
-        for evidence in live_evidence
-        if isinstance(evidence, Mapping)
-    ]
+    live_identities: list[dict[str, str]] = []
+    for index, evidence in enumerate(live_evidence):
+        if not isinstance(evidence, Mapping):
+            raise MeasurementAllowlistError(f"live_evidence[{index}] must be an object")
+        live_identities.append(
+            _validate_deployment_identity(
+                evidence,
+                label=f"live_evidence[{index}]",
+                fields=("app_id", "cvm_name"),
+            )
+        )
+    app_ids = [identity["app_id"] for identity in live_identities]
+    cvm_names = [identity["cvm_name"] for identity in live_identities]
     if len(set(app_ids)) != 2 or len(set(cvm_names)) != 2:
         raise MeasurementAllowlistError("live evidence deployments are not independent")
     deployment_summaries = _validate_deployment_summaries(
@@ -608,16 +662,26 @@ def validate_reconciliation(
             raise MeasurementAllowlistError(
                 f"deployment {field} values are not independent"
             )
+    _validate_mission_protected_disjoint(deployment_records)
     replay_record = record.get("live_event_replay")
     if not isinstance(replay_record, Mapping) or not isinstance(
         replay_record.get("evidence"), list
     ):
         raise MeasurementAllowlistError("per-CVM RTMR3 replay evidence is missing")
-    replay_by_name = {
-        item.get("cvm_name"): item
-        for item in replay_record["evidence"]
-        if isinstance(item, Mapping)
-    }
+    replay_by_name: dict[str, Mapping[str, Any]] = {}
+    for index, item in enumerate(replay_record["evidence"]):
+        if not isinstance(item, Mapping):
+            raise MeasurementAllowlistError(
+                f"RTMR3 replay record {index} must be an object"
+            )
+        cvm_name = _validate_deployment_identity(
+            item,
+            label=f"live_event_replay.evidence[{index}]",
+            fields=("cvm_name",),
+        )["cvm_name"]
+        if cvm_name in replay_by_name:
+            raise MeasurementAllowlistError("RTMR3 replay records are not independent")
+        replay_by_name[cvm_name] = item
     if len(replay_by_name) != 2:
         raise MeasurementAllowlistError("RTMR3 replay records are not independent")
     for evidence in live_evidence:
@@ -664,6 +728,25 @@ def validate_reconciliation(
         if isinstance(cleanup_inventory, Mapping)
         else None
     )
+    if isinstance(deleted, list):
+        for index, cvm_name in enumerate(deleted):
+            name = _validate_identity_value(
+                cvm_name,
+                label=f"cleanup.deleted_mission_cvms[{index}]",
+            )
+            _reject_protected_identity(
+                name,
+                label=f"cleanup.deleted_mission_cvms[{index}]",
+            )
+    if isinstance(protected, Mapping):
+        _validate_identity_value(
+            protected.get("cvm_id"),
+            label="cleanup.protected_user_cvm.cvm_id",
+        )
+        _validate_identity_value(
+            protected.get("cvm_name"),
+            label="cleanup.protected_user_cvm.cvm_name",
+        )
     if (
         cleanup.get("mission_owned_cvm_total_after_cleanup") != 0
         or cleanup.get("account_cvm_total_after_cleanup") != 1
@@ -674,7 +757,6 @@ def validate_reconciliation(
         or not isinstance(deleted, list)
         or len(deleted) != 2
         or set(deleted) != expected_deleted
-        or PROTECTED_CVM_ID in deleted
         or not isinstance(protected, Mapping)
         or protected.get("cvm_id") != PROTECTED_CVM_ID
         or protected.get("cvm_name") != PROTECTED_CVM_NAME
@@ -716,9 +798,16 @@ def _validate_deployment_summaries(
     for index, name in enumerate(("first", "second")):
         summary = value.get(name)
         evidence = live_evidence[index]
+        if not isinstance(summary, Mapping):
+            raise MeasurementAllowlistError(
+                f"reconciliation deployment summary {name} drift"
+            )
+        _validate_deployment_identity(
+            summary,
+            label=f"reconciliation_deployments.{name}",
+        )
         if (
-            not isinstance(summary, Mapping)
-            or set(summary) != DEPLOYMENT_SUMMARY_FIELDS
+            set(summary) != DEPLOYMENT_SUMMARY_FIELDS
             or not isinstance(evidence, Mapping)
             or summary.get("app_id") != evidence.get("app_id")
             or summary.get("cvm_name") != evidence.get("cvm_name")
@@ -729,8 +818,6 @@ def _validate_deployment_summaries(
             or summary.get("requested_node_id") is not None
             or summary.get("image_ref") != APPLICATION_IMAGE_REF
             or summary.get("compose_hash") != canonical["compose_hash"]
-            or not isinstance(summary.get("cvm_id"), str)
-            or not summary.get("cvm_id")
             or not isinstance(summary.get("vm_uuid"), str)
             or not summary.get("vm_uuid")
         ):
@@ -881,6 +968,10 @@ def _validate_execution_record(
         identities = event["identities"]
         if deployment_name is not None:
             deployment = deployment_by_name[deployment_name]
+            _validate_deployment_identity(
+                identities,
+                label=f"execution.events[{index}].identities",
+            )
             for field in ("app_id", "cvm_id", "cvm_name", "vm_uuid"):
                 if identities.get(field) != deployment[field]:
                     raise MeasurementAllowlistError(
@@ -1008,6 +1099,11 @@ def _validate_deployment_result(
     deployment: Mapping[str, Any],
 ) -> None:
     response = event.get("response")
+    if isinstance(response, Mapping):
+        _validate_deployment_identity(
+            response,
+            label="execution.deployment_result.response",
+        )
     if (
         not isinstance(response, Mapping)
         or set(response) != {"app_id", "created", "cvm_id", "cvm_name", "vm_uuid"}
@@ -1119,6 +1215,18 @@ def _validate_deletion_event(
 ) -> None:
     request = event.get("request")
     response = event.get("response")
+    if isinstance(request, Mapping):
+        _validate_deployment_identity(
+            request,
+            label="execution.deletion.request",
+            fields=("cvm_id", "cvm_name"),
+        )
+    if isinstance(response, Mapping):
+        _validate_deployment_identity(
+            response,
+            label="execution.deletion.response",
+            fields=("cvm_id",),
+        )
     if (
         not isinstance(request, Mapping)
         or set(request) != {"cvm_id", "cvm_name", "operation"}
@@ -1136,6 +1244,28 @@ def _validate_deletion_event(
 
 def _validate_final_inventory_event(event: Mapping[str, Any]) -> None:
     response = event.get("response")
+    if isinstance(response, Mapping):
+        mission_owned_cvm_ids = response.get("mission_owned_cvm_ids")
+        if isinstance(mission_owned_cvm_ids, list):
+            for index, value in enumerate(mission_owned_cvm_ids):
+                cvm_id = _validate_identity_value(
+                    value,
+                    label=f"execution.final_inventory.mission_owned_cvm_ids[{index}]",
+                )
+                _reject_protected_identity(
+                    cvm_id,
+                    label=f"execution.final_inventory.mission_owned_cvm_ids[{index}]",
+                )
+        protected_cvm = response.get("protected_cvm")
+        if isinstance(protected_cvm, Mapping):
+            _validate_identity_value(
+                protected_cvm.get("cvm_id"),
+                label="execution.final_inventory.protected_cvm.cvm_id",
+            )
+            _validate_identity_value(
+                protected_cvm.get("cvm_name"),
+                label="execution.final_inventory.protected_cvm.cvm_name",
+            )
     if (
         not isinstance(response, Mapping)
         or set(response)
@@ -1349,7 +1479,7 @@ def _validate_live_evidence(
         else None
     )
     app_id = evidence.get("app_id")
-    if not isinstance(app_id, str) or not isinstance(certificates, list):
+    if not isinstance(certificates, list):
         raise MeasurementAllowlistError(
             f"live_evidence[{index}] certificate binding is missing"
         )
@@ -1438,11 +1568,28 @@ def _validate_live_evidence(
         )
     info = _load_json(info_file, "live /Info")
     deployment = _load_json(deployment_file, "deployment record")
+    if not isinstance(info, Mapping):
+        raise MeasurementAllowlistError(f"live_evidence[{index}] /Info identity drift")
+    _validate_deployment_identity(
+        {
+            "app_id": info.get("app_id"),
+            "cvm_id": info.get("id"),
+            "cvm_name": info.get("name"),
+        },
+        label=f"live_evidence[{index}].info",
+    )
+    if not isinstance(deployment, Mapping):
+        raise MeasurementAllowlistError(
+            f"live_evidence[{index}] deployment record drift"
+        )
+    _validate_deployment_identity(
+        deployment,
+        label=f"live_evidence[{index}].deployment",
+    )
     os_info = info.get("os") if isinstance(info, Mapping) else None
     resource = info.get("resource") if isinstance(info, Mapping) else None
     if (
-        not isinstance(info, Mapping)
-        or info.get("status") != "running"
+        info.get("status") != "running"
         or info.get("app_id") != app_id
         or info.get("name") != evidence.get("cvm_name")
         or info.get("id") != deployment_summary.get("cvm_id")
@@ -1461,8 +1608,7 @@ def _validate_live_evidence(
     ):
         raise MeasurementAllowlistError(f"live_evidence[{index}] /Info identity drift")
     if (
-        not isinstance(deployment, Mapping)
-        or set(deployment) != DEPLOYMENT_FIELDS
+        set(deployment) != DEPLOYMENT_FIELDS
         or deployment.get("app_id") != app_id
         or deployment.get("cvm_name") != evidence.get("cvm_name")
         or deployment.get("cvm_id") != info.get("id")
