@@ -1,8 +1,16 @@
 {
   "artifacts": [
     {
+      "path": "evidence/m2/build/build-1.history.json",
+      "sha256": "06cf2b34422abfa406308a65dcefd9a1fce83df8f66b3536d28bfff8b7e81483"
+    },
+    {
       "path": "evidence/m2/build/build-1.metadata.json",
       "sha256": "2ef2e4c13f0d61cb5060e060a4fb5cd38af94d5410bd97ca394bf9ab3a76df52"
+    },
+    {
+      "path": "evidence/m2/build/build-2.history.json",
+      "sha256": "eebec0102d06e559693b696f3c11091f4f6bb054e0a4df85a422502b07e46ec8"
     },
     {
       "path": "evidence/m2/build/build-2.metadata.json",

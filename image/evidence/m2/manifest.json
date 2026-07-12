@@ -1,6 +1,8 @@
 {
   "files": {
+    "build/build-1.history.json": "06cf2b34422abfa406308a65dcefd9a1fce83df8f66b3536d28bfff8b7e81483",
     "build/build-1.metadata.json": "2ef2e4c13f0d61cb5060e060a4fb5cd38af94d5410bd97ca394bf9ab3a76df52",
+    "build/build-2.history.json": "eebec0102d06e559693b696f3c11091f4f6bb054e0a4df85a422502b07e46ec8",
     "build/build-2.metadata.json": "f2530cf56c6e1e9abfde5259f4fa899f01273ffdd0a225e0047977ca65883a59",
     "build/build-command.json": "44f9b6fcf92d7183e09e69f2e8871434abf0cfeac26fb3cac3652f3b05bffcd3",
     "build/publish.metadata.json": "167c371ae24075954c5f8f7b92af60d9c4874eaa229e282f283d69162e675bb4",
@@ -23,7 +25,7 @@
     "deployments/second/event-log.json": "fb5487c8dc213f55d044553728a442754063ea916c45a8b55d7492aaecb56ada",
     "deployments/second/info.json": "bc196e4621a4e3cd5dc3769db444d432150c1a780bdf691bf5226978879c69f7",
     "deployments/second/quote.hex": "37cb987e99a8296ffb73073ec302b36b24e195b6bd35192392a7096a5113477e",
-    "execution/reconciliation.json": "668998cf4c66c9836b86b40721e7d326cfe0c90929a636e0471b4465ef413052",
+    "execution/reconciliation.json": "c0b49f87e8e674ea84109bcfb5adcbb5b585668a12e92f40ca36fc43726261bc",
     "measurement/dstack-mr-invocation.json": "92121d3b528c19fcf08661a0f0949be802590274a2313a82fc35e054f3bbaf2a",
     "measurement/dstack-mr-output.json": "bad10fca4371bc867cca359aeb7e74cccae282fbeec13240f19ee90a96027c24"
   },

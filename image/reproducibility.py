@@ -325,10 +325,191 @@ def build_once(*, output: Path, metadata: Path) -> str:
 _BUILDKIT_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/){2}[A-Za-z0-9_-]{8,}$")
 
 
+def _inspect_buildkit_reference(build_ref: str) -> tuple[int, str, str]:
+    """Resolve a retained reference through the local BuildKit history store."""
+
+    process = subprocess.run(
+        [
+            "docker",
+            "buildx",
+            "history",
+            "inspect",
+            "--format",
+            "json",
+            build_ref,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return process.returncode, process.stdout, process.stderr
+
+
+def _validate_buildkit_history(
+    history: dict[str, Any],
+    *,
+    build_ref: str,
+    digest: str,
+    invocation: dict[str, Any],
+    materials: Any,
+    index: int,
+) -> None:
+    """Bind a BuildKit reference to its invocation and output attachment."""
+
+    history_ref = history.get("Ref")
+    reference_id = build_ref.rsplit("/", 1)[-1]
+    if (
+        history_ref not in {build_ref, reference_id}
+        or history.get("Name") != "basecrawl/image"
+        or history.get("Context") != "basecrawl"
+        or history.get("Dockerfile") != "image/Dockerfile"
+        or history.get("Status") != "completed"
+        or not isinstance(history.get("VCSRevision"), str)
+        or not history["VCSRevision"].strip()
+    ):
+        raise ReproducibilityError(
+            f"BuildKit history[{index}] reference is not bound to the recorded "
+            "build identity",
+            code="buildkit_reference_mismatch",
+        )
+
+    environment = invocation.get("environment")
+    platform = environment.get("platform") if isinstance(environment, dict) else None
+    if history.get("Platform") != [platform]:
+        raise ReproducibilityError(
+            f"BuildKit history[{index}] invocation platform does not match metadata",
+            code="buildkit_invocation_mismatch",
+        )
+    parameters = invocation.get("parameters")
+    args = parameters.get("args") if isinstance(parameters, dict) else None
+    build_args = history.get("BuildArgs")
+    build_arg_values = {
+        item.get("Name"): item.get("Value")
+        for item in build_args
+        if isinstance(item, dict)
+    } if isinstance(build_args, list) else {}
+    config = history.get("Config")
+    if (
+        build_arg_values.get("SOURCE_DATE_EPOCH") != str(SOURCE_DATE_EPOCH)
+        or not isinstance(config, dict)
+        or config.get("NoCache") is not True
+        or config.get("SourceDateEpoch") != str(SOURCE_DATE_EPOCH)
+        or not isinstance(args, dict)
+        or args.get("build-arg:SOURCE_DATE_EPOCH") != str(SOURCE_DATE_EPOCH)
+    ):
+        raise ReproducibilityError(
+            f"BuildKit history[{index}] invocation configuration does not match metadata",
+            code="buildkit_invocation_mismatch",
+        )
+    history_materials = history.get("Materials")
+    if not isinstance(materials, list) or not isinstance(history_materials, list):
+        raise ReproducibilityError(
+            f"BuildKit history[{index}] has no verifiable material identity",
+            code="unverifiable_buildkit_reference",
+        )
+    metadata_materials: set[tuple[str, str]] = set()
+    for material in materials:
+        if (
+            not isinstance(material, dict)
+            or not isinstance(material.get("uri"), str)
+            or not isinstance(material.get("digest"), dict)
+            or not all(
+                isinstance(value, str) for value in material["digest"].values()
+            )
+        ):
+            raise ReproducibilityError(
+                f"BuildKit history[{index}] metadata materials are malformed",
+                code="unverifiable_buildkit_reference",
+            )
+        metadata_materials.update(
+            (
+                material["uri"].split("&platform=", 1)[0],
+                value.removeprefix("sha256:"),
+            )
+            for value in material["digest"].values()
+        )
+    resolved_materials: set[tuple[str, str]] = set()
+    for material in history_materials:
+        if (
+            not isinstance(material, dict)
+            or not isinstance(material.get("URI"), str)
+            or not isinstance(material.get("Digests"), list)
+            or not all(isinstance(value, str) for value in material["Digests"])
+        ):
+            raise ReproducibilityError(
+                f"BuildKit history[{index}] materials are malformed",
+                code="unverifiable_buildkit_reference",
+            )
+        resolved_materials.update(
+            (
+                material["URI"].split("&platform=", 1)[0],
+                value.removeprefix("sha256:"),
+            )
+            for value in material["Digests"]
+        )
+    if not metadata_materials.issuperset(resolved_materials):
+        raise ReproducibilityError(
+            f"BuildKit history[{index}] materials do not match metadata",
+            code="buildkit_invocation_mismatch",
+        )
+
+    attachments = history.get("Attachments")
+    if not isinstance(attachments, list) or not any(
+        isinstance(attachment, dict)
+        and attachment.get("Digest") == digest
+        and attachment.get("Type")
+        in {
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        }
+        for attachment in attachments
+    ):
+        raise ReproducibilityError(
+            f"BuildKit history[{index}] output identity does not match metadata",
+            code="buildkit_output_mismatch",
+        )
+
+
+def _resolve_buildkit_history(
+    build_ref: str,
+    *,
+    index: int,
+    history: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Load an immutable retained history record or resolve a live reference."""
+
+    if history is not None:
+        return history
+    lookup_ref = build_ref.rsplit("/", 1)[-1]
+    returncode, stdout, stderr = _inspect_buildkit_reference(lookup_ref)
+    if returncode != 0 or not stdout.strip():
+        detail = stderr.strip() or "BuildKit returned no history record"
+        raise ReproducibilityError(
+            f"BuildKit metadata[{index}] cannot resolve BuildKit reference "
+            f"{build_ref!r}: {detail}",
+            code="unresolved_buildkit_reference",
+        )
+    try:
+        resolved = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise ReproducibilityError(
+            f"BuildKit metadata[{index}] resolved reference is not valid JSON: {error}",
+            code="unverifiable_buildkit_reference",
+        ) from error
+    if not isinstance(resolved, dict):
+        raise ReproducibilityError(
+            f"BuildKit metadata[{index}] resolved reference is not an object",
+            code="unverifiable_buildkit_reference",
+        )
+    return resolved
+
+
 def validate_buildkit_metadata(
     metadata: dict[str, Any],
     expected_digest: str | None,
     index: int,
+    *,
+    history: dict[str, Any] | None = None,
 ) -> str:
     """Validate BuildKit's output digest, reference, invocation, and descriptor identity."""
 
@@ -367,6 +548,14 @@ def validate_buildkit_metadata(
             f"BuildKit metadata[{index}] has no verifiable invocation identity",
             code="invalid_buildkit_provenance",
         )
+    _validate_buildkit_history(
+        _resolve_buildkit_history(build_ref, index=index, history=history),
+        build_ref=build_ref,
+        digest=digest,
+        invocation=invocation,
+        materials=provenance.get("materials"),
+        index=index,
+    )
     args = parameters.get("args")
     locals_ = parameters.get("locals")
     if (
@@ -507,7 +696,22 @@ def _require_live_provenance(entry: dict[str, Any], index: int) -> str:
         paths[field] = path
 
     metadata = _load_json(paths["build_metadata_path"], "BuildKit metadata")
-    validate_buildkit_metadata(metadata, entry["build_digest"], index)
+    metadata_path = paths["build_metadata_path"]
+    history_path = metadata_path.with_name(
+        metadata_path.name.replace(".metadata.json", ".history.json")
+    )
+    if not history_path.is_file():
+        raise ReproducibilityError(
+            f"evidence[{index}] BuildKit history does not exist: {history_path}",
+            code="unresolved_buildkit_reference",
+        )
+    history = _load_json(history_path, "BuildKit history")
+    validate_buildkit_metadata(
+        metadata,
+        entry["build_digest"],
+        index,
+        history=history,
+    )
     build_ref = metadata["buildx.build.ref"]
     registry = subprocess.run(
         ["docker", "buildx", "imagetools", "inspect", "--raw", entry["image_ref"]],

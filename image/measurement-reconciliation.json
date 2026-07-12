@@ -65,6 +65,10 @@
       "evidence/m2/build/build-1.metadata.json",
       "evidence/m2/build/build-2.metadata.json"
     ],
+    "build_history_paths": [
+      "evidence/m2/build/build-1.history.json",
+      "evidence/m2/build/build-2.history.json"
+    ],
     "compose_file": "evidence/m2/compose/docker-compose.yml",
     "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
     "phala_app_compose": "evidence/m2/compose/phala-app-compose.json",

@@ -157,6 +157,44 @@ class MeasurementAllowlistTests(unittest.TestCase):
                         )
                     self.assertEqual(ALLOWLIST_PATH.read_bytes(), allowlist_before)
 
+    def test_buildkit_history_must_resolve_each_metadata_reference(self) -> None:
+        for mutation in ("missing", "wrong_ref", "wrong_output", "reused"):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+                    record = json.loads(RECONCILIATION_PATH.read_text())
+                    if mutation == "missing":
+                        history_path = root / record["image"]["build_history_paths"][0]
+                        history_path.unlink()
+                    else:
+                        history_path = root / record["image"]["build_history_paths"][0]
+                        history = json.loads(history_path.read_text())
+                        if mutation == "wrong_ref":
+                            history["Ref"] = "default/default/not-the-record"
+                        elif mutation == "wrong_output":
+                            history["Attachments"][0]["Digest"] = "sha256:" + "0" * 64
+                        else:
+                            second_history = root / record["image"][
+                                "build_history_paths"
+                            ][1]
+                            second_history.write_text(history_path.read_text())
+                        if mutation in {"wrong_ref", "wrong_output"}:
+                            history_path.write_text(json.dumps(history))
+                    measurements.write_evidence_manifest(
+                        root / record["evidence_bundle"]["manifest_path"]
+                    )
+                    path = root / "measurement-reconciliation.json"
+                    path.write_text(json.dumps(record))
+                    with self.assertRaises(measurements.MeasurementAllowlistError) as raised:
+                        measurements.validate_reconciliation(
+                            path,
+                            allowlist_path=ALLOWLIST_PATH,
+                            app_compose_path=APP_COMPOSE_PATH,
+                        )
+                    if mutation != "missing":
+                        self.assertIn("BuildKit", str(raised.exception))
+
     def test_deployment_identity_must_match_live_evidence_and_info(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

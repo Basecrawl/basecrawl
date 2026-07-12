@@ -46,6 +46,7 @@ APPLICATION_IMAGE_REF = (
     "57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
 )
 MEASUREMENT_QEMU_VERSION = "8.0.0"
+BUILD_SOURCE_DATE_EPOCH = "1700000000"
 PROTECTED_CVM_ID = "cvm_MeD2Y9wQ"
 PROTECTED_CVM_NAME = "dstack-app-nlv7j"
 
@@ -343,6 +344,137 @@ def _raise_entries() -> list[dict[str, str]]:
     raise MeasurementAllowlistError("every allowlist entry must be an object")
 
 
+def _validate_buildkit_history(
+    metadata: Mapping[str, Any],
+    history: Mapping[str, Any],
+    *,
+    build_digest: Any,
+    index: int,
+) -> str:
+    """Require retained history to resolve the recorded invocation and output."""
+
+    build_ref = metadata.get("buildx.build.ref")
+    provenance = metadata.get("buildx.build.provenance")
+    invocation = provenance.get("invocation") if isinstance(provenance, Mapping) else None
+    parameters = invocation.get("parameters") if isinstance(invocation, Mapping) else None
+    args = parameters.get("args") if isinstance(parameters, Mapping) else None
+    environment = (
+        invocation.get("environment") if isinstance(invocation, Mapping) else None
+    )
+    if (
+        not isinstance(build_ref, str)
+        or not build_ref.strip()
+        or not isinstance(args, Mapping)
+        or not isinstance(environment, Mapping)
+        or args.get("build-arg:SOURCE_DATE_EPOCH") != BUILD_SOURCE_DATE_EPOCH
+        or environment.get("platform") != "linux/amd64"
+    ):
+        raise MeasurementAllowlistError(
+            f"BuildKit metadata[{index}] has no verifiable invocation identity"
+        )
+    materials = provenance.get("materials") if isinstance(provenance, Mapping) else None
+    history_materials = history.get("Materials")
+    if not isinstance(materials, list) or not isinstance(history_materials, list):
+        raise MeasurementAllowlistError(
+            f"BuildKit history[{index}] has no verifiable material identity"
+        )
+    metadata_materials: set[tuple[str, str]] = set()
+    for material in materials:
+        if (
+            not isinstance(material, Mapping)
+            or not isinstance(material.get("uri"), str)
+            or not isinstance(material.get("digest"), Mapping)
+            or not all(
+                isinstance(value, str) for value in material["digest"].values()
+            )
+        ):
+            raise MeasurementAllowlistError(
+                f"BuildKit history[{index}] metadata materials are malformed"
+            )
+        metadata_materials.update(
+            (
+                material["uri"].split("&platform=", 1)[0],
+                value.removeprefix("sha256:"),
+            )
+            for value in material["digest"].values()
+        )
+    resolved_materials: set[tuple[str, str]] = set()
+    for material in history_materials:
+        if (
+            not isinstance(material, Mapping)
+            or not isinstance(material.get("URI"), str)
+            or not isinstance(material.get("Digests"), list)
+            or not all(isinstance(value, str) for value in material["Digests"])
+        ):
+            raise MeasurementAllowlistError(
+                f"BuildKit history[{index}] materials are malformed"
+            )
+        resolved_materials.update(
+            (
+                material["URI"].split("&platform=", 1)[0],
+                value.removeprefix("sha256:"),
+            )
+            for value in material["Digests"]
+        )
+    if not metadata_materials.issuperset(resolved_materials):
+        raise MeasurementAllowlistError(
+            f"BuildKit history[{index}] materials do not match metadata"
+        )
+    history_ref = history.get("Ref")
+    if (
+        history_ref not in {build_ref, build_ref.rsplit("/", 1)[-1]}
+        or history.get("Name") != "basecrawl/image"
+        or history.get("Context") != "basecrawl"
+        or history.get("Dockerfile") != "image/Dockerfile"
+        or history.get("Status") != "completed"
+        or not isinstance(history.get("VCSRevision"), str)
+        or not history["VCSRevision"].strip()
+        or history.get("Platform") != [environment["platform"]]
+    ):
+        raise MeasurementAllowlistError(
+            f"BuildKit history[{index}] does not resolve metadata reference"
+        )
+    build_args = history.get("BuildArgs")
+    build_arg_values = (
+        {
+            item.get("Name"): item.get("Value")
+            for item in build_args
+            if isinstance(item, Mapping)
+        }
+        if isinstance(build_args, list)
+        else {}
+    )
+    config = history.get("Config")
+    if (
+        build_arg_values.get("SOURCE_DATE_EPOCH") != BUILD_SOURCE_DATE_EPOCH
+        or not isinstance(config, Mapping)
+        or config.get("NoCache") is not True
+        or config.get("SourceDateEpoch") != BUILD_SOURCE_DATE_EPOCH
+    ):
+        raise MeasurementAllowlistError(
+            f"BuildKit history[{index}] invocation identity drift"
+        )
+    if not isinstance(build_digest, str):
+        raise MeasurementAllowlistError(
+            f"BuildKit metadata[{index}] output digest is malformed"
+        )
+    attachments = history.get("Attachments")
+    if not isinstance(attachments, list) or not any(
+        isinstance(attachment, Mapping)
+        and attachment.get("Digest") == build_digest
+        and attachment.get("Type")
+        in {
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        }
+        for attachment in attachments
+    ):
+        raise MeasurementAllowlistError(
+            f"BuildKit history[{index}] output identity drift"
+        )
+    return build_ref
+
+
 def allowlist_contains(
     candidate: Mapping[str, Any], entries: Iterable[Mapping[str, Any]]
 ) -> bool:
@@ -578,8 +710,16 @@ def validate_reconciliation(
         raise MeasurementAllowlistError("dstack-mr retained input/output drift")
 
     build_paths = image.get("build_metadata_paths")
-    if not isinstance(build_paths, list) or len(build_paths) != 2:
-        raise MeasurementAllowlistError("two BuildKit metadata records are required")
+    history_paths = image.get("build_history_paths")
+    if (
+        not isinstance(build_paths, list)
+        or len(build_paths) != 2
+        or not isinstance(history_paths, list)
+        or len(history_paths) != len(build_paths)
+    ):
+        raise MeasurementAllowlistError(
+            "two BuildKit metadata and history records are required"
+        )
     build_refs: set[str] = set()
     for index, metadata_value in enumerate(build_paths):
         metadata = _load_json(
@@ -590,13 +730,26 @@ def validate_reconciliation(
             ),
             "BuildKit metadata",
         )
-        build_ref = metadata.get("buildx.build.ref")
+        history = _load_json(
+            _repository_relative_path(
+                record_root,
+                history_paths[index],
+                f"image.build_history_paths[{index}]",
+            ),
+            "BuildKit history",
+        )
         if (
             metadata.get("containerimage.digest") != image.get("build_digest")
-            or not isinstance(build_ref, str)
-            or not build_ref
         ):
-            raise MeasurementAllowlistError("BuildKit metadata identity drift")
+            raise MeasurementAllowlistError(
+                "BuildKit metadata identity drift"
+            )
+        build_ref = _validate_buildkit_history(
+            metadata,
+            history,
+            build_digest=image.get("build_digest"),
+            index=index,
+        )
         build_refs.add(build_ref)
     if len(build_refs) != 2:
         raise MeasurementAllowlistError("BuildKit build references are not independent")

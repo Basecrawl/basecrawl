@@ -161,7 +161,10 @@ services:
         metadata = json.loads(
             (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
         )
-        repro.validate_buildkit_metadata(metadata, SHA256, 0)
+        history = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.history.json").read_text()
+        )
+        repro.validate_buildkit_metadata(metadata, SHA256, 0, history=history)
         for mutation in ("empty_ref", "bad_ref", "missing_provenance", "bad_output"):
             with self.subTest(mutation=mutation):
                 candidate = copy.deepcopy(metadata)
@@ -179,7 +182,83 @@ services:
                     repro.ReproducibilityError,
                     "BuildKit",
                 ):
-                    repro.validate_buildkit_metadata(candidate, SHA256, 0)
+                    repro.validate_buildkit_metadata(
+                        candidate,
+                        SHA256,
+                        0,
+                        history=history,
+                    )
+
+    def test_buildkit_reference_resolves_to_recorded_invocation_and_output(self) -> None:
+        metadata = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
+        )
+        history = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.history.json").read_text()
+        )
+        resolved = repro.validate_buildkit_metadata(
+            metadata,
+            SHA256,
+            0,
+            history=history,
+        )
+        self.assertEqual(resolved, SHA256)
+
+    def test_unresolved_buildkit_reference_is_structured_and_fail_closed(self) -> None:
+        metadata = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
+        )
+        with mock.patch.object(
+            repro,
+            "_inspect_buildkit_reference",
+            return_value=(1, "", "no record found"),
+        ):
+            with self.assertRaisesRegex(
+                repro.ReproducibilityError,
+                "cannot resolve BuildKit reference",
+            ) as raised:
+                repro.validate_buildkit_metadata(metadata, SHA256, 0)
+        self.assertEqual(raised.exception.code, "unresolved_buildkit_reference")
+
+    def test_buildkit_reference_output_mismatch_is_fail_closed(self) -> None:
+        metadata = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
+        )
+        history = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.history.json").read_text()
+        )
+        history["Attachments"][0]["Digest"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            repro.ReproducibilityError,
+            "output identity",
+        ) as raised:
+            repro.validate_buildkit_metadata(
+                metadata,
+                SHA256,
+                0,
+                history=history,
+            )
+        self.assertEqual(raised.exception.code, "buildkit_output_mismatch")
+
+    def test_buildkit_reference_invocation_mismatch_is_fail_closed(self) -> None:
+        metadata = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
+        )
+        history = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.history.json").read_text()
+        )
+        history["Config"]["SourceDateEpoch"] = "0"
+        with self.assertRaisesRegex(
+            repro.ReproducibilityError,
+            "invocation",
+        ) as raised:
+            repro.validate_buildkit_metadata(
+                metadata,
+                SHA256,
+                0,
+                history=history,
+            )
+        self.assertEqual(raised.exception.code, "buildkit_invocation_mismatch")
 
     def test_validate_definitions_includes_durable_measurement_evidence(self) -> None:
         report = repro.validate_definitions()
