@@ -259,6 +259,7 @@ fn run(cli: Cli) -> Result<String, Error> {
         attest: cli.attest || cli.sign_proof,
         sign_proof: cli.sign_proof,
         fingerprint_seed: cli.fingerprint_seed,
+        landmark_rtts: None,
     };
 
     let proof = scrape(&raw_url, &options)?;

@@ -21,6 +21,7 @@ pub mod markdown;
 pub mod metadata;
 pub mod pagination;
 pub mod robots;
+pub mod rtt_echo;
 pub mod screenshot;
 pub mod url_validation;
 
@@ -110,6 +111,11 @@ pub struct ScrapeOptions {
     /// from `task_id`/`nonce`, falling back to a stable material from the request surface. The
     /// normalized seed always appears in `egress.fingerprint_seed` and is bound into `report_data`.
     pub fingerprint_seed: Option<String>,
+    /// Enclave-recorded landmark RTTs (ms) to write into `egress.landmark_rtts` (VAL-GEO-009).
+    /// When `None`, the emission uses an empty object (pre-geo / unmeasured). Callers that have
+    /// measured landmarks (via [`rtt_echo::probe_landmarks`]) pass the resulting map so the
+    /// validator can cross-check against independently measured floors.
+    pub landmark_rtts: Option<std::collections::BTreeMap<String, f64>>,
 }
 
 impl Default for ScrapeOptions {
@@ -140,6 +146,7 @@ impl Default for ScrapeOptions {
             attest: false,
             sign_proof: false,
             fingerprint_seed: None,
+            landmark_rtts: None,
         }
     }
 }
@@ -475,7 +482,15 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let completeness_manifest = canonical::completeness_manifest(&format_names, &formats_produced);
     let manifest_sha256 =
         canonical::manifest_sha256(url.as_str(), options.nonce.as_deref(), &result_hash);
-    let egress = egress::build(fetched.egress_ip, fetched.fetched_at, &fingerprint.seed)?;
+    let egress = match &options.landmark_rtts {
+        Some(rtts) => egress::build_with_landmark_rtts(
+            fetched.egress_ip,
+            fetched.fetched_at,
+            &fingerprint.seed,
+            rtts.clone(),
+        )?,
+        None => egress::build(fetched.egress_ip, fetched.fetched_at, &fingerprint.seed)?,
+    };
 
     let mut proof = ScrapeProof {
         version: SCRAPE_PROOF_VERSION,
