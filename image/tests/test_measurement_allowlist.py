@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -65,6 +66,24 @@ class MeasurementAllowlistTests(unittest.TestCase):
 
     def test_current_compose_and_image_tuple_is_unchanged(self) -> None:
         record = json.loads(RECONCILIATION_PATH.read_text())
+        self.assertEqual(measurements.CATALOG_VERSION, "0.5.9")
+        self.assertEqual(measurements.CATALOG_RELEASE_NAME, "dstack-0.5.9")
+        self.assertEqual(
+            measurements.CATALOG_SLUG,
+            "dstack-0.5.9-bd369a8c",
+        )
+        self.assertEqual(
+            measurements.CATALOG_OS_IMAGE_HASH,
+            "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        )
+        self.assertEqual(
+            measurements.DSTACK_COMMIT,
+            "282eeb27d22d8f091ad0fa5a90e638f85cf68751",
+        )
+        self.assertEqual(
+            measurements.META_DSTACK_COMMIT,
+            "e3655d1390feee3736476f4bda35c4354b4a12fc",
+        )
         self.assertEqual(
             record["image"]["build_digest"],
             "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
@@ -397,6 +416,96 @@ class MeasurementAllowlistTests(unittest.TestCase):
             metadata.write_text(json.dumps(contents))
             manifest_path = root / record["evidence_bundle"]["manifest_path"]
             measurements.write_evidence_manifest(manifest_path)
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "catalog",
+            ):
+                measurements.validate_reconciliation(
+                    record_path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_coordinated_catalog_release_name_mutation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            record["catalog"]["name"] = "dstack-renamed-0.5.9"
+            release_path = root / record["catalog"]["release_identity_path"]
+            release = json.loads(release_path.read_text())
+            release["name"] = record["catalog"]["name"]
+            release_path.write_text(json.dumps(release))
+            measurements.write_evidence_manifest(
+                root / record["evidence_bundle"]["manifest_path"]
+            )
+            record_path = root / "measurement-reconciliation.json"
+            record_path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "catalog",
+            ):
+                measurements.validate_reconciliation(
+                    record_path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_coordinated_catalog_version_mutation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            record["catalog"]["version"] = "0.5.10"
+            release_path = root / record["catalog"]["release_identity_path"]
+            release = json.loads(release_path.read_text())
+            release["version"] = record["catalog"]["version"]
+            release_path.write_text(json.dumps(release))
+            metadata_path = root / record["catalog"]["metadata_source"]
+            metadata = json.loads(metadata_path.read_text())
+            metadata["version"] = record["catalog"]["version"]
+            metadata_path.write_text(json.dumps(metadata))
+            metadata_sha256 = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
+            record["catalog"]["metadata_sha256"] = metadata_sha256
+            record["dstack_mr"]["metadata_sha256"] = metadata_sha256
+            invocation_path = root / record["dstack_mr"]["invocation_path"]
+            invocation = json.loads(invocation_path.read_text())
+            invocation["metadata_sha256"] = metadata_sha256
+            invocation_path.write_text(json.dumps(invocation))
+            measurements.write_evidence_manifest(
+                root / record["evidence_bundle"]["manifest_path"]
+            )
+            record_path = root / "measurement-reconciliation.json"
+            record_path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(
+                measurements.MeasurementAllowlistError,
+                "catalog",
+            ):
+                measurements.validate_reconciliation(
+                    record_path,
+                    allowlist_path=ALLOWLIST_PATH,
+                    app_compose_path=APP_COMPOSE_PATH,
+                )
+
+    def test_catalog_metadata_bytes_are_bound_to_release_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(IMAGE_DIR / "evidence", root / "evidence")
+            record = json.loads(RECONCILIATION_PATH.read_text())
+            metadata_path = root / record["catalog"]["metadata_source"]
+            metadata_path.write_bytes(metadata_path.read_bytes() + b"\n")
+            metadata_sha256 = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
+            record["catalog"]["metadata_sha256"] = metadata_sha256
+            record["dstack_mr"]["metadata_sha256"] = metadata_sha256
+            invocation_path = root / record["dstack_mr"]["invocation_path"]
+            invocation = json.loads(invocation_path.read_text())
+            invocation["metadata_sha256"] = metadata_sha256
+            invocation_path.write_text(json.dumps(invocation))
+            measurements.write_evidence_manifest(
+                root / record["evidence_bundle"]["manifest_path"]
+            )
+            record_path = root / "measurement-reconciliation.json"
+            record_path.write_text(json.dumps(record))
             with self.assertRaisesRegex(
                 measurements.MeasurementAllowlistError,
                 "catalog",

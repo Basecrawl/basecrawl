@@ -35,6 +35,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 DSTACK_COMMIT = "282eeb27d22d8f091ad0fa5a90e638f85cf68751"
 META_DSTACK_COMMIT = "e3655d1390feee3736476f4bda35c4354b4a12fc"
+CATALOG_VERSION = "0.5.9"
+CATALOG_RELEASE_NAME = "dstack-0.5.9"
 CATALOG_SLUG = "dstack-0.5.9-bd369a8c"
 CATALOG_OS_IMAGE_HASH = (
     "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033"
@@ -454,6 +456,8 @@ def validate_reconciliation(
     catalog = record.get("catalog")
     if (
         not isinstance(catalog, Mapping)
+        or catalog.get("version") != CATALOG_VERSION
+        or catalog.get("name") != CATALOG_RELEASE_NAME
         or catalog.get("slug") != CATALOG_SLUG
         or catalog.get("os_image_hash") != CATALOG_OS_IMAGE_HASH
         or catalog.get("is_dev") is not False
@@ -819,18 +823,19 @@ def _catalog_artifacts_match(catalog: Mapping[str, Any], *, root: Path) -> bool:
         release_digest = hashlib.sha256(checksum_path.read_bytes()).hexdigest()
         rootfs_match = re.search(r"\bdstack\.rootfs_hash=([0-9a-f]{64})\b", metadata["cmdline"])
         if (
-            metadata.get("version") != catalog.get("version")
+            metadata.get("version") != CATALOG_VERSION
             or metadata.get("git_revision") != META_DSTACK_COMMIT
             or metadata.get("is_dev") is not False
-            or release.get("name") != catalog.get("name")
-            or release.get("slug") != catalog.get("slug")
-            or release.get("version") != catalog.get("version")
+            or release.get("name") != CATALOG_RELEASE_NAME
+            or release.get("slug") != CATALOG_SLUG
+            or release.get("version") != CATALOG_VERSION
             or release.get("source_revision") != META_DSTACK_COMMIT
             or release.get("dstack_revision") != DSTACK_COMMIT
             or release.get("is_dev") is not False
-            or release.get("os_image_hash") != catalog.get("os_image_hash")
+            or release.get("os_image_hash") != CATALOG_OS_IMAGE_HASH
+            or metadata_sha256 != release_hashes.get("metadata.json")
             or digest != catalog.get("digest_txt")
-            or digest != catalog.get("os_image_hash")
+            or digest != CATALOG_OS_IMAGE_HASH
             or release_digest != digest
             or not rootfs_match
             or release.get("release_files_sha256") != release_hashes
@@ -1141,7 +1146,9 @@ def _verify_quote(quote: bytes, *, quote_path: Path, index: int) -> None:
 __all__ = [
     "CANONICAL_FIELDS",
     "CATALOG_OS_IMAGE_HASH",
+    "CATALOG_RELEASE_NAME",
     "CATALOG_SLUG",
+    "CATALOG_VERSION",
     "DSTACK_COMMIT",
     "MEASUREMENT_QEMU_VERSION",
     "META_DSTACK_COMMIT",
