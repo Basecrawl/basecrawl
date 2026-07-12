@@ -4,6 +4,7 @@ import copy
 import json
 import re
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -14,6 +15,7 @@ IMAGE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(IMAGE_DIR))
 
 import reproducibility as repro
+import buildkit_provenance
 
 
 SHA256 = "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
@@ -189,7 +191,9 @@ services:
                         history=history,
                     )
 
-    def test_buildkit_reference_resolves_to_recorded_invocation_and_output(self) -> None:
+    def test_buildkit_reference_resolves_to_recorded_invocation_and_output(
+        self,
+    ) -> None:
         metadata = json.loads(
             (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
         )
@@ -259,6 +263,43 @@ services:
                 history=history,
             )
         self.assertEqual(raised.exception.code, "buildkit_invocation_mismatch")
+
+    def test_reproducibility_wrapper_uses_exact_material_equality(self) -> None:
+        metadata = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.metadata.json").read_text()
+        )
+        history = json.loads(
+            (IMAGE_DIR / "evidence/m2/build/build-1.history.json").read_text()
+        )
+        metadata["buildx.build.provenance"]["materials"].append(
+            {
+                "uri": "pkg:docker/example@1?digest=sha256:" + "0" * 64,
+                "digest": {"sha256": "0" * 64},
+            }
+        )
+        with self.assertRaisesRegex(
+            repro.ReproducibilityError,
+            "exactly match",
+        ) as raised:
+            repro.validate_buildkit_metadata(metadata, SHA256, 0, history=history)
+        self.assertEqual(raised.exception.code, "buildkit_material_mismatch")
+
+    def test_check_builds_rejects_reused_reference_even_when_digests_match(
+        self,
+    ) -> None:
+        record = buildkit_provenance.BuildKitRecord(
+            digest=SHA256,
+            canonical_ref="default/default/reusedref123",
+            materials=frozenset(),
+        )
+        with mock.patch.object(repro, "_build_once_record", return_value=record):
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(
+                    repro.ReproducibilityError,
+                    "not distinct",
+                ) as raised:
+                    repro.check_builds(count=2, output_dir=Path(temporary))
+        self.assertEqual(raised.exception.code, "reused_buildkit_reference")
 
     def test_validate_definitions_includes_durable_measurement_evidence(self) -> None:
         report = repro.validate_definitions()

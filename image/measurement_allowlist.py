@@ -21,6 +21,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import buildkit_provenance
+
 CANONICAL_FIELDS = (
     "mrtd",
     "rtmr0",
@@ -356,129 +358,25 @@ def _validate_buildkit_history(
     *,
     build_digest: Any,
     index: int,
+    metadata_path: Path | None = None,
+    history_path: Path | None = None,
+    manifest_files: Mapping[str, str] | None = None,
 ) -> str:
-    """Require retained history to resolve the recorded invocation and output."""
+    """Compatibility adapter for the authoritative BuildKit validator."""
 
-    build_ref = metadata.get("buildx.build.ref")
-    provenance = metadata.get("buildx.build.provenance")
-    invocation = provenance.get("invocation") if isinstance(provenance, Mapping) else None
-    parameters = invocation.get("parameters") if isinstance(invocation, Mapping) else None
-    args = parameters.get("args") if isinstance(parameters, Mapping) else None
-    environment = (
-        invocation.get("environment") if isinstance(invocation, Mapping) else None
-    )
-    if (
-        not isinstance(build_ref, str)
-        or not build_ref.strip()
-        or not isinstance(args, Mapping)
-        or not isinstance(environment, Mapping)
-        or args.get("build-arg:SOURCE_DATE_EPOCH") != BUILD_SOURCE_DATE_EPOCH
-        or environment.get("platform") != "linux/amd64"
-    ):
-        raise MeasurementAllowlistError(
-            f"BuildKit metadata[{index}] has no verifiable invocation identity"
+    try:
+        record = buildkit_provenance.validate_buildkit_record(
+            metadata,
+            history,
+            expected_digest=build_digest,
+            index=index,
+            metadata_path=metadata_path,
+            history_path=history_path,
+            manifest_files=manifest_files,
         )
-    materials = provenance.get("materials") if isinstance(provenance, Mapping) else None
-    history_materials = history.get("Materials")
-    if not isinstance(materials, list) or not isinstance(history_materials, list):
-        raise MeasurementAllowlistError(
-            f"BuildKit history[{index}] has no verifiable material identity"
-        )
-    metadata_materials: set[tuple[str, str]] = set()
-    for material in materials:
-        if (
-            not isinstance(material, Mapping)
-            or not isinstance(material.get("uri"), str)
-            or not isinstance(material.get("digest"), Mapping)
-            or not all(
-                isinstance(value, str) for value in material["digest"].values()
-            )
-        ):
-            raise MeasurementAllowlistError(
-                f"BuildKit history[{index}] metadata materials are malformed"
-            )
-        metadata_materials.update(
-            (
-                material["uri"].split("&platform=", 1)[0],
-                value.removeprefix("sha256:"),
-            )
-            for value in material["digest"].values()
-        )
-    resolved_materials: set[tuple[str, str]] = set()
-    for material in history_materials:
-        if (
-            not isinstance(material, Mapping)
-            or not isinstance(material.get("URI"), str)
-            or not isinstance(material.get("Digests"), list)
-            or not all(isinstance(value, str) for value in material["Digests"])
-        ):
-            raise MeasurementAllowlistError(
-                f"BuildKit history[{index}] materials are malformed"
-            )
-        resolved_materials.update(
-            (
-                material["URI"].split("&platform=", 1)[0],
-                value.removeprefix("sha256:"),
-            )
-            for value in material["Digests"]
-        )
-    if not metadata_materials.issuperset(resolved_materials):
-        raise MeasurementAllowlistError(
-            f"BuildKit history[{index}] materials do not match metadata"
-        )
-    history_ref = history.get("Ref")
-    if (
-        history_ref not in {build_ref, build_ref.rsplit("/", 1)[-1]}
-        or history.get("Name") != "basecrawl/image"
-        or history.get("Context") != "basecrawl"
-        or history.get("Dockerfile") != "image/Dockerfile"
-        or history.get("Status") != "completed"
-        or not isinstance(history.get("VCSRevision"), str)
-        or not history["VCSRevision"].strip()
-        or history.get("Platform") != [environment["platform"]]
-    ):
-        raise MeasurementAllowlistError(
-            f"BuildKit history[{index}] does not resolve metadata reference"
-        )
-    build_args = history.get("BuildArgs")
-    build_arg_values = (
-        {
-            item.get("Name"): item.get("Value")
-            for item in build_args
-            if isinstance(item, Mapping)
-        }
-        if isinstance(build_args, list)
-        else {}
-    )
-    config = history.get("Config")
-    if (
-        build_arg_values.get("SOURCE_DATE_EPOCH") != BUILD_SOURCE_DATE_EPOCH
-        or not isinstance(config, Mapping)
-        or config.get("NoCache") is not True
-        or config.get("SourceDateEpoch") != BUILD_SOURCE_DATE_EPOCH
-    ):
-        raise MeasurementAllowlistError(
-            f"BuildKit history[{index}] invocation identity drift"
-        )
-    if not isinstance(build_digest, str):
-        raise MeasurementAllowlistError(
-            f"BuildKit metadata[{index}] output digest is malformed"
-        )
-    attachments = history.get("Attachments")
-    if not isinstance(attachments, list) or not any(
-        isinstance(attachment, Mapping)
-        and attachment.get("Digest") == build_digest
-        and attachment.get("Type")
-        in {
-            "application/vnd.oci.image.manifest.v1+json",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        }
-        for attachment in attachments
-    ):
-        raise MeasurementAllowlistError(
-            f"BuildKit history[{index}] output identity drift"
-        )
-    return build_ref
+    except buildkit_provenance.BuildKitProvenanceError as error:
+        raise MeasurementAllowlistError(str(error)) from error
+    return record.canonical_ref
 
 
 def allowlist_contains(
@@ -726,7 +624,7 @@ def validate_reconciliation(
         raise MeasurementAllowlistError(
             "two BuildKit metadata and history records are required"
         )
-    build_refs: set[str] = set()
+    build_records: list[buildkit_provenance.BuildKitRecord] = []
     for index, metadata_value in enumerate(build_paths):
         metadata = _load_json(
             _repository_relative_path(
@@ -744,21 +642,26 @@ def validate_reconciliation(
             ),
             "BuildKit history",
         )
-        if (
-            metadata.get("containerimage.digest") != image.get("build_digest")
-        ):
-            raise MeasurementAllowlistError(
-                "BuildKit metadata identity drift"
+        if metadata.get("containerimage.digest") != image.get("build_digest"):
+            raise MeasurementAllowlistError("BuildKit metadata identity drift")
+        try:
+            build_records.append(
+                buildkit_provenance.validate_buildkit_record(
+                    metadata,
+                    history,
+                    expected_digest=image.get("build_digest"),
+                    index=index,
+                    metadata_path=record_root / metadata_value,
+                    history_path=record_root / history_paths[index],
+                    manifest_files=manifest_files,
+                )
             )
-        build_ref = _validate_buildkit_history(
-            metadata,
-            history,
-            build_digest=image.get("build_digest"),
-            index=index,
-        )
-        build_refs.add(build_ref)
-    if len(build_refs) != 2:
-        raise MeasurementAllowlistError("BuildKit build references are not independent")
+        except buildkit_provenance.BuildKitProvenanceError as error:
+            raise MeasurementAllowlistError(str(error)) from error
+    try:
+        buildkit_provenance.validate_independent_records(build_records)
+    except buildkit_provenance.BuildKitProvenanceError as error:
+        raise MeasurementAllowlistError(str(error)) from error
     publish_metadata = _load_json(
         _repository_relative_path(
             record_root,
@@ -1352,9 +1255,7 @@ def _validate_validation_event(
             "artifacts": (f"{deployment_prefix}/quote.hex",),
         },
         "direct RTMR3 replay": {
-            "command": (
-                f"python3 -c replay_rtmr3 {deployment_prefix}/event-log.json"
-            ),
+            "command": (f"python3 -c replay_rtmr3 {deployment_prefix}/event-log.json"),
             "result": {
                 "compose_hash": (
                     "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42"
@@ -1369,10 +1270,7 @@ def _validate_validation_event(
             "artifacts": ("evidence/m2/measurement/dstack-mr-output.json",),
         },
     }
-    if (
-        expected_kind not in canonical_specs
-        or validation.get("kind") != expected_kind
-    ):
+    if expected_kind not in canonical_specs or validation.get("kind") != expected_kind:
         raise MeasurementAllowlistError(
             "execution record validation kind or order drift"
         )
@@ -1387,9 +1285,7 @@ def _validate_validation_event(
         if isinstance(artifact, Mapping) and isinstance(artifact.get("path"), str)
     )
     if actual_artifacts != expected["artifacts"]:
-        raise MeasurementAllowlistError(
-            "execution record validation artifacts drift"
-        )
+        raise MeasurementAllowlistError("execution record validation artifacts drift")
 
 
 def _validate_deletion_event(

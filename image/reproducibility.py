@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+import buildkit_provenance
+import measurement_allowlist
+
 
 IMAGE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = IMAGE_DIR.parent
@@ -308,7 +311,9 @@ def build_command(
     ]
 
 
-def build_once(*, output: Path, metadata: Path) -> str:
+def _build_once_record(
+    *, output: Path, metadata: Path
+) -> buildkit_provenance.BuildKitRecord:
     proc = subprocess.run(build_command(output=output, metadata=metadata), check=False)
     if proc.returncode != 0:
         raise ReproducibilityError(
@@ -318,11 +323,31 @@ def build_once(*, output: Path, metadata: Path) -> str:
         build_metadata = json.loads(metadata.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ReproducibilityError(f"invalid BuildKit metadata: {error}") from error
-    digest = validate_buildkit_metadata(build_metadata, expected_digest=None, index=0)
-    return digest
+    try:
+        record = buildkit_provenance.validate_buildkit_record(
+            build_metadata,
+            _resolve_buildkit_history(
+                build_metadata.get("buildx.build.ref"),
+                index=0,
+                history=None,
+            ),
+            expected_digest=build_metadata.get("containerimage.digest"),
+            index=0,
+        )
+    except (buildkit_provenance.BuildKitProvenanceError, TypeError) as error:
+        if isinstance(error, buildkit_provenance.BuildKitProvenanceError):
+            raise ReproducibilityError(str(error), code=error.code) from error
+        raise ReproducibilityError(
+            "BuildKit metadata[0] is malformed",
+            code="invalid_buildkit_provenance",
+        ) from error
+    return record
 
 
-_BUILDKIT_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/){2}[A-Za-z0-9_-]{8,}$")
+def build_once(*, output: Path, metadata: Path) -> str:
+    """Build once and return its digest for compatibility with callers."""
+
+    return _build_once_record(output=output, metadata=metadata).digest
 
 
 def _inspect_buildkit_reference(build_ref: str) -> tuple[int, str, str]:
@@ -345,131 +370,6 @@ def _inspect_buildkit_reference(build_ref: str) -> tuple[int, str, str]:
     return process.returncode, process.stdout, process.stderr
 
 
-def _validate_buildkit_history(
-    history: dict[str, Any],
-    *,
-    build_ref: str,
-    digest: str,
-    invocation: dict[str, Any],
-    materials: Any,
-    index: int,
-) -> None:
-    """Bind a BuildKit reference to its invocation and output attachment."""
-
-    history_ref = history.get("Ref")
-    reference_id = build_ref.rsplit("/", 1)[-1]
-    if (
-        history_ref not in {build_ref, reference_id}
-        or history.get("Name") != "basecrawl/image"
-        or history.get("Context") != "basecrawl"
-        or history.get("Dockerfile") != "image/Dockerfile"
-        or history.get("Status") != "completed"
-        or not isinstance(history.get("VCSRevision"), str)
-        or not history["VCSRevision"].strip()
-    ):
-        raise ReproducibilityError(
-            f"BuildKit history[{index}] reference is not bound to the recorded "
-            "build identity",
-            code="buildkit_reference_mismatch",
-        )
-
-    environment = invocation.get("environment")
-    platform = environment.get("platform") if isinstance(environment, dict) else None
-    if history.get("Platform") != [platform]:
-        raise ReproducibilityError(
-            f"BuildKit history[{index}] invocation platform does not match metadata",
-            code="buildkit_invocation_mismatch",
-        )
-    parameters = invocation.get("parameters")
-    args = parameters.get("args") if isinstance(parameters, dict) else None
-    build_args = history.get("BuildArgs")
-    build_arg_values = {
-        item.get("Name"): item.get("Value")
-        for item in build_args
-        if isinstance(item, dict)
-    } if isinstance(build_args, list) else {}
-    config = history.get("Config")
-    if (
-        build_arg_values.get("SOURCE_DATE_EPOCH") != str(SOURCE_DATE_EPOCH)
-        or not isinstance(config, dict)
-        or config.get("NoCache") is not True
-        or config.get("SourceDateEpoch") != str(SOURCE_DATE_EPOCH)
-        or not isinstance(args, dict)
-        or args.get("build-arg:SOURCE_DATE_EPOCH") != str(SOURCE_DATE_EPOCH)
-    ):
-        raise ReproducibilityError(
-            f"BuildKit history[{index}] invocation configuration does not match metadata",
-            code="buildkit_invocation_mismatch",
-        )
-    history_materials = history.get("Materials")
-    if not isinstance(materials, list) or not isinstance(history_materials, list):
-        raise ReproducibilityError(
-            f"BuildKit history[{index}] has no verifiable material identity",
-            code="unverifiable_buildkit_reference",
-        )
-    metadata_materials: set[tuple[str, str]] = set()
-    for material in materials:
-        if (
-            not isinstance(material, dict)
-            or not isinstance(material.get("uri"), str)
-            or not isinstance(material.get("digest"), dict)
-            or not all(
-                isinstance(value, str) for value in material["digest"].values()
-            )
-        ):
-            raise ReproducibilityError(
-                f"BuildKit history[{index}] metadata materials are malformed",
-                code="unverifiable_buildkit_reference",
-            )
-        metadata_materials.update(
-            (
-                material["uri"].split("&platform=", 1)[0],
-                value.removeprefix("sha256:"),
-            )
-            for value in material["digest"].values()
-        )
-    resolved_materials: set[tuple[str, str]] = set()
-    for material in history_materials:
-        if (
-            not isinstance(material, dict)
-            or not isinstance(material.get("URI"), str)
-            or not isinstance(material.get("Digests"), list)
-            or not all(isinstance(value, str) for value in material["Digests"])
-        ):
-            raise ReproducibilityError(
-                f"BuildKit history[{index}] materials are malformed",
-                code="unverifiable_buildkit_reference",
-            )
-        resolved_materials.update(
-            (
-                material["URI"].split("&platform=", 1)[0],
-                value.removeprefix("sha256:"),
-            )
-            for value in material["Digests"]
-        )
-    if not metadata_materials.issuperset(resolved_materials):
-        raise ReproducibilityError(
-            f"BuildKit history[{index}] materials do not match metadata",
-            code="buildkit_invocation_mismatch",
-        )
-
-    attachments = history.get("Attachments")
-    if not isinstance(attachments, list) or not any(
-        isinstance(attachment, dict)
-        and attachment.get("Digest") == digest
-        and attachment.get("Type")
-        in {
-            "application/vnd.oci.image.manifest.v1+json",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        }
-        for attachment in attachments
-    ):
-        raise ReproducibilityError(
-            f"BuildKit history[{index}] output identity does not match metadata",
-            code="buildkit_output_mismatch",
-        )
-
-
 def _resolve_buildkit_history(
     build_ref: str,
     *,
@@ -480,6 +380,12 @@ def _resolve_buildkit_history(
 
     if history is not None:
         return history
+    if not isinstance(build_ref, str) or not build_ref.strip():
+        raise ReproducibilityError(
+            f"BuildKit metadata[{index}] has an unverifiable build reference: "
+            f"{build_ref!r}",
+            code="invalid_buildkit_reference",
+        )
     lookup_ref = build_ref.rsplit("/", 1)[-1]
     returncode, stdout, stderr = _inspect_buildkit_reference(lookup_ref)
     if returncode != 0 or not stdout.strip():
@@ -512,85 +418,31 @@ def validate_buildkit_metadata(
     history: dict[str, Any] | None = None,
 ) -> str:
     """Validate BuildKit's output digest, reference, invocation, and descriptor identity."""
-
-    digest = metadata.get("containerimage.digest")
-    build_ref = metadata.get("buildx.build.ref")
-    provenance = metadata.get("buildx.build.provenance")
-    descriptor = metadata.get("containerimage.descriptor")
-    if (
-        not isinstance(digest, str)
-        or not _BUILD_DIGEST.fullmatch(digest)
-        or (expected_digest is not None and digest != expected_digest)
-    ):
-        raise ReproducibilityError(
-            f"BuildKit metadata[{index}] has an invalid or unexpected output digest: "
-            f"{digest!r}",
-            code="invalid_buildkit_provenance",
+    try:
+        digest = metadata.get("containerimage.digest")
+        record = buildkit_provenance.validate_buildkit_record(
+            metadata,
+            _resolve_buildkit_history(
+                metadata.get("buildx.build.ref"),
+                index=index,
+                history=history,
+            ),
+            expected_digest=(
+                expected_digest if expected_digest is not None else digest
+            ),
+            index=index,
         )
-    if not isinstance(build_ref, str) or not _BUILDKIT_REF.fullmatch(build_ref):
+    except (buildkit_provenance.BuildKitProvenanceError, TypeError) as error:
+        if isinstance(error, buildkit_provenance.BuildKitProvenanceError):
+            raise ReproducibilityError(
+                str(error),
+                code=error.code,
+            ) from error
         raise ReproducibilityError(
-            f"BuildKit metadata[{index}] has an unverifiable build reference: "
-            f"{build_ref!r}",
+            f"BuildKit metadata[{index}] is malformed",
             code="invalid_buildkit_provenance",
-        )
-    if not isinstance(provenance, dict):
-        raise ReproducibilityError(
-            f"BuildKit metadata[{index}] has no provenance invocation",
-            code="invalid_buildkit_provenance",
-        )
-    invocation = provenance.get("invocation")
-    parameters = invocation.get("parameters") if isinstance(invocation, dict) else None
-    environment = (
-        invocation.get("environment") if isinstance(invocation, dict) else None
-    )
-    if not isinstance(parameters, dict) or not isinstance(environment, dict):
-        raise ReproducibilityError(
-            f"BuildKit metadata[{index}] has no verifiable invocation identity",
-            code="invalid_buildkit_provenance",
-        )
-    _validate_buildkit_history(
-        _resolve_buildkit_history(build_ref, index=index, history=history),
-        build_ref=build_ref,
-        digest=digest,
-        invocation=invocation,
-        materials=provenance.get("materials"),
-        index=index,
-    )
-    args = parameters.get("args")
-    locals_ = parameters.get("locals")
-    if (
-        not isinstance(args, dict)
-        or not args.get("cmdline")
-        or not args.get("source")
-        or not isinstance(locals_, list)
-        or {item.get("name") for item in locals_ if isinstance(item, dict)}
-        != {"context", "dockerfile"}
-    ):
-        raise ReproducibilityError(
-            f"BuildKit metadata[{index}] invocation is missing source identity",
-            code="invalid_buildkit_provenance",
-        )
-    if environment.get("platform") != "linux/amd64":
-        raise ReproducibilityError(
-            f"BuildKit metadata[{index}] invocation platform is not linux/amd64",
-            code="invalid_buildkit_provenance",
-        )
-    if (
-        not isinstance(descriptor, dict)
-        or descriptor.get("digest") != digest
-        or descriptor.get("mediaType")
-        not in {
-            "application/vnd.oci.image.manifest.v1+json",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        }
-        or not isinstance(descriptor.get("size"), int)
-        or descriptor["size"] <= 0
-    ):
-        raise ReproducibilityError(
-            f"BuildKit metadata[{index}] output descriptor is not bound to the digest",
-            code="invalid_buildkit_provenance",
-        )
-    return digest
+        ) from error
+    return record.digest
 
 
 def check_builds(*, count: int = 2, output_dir: Path | None = None) -> list[str]:
@@ -602,13 +454,18 @@ def check_builds(*, count: int = 2, output_dir: Path | None = None) -> list[str]
         with tempfile.TemporaryDirectory(prefix="basecrawl-repro-") as temporary:
             return check_builds(count=count, output_dir=Path(temporary))
     output_dir.mkdir(parents=True, exist_ok=True)
-    digests = [
-        build_once(
+    records = [
+        _build_once_record(
             output=output_dir / f"basecrawl-{index}.oci.tar",
             metadata=output_dir / f"basecrawl-{index}.metadata.json",
         )
         for index in range(1, count + 1)
     ]
+    try:
+        buildkit_provenance.validate_independent_records(records)
+    except buildkit_provenance.BuildKitProvenanceError as error:
+        raise ReproducibilityError(str(error), code=error.code) from error
+    digests = [record.digest for record in records]
     if len(set(digests)) != 1:
         raise ReproducibilityError(
             f"build_digest drift across independent builds: {digests!r}"
@@ -706,13 +563,25 @@ def _require_live_provenance(entry: dict[str, Any], index: int) -> str:
             code="unresolved_buildkit_reference",
         )
     history = _load_json(history_path, "BuildKit history")
-    validate_buildkit_metadata(
-        metadata,
-        entry["build_digest"],
-        index,
-        history=history,
-    )
-    build_ref = metadata["buildx.build.ref"]
+    try:
+        record = buildkit_provenance.validate_buildkit_record(
+            metadata,
+            history,
+            expected_digest=entry["build_digest"],
+            index=index,
+            metadata_path=paths["build_metadata_path"],
+            history_path=history_path,
+            manifest_files=(
+                measurement_allowlist.verify_evidence_manifest(EVIDENCE_MANIFEST)
+            ),
+        )
+    except (
+        buildkit_provenance.BuildKitProvenanceError,
+        measurement_allowlist.MeasurementAllowlistError,
+    ) as error:
+        code = getattr(error, "code", "unmanifested_buildkit_reference")
+        raise ReproducibilityError(str(error), code=code) from error
+    build_ref = record.canonical_ref
     registry = subprocess.run(
         ["docker", "buildx", "imagetools", "inspect", "--raw", entry["image_ref"]],
         capture_output=True,
