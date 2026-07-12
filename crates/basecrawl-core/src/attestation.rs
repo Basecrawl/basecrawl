@@ -4,6 +4,7 @@
 //! over the mounted Unix socket and validates the signed response shape.  It never constructs a
 //! quote locally, and it fails closed when the socket or any required response field is missing.
 
+use basecrawl_proof::TdxMeasurement;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -80,16 +81,6 @@ pub struct QuoteResponse {
     pub vm_config: Value,
 }
 
-/// The signed measurements carried by a v4 TDX TD10 report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QuoteMeasurement {
-    pub mrtd: String,
-    pub rtmr0: String,
-    pub rtmr1: String,
-    pub rtmr2: String,
-    pub rtmr3: String,
-}
-
 impl QuoteResponse {
     pub fn to_canonical_json(&self) -> String {
         serde_json::to_string(self).expect("QuoteResponse is always serializable")
@@ -97,7 +88,7 @@ impl QuoteResponse {
 }
 
 /// Decode the TD10 measurement registers from a validated quote.
-pub fn quote_measurement(quote_hex: &str) -> Result<QuoteMeasurement, QuoteRequestError> {
+pub fn quote_measurement(quote_hex: &str) -> Result<TdxMeasurement, QuoteRequestError> {
     let quote = decode_hex(quote_hex).ok_or(QuoteRequestError::InvalidQuote)?;
     if quote.len() < QUOTE_HEADER_BYTES + 520 {
         return Err(QuoteRequestError::QuoteTooShort {
@@ -105,7 +96,7 @@ pub fn quote_measurement(quote_hex: &str) -> Result<QuoteMeasurement, QuoteReque
             minimum: MIN_QUOTE_HEX_LEN,
         });
     }
-    Ok(QuoteMeasurement {
+    Ok(TdxMeasurement {
         mrtd: encode_hex(&quote[48 + 136..48 + 184]),
         rtmr0: encode_hex(&quote[48 + 328..48 + 376]),
         rtmr1: encode_hex(&quote[48 + 376..48 + 424]),

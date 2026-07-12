@@ -455,7 +455,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         proof.attestation = Attestation {
             tee_type: Some("tdx".to_string()),
             quote: Some(quote.quote),
-            measurement: Some(serde_json::to_value(measurement).expect("measurement serializes")),
+            measurement: Some(measurement),
             report_data: Some(quote.report_data),
         };
     }

@@ -191,13 +191,23 @@ pub struct Egress {
     pub fingerprint_seed: Option<String>,
 }
 
+/// Signed measurement registers carried by an Intel TDX TD10 report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TdxMeasurement {
+    pub mrtd: String,
+    pub rtmr0: String,
+    pub rtmr1: String,
+    pub rtmr2: String,
+    pub rtmr3: String,
+}
+
 /// Hardware attestation block. At M1 every field is an explicit-null placeholder: no quote,
 /// measurement, or report_data is produced before TEE integration (milestone M2).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Attestation {
     pub tee_type: Option<String>,
     pub quote: Option<String>,
-    pub measurement: Option<Value>,
+    pub measurement: Option<TdxMeasurement>,
     pub report_data: Option<String>,
 }
 
@@ -280,6 +290,35 @@ mod tests {
         assert!(v["attestation"]["measurement"].is_null());
         assert!(v["attestation"]["report_data"].is_null());
         assert!(v["sdk_signature"]["sig"].is_null());
+    }
+
+    #[test]
+    fn populated_tdx_attestation_roundtrips_losslessly() {
+        let mut proof = sample();
+        proof.attestation = Attestation {
+            tee_type: Some("tdx".into()),
+            quote: Some("04aabbcc".into()),
+            measurement: Some(TdxMeasurement {
+                mrtd: "11".repeat(48),
+                rtmr0: "22".repeat(48),
+                rtmr1: "33".repeat(48),
+                rtmr2: "44".repeat(48),
+                rtmr3: "55".repeat(48),
+            }),
+            report_data: Some("66".repeat(64)),
+        };
+
+        let serialized = proof.to_canonical_json();
+        let roundtripped: ScrapeProof = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(roundtripped, proof);
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["attestation"]["tee_type"], "tdx");
+        assert_eq!(value["attestation"]["measurement"]["mrtd"], "11".repeat(48));
+        assert_eq!(
+            value["attestation"]["measurement"]["rtmr3"],
+            "55".repeat(48)
+        );
     }
 
     #[test]

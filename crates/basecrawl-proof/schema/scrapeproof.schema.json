@@ -176,7 +176,23 @@
       "properties": {
         "tee_type": { "type": ["string", "null"] },
         "quote": { "type": ["string", "null"] },
-        "measurement": { "type": ["object", "null"] },
+        "measurement": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mrtd", "rtmr0", "rtmr1", "rtmr2", "rtmr3"],
+              "properties": {
+                "mrtd": { "type": "string", "pattern": "^[0-9a-f]{96}$" },
+                "rtmr0": { "type": "string", "pattern": "^[0-9a-f]{96}$" },
+                "rtmr1": { "type": "string", "pattern": "^[0-9a-f]{96}$" },
+                "rtmr2": { "type": "string", "pattern": "^[0-9a-f]{96}$" },
+                "rtmr3": { "type": "string", "pattern": "^[0-9a-f]{96}$" }
+              }
+            }
+          ]
+        },
         "report_data": { "type": ["string", "null"] }
       }
     },

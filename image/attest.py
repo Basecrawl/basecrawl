@@ -22,6 +22,8 @@ REPORT_DATA_BYTES = 64
 QUOTE_HEADER_BYTES = 48
 TD_REPORT_DATA_OFFSET = 520
 TD_REPORT_DATA_BYTES = 64
+TD_MEASUREMENT_HEX_LEN = 48 * 2
+TD_ATTRIBUTES_HEX_LEN = 8 * 2
 
 
 class AttestationError(RuntimeError):
@@ -213,9 +215,106 @@ def decode_quote(quote_path: Path) -> dict[str, Any]:
     header = decoded.get("header", {})
     if header.get("version") != 4 or header.get("tee_type") != 129:
         raise AttestationError("decoded quote is not TDX v4")
-    if not isinstance(decoded.get("report", {}).get("TD10", {}).get("mr_td"), str):
-        raise AttestationError("decoded quote has no TD10 mr_td")
+    report = decoded.get("report", {}).get("TD10", {})
+    if not isinstance(report, dict):
+        raise AttestationError("decoded quote has no TD10 report")
+    for field in ("mr_td", "rt_mr0", "rt_mr1", "rt_mr2", "rt_mr3"):
+        value = report.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) != TD_MEASUREMENT_HEX_LEN
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise AttestationError(f"decoded quote has no valid TD10 {field}")
+    report_data = report.get("report_data")
+    if (
+        not isinstance(report_data, str)
+        or len(report_data) != REPORT_DATA_BYTES * 2
+        or any(char not in "0123456789abcdef" for char in report_data)
+    ):
+        raise AttestationError("decoded quote has no valid TD10 report_data")
+    attributes = report.get("td_attributes")
+    if (
+        not isinstance(attributes, str)
+        or len(attributes) != TD_ATTRIBUTES_HEX_LEN
+        or any(char not in "0123456789abcdef" for char in attributes)
+    ):
+        raise AttestationError("decoded quote has no valid TD10 td_attributes")
+    if int.from_bytes(bytes.fromhex(attributes), "little") & 1:
+        raise AttestationError("decoded quote has the TD DEBUG attribute set")
     return decoded
+
+
+def inspect_pckinfo(quote_path: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        ["dcap-qvl", "pckinfo", "--hex", str(quote_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise AttestationError(
+            f"dcap-qvl could not inspect PCK information: {result.stderr.strip()}"
+        )
+    try:
+        pckinfo = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AttestationError("dcap-qvl returned invalid pckinfo JSON") from error
+    if pckinfo.get("tee_type") != "TDX":
+        raise AttestationError("PCK information is not for a TDX quote")
+    if not isinstance(pckinfo.get("fmspc"), str) or not pckinfo["fmspc"]:
+        raise AttestationError("PCK information has no fmspc")
+    if not isinstance(pckinfo.get("pce_svn"), int):
+        raise AttestationError("PCK information has no pce_svn")
+    chain = pckinfo.get("certificate_chain")
+    expected = [
+        ("Leaf PCK", "Intel SGX PCK Certificate", "Intel SGX PCK Platform CA"),
+        ("PCK CA", "Intel SGX PCK Platform CA", "Intel SGX Root CA"),
+        ("Root CA", "Intel SGX Root CA", "Intel SGX Root CA"),
+    ]
+    if not isinstance(chain, list) or len(chain) != len(expected):
+        raise AttestationError("PCK certificate chain is incomplete")
+    for certificate, (role, subject, issuer) in zip(chain, expected, strict=True):
+        if (
+            not isinstance(certificate, dict)
+            or certificate.get("role") != role
+            or subject not in certificate.get("subject", "")
+            or issuer not in certificate.get("issuer", "")
+        ):
+            raise AttestationError(
+                "PCK certificate chain must be Leaf PCK -> PCK Platform CA -> "
+                "Intel SGX Root CA"
+            )
+    return pckinfo
+
+
+def build_tier2_attestation(quote_hex: str, decoded: dict[str, Any]) -> dict[str, Any]:
+    header = decoded.get("header", {})
+    report = decoded.get("report", {}).get("TD10", {})
+    if header.get("version") != 4 or header.get("tee_type") != 129:
+        raise AttestationError("decoded quote is not TDX v4")
+    report_data = report.get("report_data")
+    if not isinstance(report_data, str):
+        raise AttestationError("decoded quote has no TD10 report_data")
+    normalized_quote = quote_hex.strip().lower()
+    _quote_shape(normalized_quote, report_data)
+    measurement = {
+        "mrtd": report["mr_td"],
+        "rtmr0": report["rt_mr0"],
+        "rtmr1": report["rt_mr1"],
+        "rtmr2": report["rt_mr2"],
+        "rtmr3": report["rt_mr3"],
+    }
+    attestation = {
+        "tee_type": "tdx",
+        "quote": normalized_quote,
+        "measurement": measurement,
+        "report_data": report_data,
+    }
+    if json.loads(json.dumps(attestation, separators=(",", ":"))) != attestation:
+        raise AttestationError("Tier-2 attestation JSON round-trip was lossy")
+    return attestation
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -226,6 +325,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--response-out", type=Path, required=True)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--decode-out", type=Path)
+    parser.add_argument("--pckinfo-out", type=Path)
+    parser.add_argument("--attestation-out", type=Path)
     return parser
 
 
@@ -240,10 +341,26 @@ def main() -> int:
         )
         if args.verify:
             verify_quote(args.quote_out)
-        if args.decode_out is not None:
+        decoded = None
+        if args.decode_out is not None or args.attestation_out is not None:
             decoded = decode_quote(args.quote_out)
-            args.decode_out.write_text(
-                json.dumps(decoded, sort_keys=True, separators=(",", ":")) + "\n",
+            if args.decode_out is not None:
+                args.decode_out.write_text(
+                    json.dumps(decoded, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+        if args.pckinfo_out is not None:
+            pckinfo = inspect_pckinfo(args.quote_out)
+            args.pckinfo_out.write_text(
+                json.dumps(pckinfo, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+        if args.attestation_out is not None:
+            if decoded is None:
+                decoded = decode_quote(args.quote_out)
+            attestation = build_tier2_attestation(response["quote"], decoded)
+            args.attestation_out.write_text(
+                json.dumps(attestation, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
     except AttestationError as error:

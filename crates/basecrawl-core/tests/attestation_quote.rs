@@ -1,4 +1,6 @@
-use basecrawl_core::attestation::{get_quote_at, quote_report_data, QuoteRequestError};
+use basecrawl_core::attestation::{
+    get_quote_at, quote_measurement, quote_report_data, QuoteRequestError,
+};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -12,6 +14,15 @@ fn quote_fixture(report_data: &str) -> String {
     let mut quote = vec![0_u8; 48 + 584 + 4];
     quote[0..2].copy_from_slice(&4_u16.to_le_bytes());
     quote[4..8].copy_from_slice(&0x81_u32.to_le_bytes());
+    for (offset, value) in [
+        (136, 0x11),
+        (328, 0x22),
+        (376, 0x33),
+        (424, 0x44),
+        (472, 0x55),
+    ] {
+        quote[48 + offset..48 + offset + 48].fill(value);
+    }
     let report_data_bytes: Vec<u8> = report_data
         .as_bytes()
         .chunks_exact(2)
@@ -26,6 +37,17 @@ fn quote_fixture(report_data: &str) -> String {
         .into_iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[test]
+fn quote_measurement_extracts_all_tdx_registers() {
+    let measurement = quote_measurement(&quote_fixture(REPORT_DATA)).unwrap();
+
+    assert_eq!(measurement.mrtd, "11".repeat(48));
+    assert_eq!(measurement.rtmr0, "22".repeat(48));
+    assert_eq!(measurement.rtmr1, "33".repeat(48));
+    assert_eq!(measurement.rtmr2, "44".repeat(48));
+    assert_eq!(measurement.rtmr3, "55".repeat(48));
 }
 
 fn socket_path(label: &str) -> PathBuf {
