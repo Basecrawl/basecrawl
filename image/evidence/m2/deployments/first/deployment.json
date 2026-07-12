@@ -1,0 +1,15 @@
+{
+  "cvm_id": "cvm_dw1Ax7wM",
+  "vm_uuid": "fa022b0c-0d8c-4066-9c02-e008010f3490",
+  "app_id": "bd003bdb2818d54e93ef23e5490f3292b54685b7",
+  "cvm_name": "basecrawl-quote-20260711-2238",
+  "instance_type": "tdx.small",
+  "os_image": "dstack-0.5.9-bd369a8c",
+  "automatic_placement": true,
+  "requested_region": null,
+  "requested_node_id": null,
+  "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+  "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
+  "created": true,
+  "deleted": true
+}

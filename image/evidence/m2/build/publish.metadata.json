@@ -1,0 +1,72 @@
+{
+  "buildx.build.provenance": {
+    "builder": {
+      "id": ""
+    },
+    "buildType": "https://mobyproject.org/buildkit@v1",
+    "materials": [
+      {
+        "uri": "pkg:docker/docker/dockerfile@1.7?digest=sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e\u0026platform=linux%2Famd64",
+        "digest": {
+          "sha256": "a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+        }
+      },
+      {
+        "uri": "pkg:docker/docker/dockerfile@1.7?digest=sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+        "digest": {
+          "sha256": "a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+        }
+      },
+      {
+        "uri": "pkg:docker/rust@1.96.0-bookworm?digest=sha256:c993d32d95cc146bd12c84d66f0b924a6a96f3988325f39c144f2f9893dea120\u0026platform=linux%2Famd64",
+        "digest": {
+          "sha256": "c993d32d95cc146bd12c84d66f0b924a6a96f3988325f39c144f2f9893dea120"
+        }
+      },
+      {
+        "uri": "pkg:docker/ghcr.io/puppeteer/puppeteer@24.37.2?digest=sha256:59818936eb9768ba3c1681441ec62e8aacaa67c074e2573bd66bf78a065b31e1\u0026platform=linux%2Famd64",
+        "digest": {
+          "sha256": "59818936eb9768ba3c1681441ec62e8aacaa67c074e2573bd66bf78a065b31e1"
+        }
+      }
+    ],
+    "invocation": {
+      "configSource": {
+        "entryPoint": "Dockerfile"
+      },
+      "parameters": {
+        "frontend": "gateway.v0",
+        "args": {
+          "build-arg:SOURCE_DATE_EPOCH": "1700000000",
+          "cmdline": "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+          "no-cache": "",
+          "source": "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+        },
+        "locals": [
+          {
+            "name": "context"
+          },
+          {
+            "name": "dockerfile"
+          }
+        ]
+      },
+      "environment": {
+        "platform": "linux/amd64"
+      }
+    }
+  },
+  "buildx.build.ref": "default/default/zbyb84xyt31hmovi9v6zyh8l8",
+  "containerimage.config.digest": "sha256:2083d4eb9c5467458f1b49a56b0fa6e5dd5acb6e39a668a68ec3f4bb29470bfe",
+  "containerimage.descriptor": {
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+    "size": 3714,
+    "platform": {
+      "architecture": "amd64",
+      "os": "linux"
+    }
+  },
+  "containerimage.digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+  "image.name": "docker.io/mathiiss/basecrawl-cvm:commit-c4e91c5"
+}

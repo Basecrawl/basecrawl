@@ -1,0 +1,15 @@
+{
+  "captured_at": "2026-07-12T00:00:00Z",
+  "account_cvm_total": 1,
+  "mission_owned_cvm_total": 0,
+  "protected_user_cvm": {
+    "cvm_id": "cvm_MeD2Y9wQ",
+    "cvm_name": "dstack-app-nlv7j",
+    "status": "running",
+    "preserved": true
+  },
+  "deleted_mission_cvms": [
+    "basecrawl-quote-20260711-2238",
+    "basecrawl-reconcile-20260711-f01368"
+  ]
+}

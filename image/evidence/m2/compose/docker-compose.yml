@@ -1,0 +1,23 @@
+services:
+  basecrawl:
+    image: "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+    command:
+      - >-
+        set -eu;
+        /usr/local/bin/basecrawl --help >/dev/null;
+        REPORT_DATA=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f;
+        while [ ! -S /var/run/dstack.sock ]; do sleep 1; done;
+        RESPONSE="$(curl --fail --silent --show-error --max-time 60
+        --unix-socket /var/run/dstack.sock -X POST http://dstack/GetQuote
+        -H 'Content-Type: application/json'
+        --data "{\"report_data\":\"$${REPORT_DATA}\"}")";
+        printf 'BASECRAWL_GETQUOTE=%s\n' "$$RESPONSE";
+        exec sleep infinity
+    restart: "unless-stopped"
+    volumes:
+      - type: "bind"
+        source: "/var/run/dstack.sock"
+        target: "/var/run/dstack.sock"

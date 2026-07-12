@@ -1,0 +1,32 @@
+{
+  "source_commit": "c4e91c5c678e056da88913acfc8638fb395159d2",
+  "platform": "linux/amd64",
+  "source_date_epoch": 1700000000,
+  "no_cache": true,
+  "provenance": false,
+  "sbom": false,
+  "rewrite_timestamp": true,
+  "dockerfile": "image/Dockerfile",
+  "context": ".",
+  "expected_digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+  "command": [
+    "docker",
+    "buildx",
+    "build",
+    "--progress=plain",
+    "--platform",
+    "linux/amd64",
+    "--no-cache",
+    "--provenance=false",
+    "--sbom=false",
+    "--build-arg",
+    "SOURCE_DATE_EPOCH=1700000000",
+    "--metadata-file",
+    "<output>.metadata.json",
+    "--output",
+    "type=oci,dest=<output>.oci.tar,rewrite-timestamp=true",
+    "-f",
+    "image/Dockerfile",
+    "."
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "dstack-0.5.9",
+  "slug": "dstack-0.5.9-bd369a8c",
+  "version": "0.5.9",
+  "source_revision": "e3655d1390feee3736476f4bda35c4354b4a12fc",
+  "dstack_revision": "282eeb27d22d8f091ad0fa5a90e638f85cf68751",
+  "is_dev": false,
+  "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+  "release_files_sha256": {
+    "ovmf.fd": "76888ce69c91aed86c43f840b913899b40b981964b7ce6018667f91ad06301f0",
+    "bzImage": "92ceba363abfd655c4f1d3e6fe0df44868436dc4c25cf86efb11adf6c6db31dd",
+    "initramfs.cpio.gz": "4662c4f04f56cb08ab1074da7307dda513468d02ee6e6b6d934373b07a8b3899",
+    "metadata.json": "d166e9ffcb3c556983956fd6e81ba8114cd0a3fe4bbcdb1bdf085ac86f678eb0",
+    "rootfs.img.verity": "e92ad3aeae158f08706f634509f756d6d838c81dd08eded68cc4aab041fe7fd8"
+  }
+}

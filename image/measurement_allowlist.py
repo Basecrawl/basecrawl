@@ -61,6 +61,7 @@ EXPECTED_RUNTIME_EVENTS = (
     "storage-fs",
     "system-ready",
 )
+EVIDENCE_MANIFEST_VERSION = 1
 
 
 class MeasurementAllowlistError(ValueError):
@@ -116,6 +117,76 @@ def _load_json(path: Path, label: str) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise MeasurementAllowlistError(f"cannot load {label} {path}: {exc}") from exc
+
+
+def _repository_relative_path(root: Path, value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise MeasurementAllowlistError(f"{label} must be a repository-relative path")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise MeasurementAllowlistError(f"{label} must be a repository-relative path")
+    resolved_root = root.resolve()
+    path = root / relative
+    if not path.is_file():
+        raise MeasurementAllowlistError(f"{label} does not exist: {value}")
+    try:
+        path.resolve().relative_to(resolved_root)
+    except ValueError as exc:
+        raise MeasurementAllowlistError(
+            f"{label} must remain inside the repository evidence root"
+        ) from exc
+    return path
+
+
+def write_evidence_manifest(path: Path | str) -> dict[str, Any]:
+    """Write deterministic hashes for every file below the manifest directory."""
+
+    target = Path(path)
+    root = target.parent
+    files = {
+        item.relative_to(root).as_posix(): hashlib.sha256(item.read_bytes()).hexdigest()
+        for item in sorted(root.rglob("*"))
+        if item.is_file() and item != target
+    }
+    manifest = {"version": EVIDENCE_MANIFEST_VERSION, "files": files}
+    target.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def verify_evidence_manifest(path: Path | str) -> dict[str, str]:
+    """Fail closed unless the manifest exactly covers all repository-local files."""
+
+    target = Path(path)
+    manifest = _load_json(target, "evidence manifest")
+    files = manifest.get("files") if isinstance(manifest, Mapping) else None
+    if manifest.get("version") != EVIDENCE_MANIFEST_VERSION or not isinstance(
+        files, Mapping
+    ):
+        raise MeasurementAllowlistError("evidence manifest is malformed")
+    expected: dict[str, str] = {}
+    for name, digest in files.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(digest, str)
+            or HEX64.fullmatch(digest) is None
+        ):
+            raise MeasurementAllowlistError("evidence manifest entry is malformed")
+        artifact = _repository_relative_path(target.parent, name, "manifest path")
+        actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if actual != digest:
+            raise MeasurementAllowlistError(f"evidence manifest digest mismatch: {name}")
+        expected[name] = digest
+    actual_files = {
+        item.relative_to(target.parent).as_posix()
+        for item in target.parent.rglob("*")
+        if item.is_file() and item != target
+    }
+    if set(expected) != actual_files:
+        raise MeasurementAllowlistError("evidence manifest coverage mismatch")
+    return expected
 
 
 def _validate_entry(value: Mapping[str, Any], *, label: str) -> dict[str, str]:
@@ -273,6 +344,16 @@ def validate_reconciliation(
     record = _load_json(Path(path), "measurement reconciliation")
     if not isinstance(record, Mapping) or record.get("status") != "reconciled":
         raise MeasurementAllowlistError("measurement reconciliation is not reconciled")
+    record_root = Path(path).resolve().parent
+    bundle = record.get("evidence_bundle")
+    if not isinstance(bundle, Mapping):
+        raise MeasurementAllowlistError("repository-local evidence bundle is missing")
+    manifest_path = _repository_relative_path(
+        record_root,
+        bundle.get("manifest_path"),
+        "evidence_bundle.manifest_path",
+    )
+    verify_evidence_manifest(manifest_path)
     canonical = _validate_entry(
         record.get("canonical_measurement", {}),
         label="canonical_measurement",
@@ -303,7 +384,7 @@ def validate_reconciliation(
         or catalog.get("slug") != CATALOG_SLUG
         or catalog.get("os_image_hash") != CATALOG_OS_IMAGE_HASH
         or catalog.get("is_dev") is not False
-        or not _catalog_artifacts_match(catalog)
+        or not _catalog_artifacts_match(catalog, root=record_root)
     ):
         raise MeasurementAllowlistError(
             "catalog identity is not the pinned Phala image"
@@ -327,11 +408,101 @@ def validate_reconciliation(
         raise MeasurementAllowlistError(
             "dstack-mr output is not the reconciled live tuple"
         )
+    invocation = _load_json(
+        _repository_relative_path(
+            record_root,
+            measurement.get("invocation_path"),
+            "dstack_mr.invocation_path",
+        ),
+        "dstack-mr invocation",
+    )
+    measured_output = _load_json(
+        _repository_relative_path(
+            record_root,
+            measurement.get("output_path"),
+            "dstack_mr.output_path",
+        ),
+        "dstack-mr output",
+    )
+    if (
+        invocation.get("source_revision") != DSTACK_COMMIT
+        or invocation.get("cpu") != measurement.get("cpu")
+        or invocation.get("memory") != measurement.get("memory")
+        or invocation.get("qemu_version") != measurement.get("qemu_version")
+        or invocation.get("metadata_sha256") != measurement.get("metadata_sha256")
+        or invocation.get("metadata_sha256")
+        != hashlib.sha256(
+            _repository_relative_path(
+                record_root,
+                measurement.get("metadata_path"),
+                "dstack_mr.metadata_path",
+            ).read_bytes()
+        ).hexdigest()
+        or measured_output != measurement.get("registers")
+    ):
+        raise MeasurementAllowlistError("dstack-mr retained input/output drift")
+
+    build_paths = image.get("build_metadata_paths")
+    if not isinstance(build_paths, list) or len(build_paths) != 2:
+        raise MeasurementAllowlistError("two BuildKit metadata records are required")
+    build_refs: set[str] = set()
+    for index, metadata_value in enumerate(build_paths):
+        metadata = _load_json(
+            _repository_relative_path(
+                record_root,
+                metadata_value,
+                f"image.build_metadata_paths[{index}]",
+            ),
+            "BuildKit metadata",
+        )
+        build_ref = metadata.get("buildx.build.ref")
+        if (
+            metadata.get("containerimage.digest") != image.get("build_digest")
+            or not isinstance(build_ref, str)
+            or not build_ref
+        ):
+            raise MeasurementAllowlistError("BuildKit metadata identity drift")
+        build_refs.add(build_ref)
+    if len(build_refs) != 2:
+        raise MeasurementAllowlistError("BuildKit build references are not independent")
+    publish_metadata = _load_json(
+        _repository_relative_path(
+            record_root,
+            image.get("publish_metadata_path"),
+            "image.publish_metadata_path",
+        ),
+        "publish metadata",
+    )
+    registry_manifest_path = _repository_relative_path(
+        record_root,
+        image.get("registry_manifest_path"),
+        "image.registry_manifest_path",
+    )
+    if (
+        publish_metadata.get("containerimage.digest") != image.get("build_digest")
+        or "sha256:" + hashlib.sha256(registry_manifest_path.read_bytes()).hexdigest()
+        != image.get("build_digest")
+    ):
+        raise MeasurementAllowlistError("published image identity drift")
 
     live_evidence = record.get("live_evidence")
-    if not isinstance(live_evidence, list) or len(live_evidence) < 2:
+    if not isinstance(live_evidence, list) or len(live_evidence) != 2:
         raise MeasurementAllowlistError(
-            "at least two live evidence records are required"
+            "exactly two live evidence records are required"
+        )
+    app_ids = [
+        evidence.get("app_id")
+        for evidence in live_evidence
+        if isinstance(evidence, Mapping)
+    ]
+    cvm_names = [
+        evidence.get("cvm_name")
+        for evidence in live_evidence
+        if isinstance(evidence, Mapping)
+    ]
+    if len(set(app_ids)) != 2 or len(set(cvm_names)) != 2:
+        raise MeasurementAllowlistError(
+            "live evidence deployments are not independent"
         )
     for index, evidence in enumerate(live_evidence):
         _validate_live_evidence(
@@ -339,6 +510,7 @@ def validate_reconciliation(
             index=index,
             canonical=canonical,
             allowlisted_compose_hash=canonical["compose_hash"],
+            root=record_root,
         )
     replay_record = record.get("live_event_replay")
     if not isinstance(replay_record, Mapping) or not isinstance(
@@ -350,6 +522,8 @@ def validate_reconciliation(
         for item in replay_record["evidence"]
         if isinstance(item, Mapping)
     }
+    if len(replay_by_name) != 2:
+        raise MeasurementAllowlistError("RTMR3 replay records are not independent")
     for evidence in live_evidence:
         replay = replay_by_name.get(evidence.get("cvm_name"))
         if (
@@ -370,6 +544,26 @@ def validate_reconciliation(
         or live_info.get("app_compose_sha256") != canonical["compose_hash"]
     ):
         raise MeasurementAllowlistError("live /Info identity does not match the tuple")
+    cleanup = record.get("cleanup")
+    cleanup_inventory = _load_json(
+        _repository_relative_path(
+            record_root,
+            cleanup.get("inventory_path") if isinstance(cleanup, Mapping) else None,
+            "cleanup.inventory_path",
+        ),
+        "cleanup inventory",
+    )
+    if (
+        not isinstance(cleanup, Mapping)
+        or cleanup.get("mission_owned_cvm_total_after_cleanup") != 0
+        or cleanup.get("protected_user_cvm_preserved") is not True
+        or cleanup.get("temporary_cvms_deleted") is not True
+        or cleanup_inventory.get("mission_owned_cvm_total") != 0
+        or cleanup_inventory.get("protected_user_cvm", {}).get("cvm_id")
+        != "cvm_MeD2Y9wQ"
+        or cleanup_inventory.get("protected_user_cvm", {}).get("preserved") is not True
+    ):
+        raise MeasurementAllowlistError("cleanup inventory does not prove ownership cleanup")
     quote_verification = record.get("live_quote_verification")
     if (
         not isinstance(quote_verification, Mapping)
@@ -382,7 +576,7 @@ def validate_reconciliation(
     return dict(record)
 
 
-def _catalog_artifacts_match(catalog: Mapping[str, Any]) -> bool:
+def _catalog_artifacts_match(catalog: Mapping[str, Any], *, root: Path) -> bool:
     metadata_path = catalog.get("metadata_source")
     metadata_sha256 = catalog.get("metadata_sha256")
     release_hashes = catalog.get("release_files_sha256")
@@ -393,22 +587,68 @@ def _catalog_artifacts_match(catalog: Mapping[str, Any]) -> bool:
         or not isinstance(release_hashes, Mapping)
     ):
         return False
-    path = Path(metadata_path)
-    if not path.is_file():
-        return False
     try:
+        path = _repository_relative_path(root, metadata_path, "catalog.metadata_source")
         if hashlib.sha256(path.read_bytes()).hexdigest() != metadata_sha256:
             return False
-        for name, expected in release_hashes.items():
-            if not isinstance(name, str) or not isinstance(expected, str):
+        metadata = _load_json(path, "catalog metadata")
+        release = _load_json(
+            _repository_relative_path(
+                root, catalog.get("release_identity_path"), "catalog release identity"
+            ),
+            "catalog release identity",
+        )
+        digest_path = _repository_relative_path(
+            root, catalog.get("digest_path"), "catalog digest"
+        )
+        checksum_path = _repository_relative_path(
+            root, catalog.get("sha256sum_path"), "catalog sha256sum"
+        )
+        files_path = _repository_relative_path(
+            root, catalog.get("release_files_path"), "catalog release files"
+        )
+        release_files = _load_json(files_path, "catalog release files")
+        checksums: dict[str, str] = {}
+        for line in checksum_path.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) != 2 or HEX64.fullmatch(parts[0]) is None:
                 return False
-            artifact = path.parent / name
-            if (
-                not artifact.is_file()
-                or hashlib.sha256(artifact.read_bytes()).hexdigest() != expected
-            ):
-                return False
-    except OSError:
+            checksums[parts[1].lstrip("*")] = parts[0]
+        digest = digest_path.read_text(encoding="utf-8").strip()
+        release_digest = hashlib.sha256(checksum_path.read_bytes()).hexdigest()
+        rootfs_match = re.search(r"\bdstack\.rootfs_hash=([0-9a-f]{64})\b", metadata["cmdline"])
+        if (
+            metadata.get("version") != catalog.get("version")
+            or metadata.get("git_revision") != META_DSTACK_COMMIT
+            or metadata.get("is_dev") is not False
+            or release.get("name") != catalog.get("name")
+            or release.get("slug") != catalog.get("slug")
+            or release.get("version") != catalog.get("version")
+            or release.get("source_revision") != META_DSTACK_COMMIT
+            or release.get("dstack_revision") != DSTACK_COMMIT
+            or release.get("is_dev") is not False
+            or release.get("os_image_hash") != catalog.get("os_image_hash")
+            or digest != catalog.get("digest_txt")
+            or digest != catalog.get("os_image_hash")
+            or release_digest != digest
+            or not rootfs_match
+            or release.get("release_files_sha256") != release_hashes
+            or checksums != {
+                name: expected
+                for name, expected in release_hashes.items()
+                if name != "rootfs.img.verity"
+            }
+            or set(release_files) != set(release_hashes)
+            or any(
+                not isinstance(release_files[name], Mapping)
+                or release_files[name].get("sha256") != expected
+                or not isinstance(release_files[name].get("size"), int)
+                or release_files[name]["size"] <= 0
+                for name, expected in release_hashes.items()
+            )
+        ):
+            return False
+    except (KeyError, OSError, MeasurementAllowlistError):
         return False
     return True
 
@@ -419,6 +659,7 @@ def _validate_live_evidence(
     index: int,
     canonical: Mapping[str, str],
     allowlisted_compose_hash: str,
+    root: Path,
 ) -> None:
     if not isinstance(evidence, Mapping):
         raise MeasurementAllowlistError(f"live_evidence[{index}] must be an object")
@@ -429,15 +670,25 @@ def _validate_live_evidence(
     info_path = evidence.get("info_path")
     if not isinstance(info_path, str):
         raise MeasurementAllowlistError(f"live_evidence[{index}] info_path is missing")
-    quote_file = Path(quote_path)
-    attestation_file = Path(attestation_path)
-    info_file = Path(info_path)
-    if (
-        not quote_file.is_file()
-        or not attestation_file.is_file()
-        or not info_file.is_file()
-    ):
-        raise MeasurementAllowlistError(f"live_evidence[{index}] paths are not files")
+    quote_file = _repository_relative_path(
+        root, quote_path, f"live_evidence[{index}].quote_path"
+    )
+    attestation_file = _repository_relative_path(
+        root, attestation_path, f"live_evidence[{index}].attestation_path"
+    )
+    info_file = _repository_relative_path(
+        root, info_path, f"live_evidence[{index}].info_path"
+    )
+    event_file = _repository_relative_path(
+        root,
+        evidence.get("event_log_path"),
+        f"live_evidence[{index}].event_log_path",
+    )
+    deployment_file = _repository_relative_path(
+        root,
+        evidence.get("deployment_path"),
+        f"live_evidence[{index}].deployment_path",
+    )
     quote_hex = quote_file.read_text(encoding="utf-8").strip()
     try:
         quote = bytes.fromhex(quote_hex)
@@ -512,7 +763,16 @@ def _validate_live_evidence(
     event_log = tcb_info.get("event_log")
     if not isinstance(event_log, list):
         raise MeasurementAllowlistError(f"live_evidence[{index}] has no event_log")
-    replay = replay_rtmr3(event_log)
+    retained_event_log = _load_json(event_file, "retained RTMR3 event log")
+    if not isinstance(retained_event_log, list) or not retained_event_log:
+        raise MeasurementAllowlistError(
+            f"live_evidence[{index}] retained event log is empty"
+        )
+    if retained_event_log != event_log:
+        raise MeasurementAllowlistError(
+            f"live_evidence[{index}] retained event log differs from attestation"
+        )
+    replay = replay_rtmr3(retained_event_log)
     if replay["rtmr3"] != signed["rtmr3"]:
         raise MeasurementAllowlistError(f"live_evidence[{index}] RTMR3 replay mismatch")
     if replay["compose_hash"] != allowlisted_compose_hash:
@@ -556,6 +816,7 @@ def _validate_live_evidence(
             f"live_evidence[{index}] os-image-hash event drift"
         )
     info = _load_json(info_file, "live /Info")
+    deployment = _load_json(deployment_file, "deployment record")
     os_info = info.get("os") if isinstance(info, Mapping) else None
     if (
         not isinstance(info, Mapping)
@@ -570,6 +831,24 @@ def _validate_live_evidence(
         or info.get("compose_hash") != allowlisted_compose_hash
     ):
         raise MeasurementAllowlistError(f"live_evidence[{index}] /Info identity drift")
+    if (
+        deployment.get("app_id") != app_id
+        or deployment.get("cvm_name") != evidence.get("cvm_name")
+        or deployment.get("instance_type") != "tdx.small"
+        or deployment.get("os_image") != CATALOG_SLUG
+        or deployment.get("automatic_placement") is not True
+        or deployment.get("requested_region") is not None
+        or deployment.get("requested_node_id") is not None
+        or deployment.get("image_ref")
+        != "docker.io/mathiiss/basecrawl-cvm@sha256:"
+        "57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+        or deployment.get("compose_hash") != allowlisted_compose_hash
+        or deployment.get("created") is not True
+        or deployment.get("deleted") is not True
+    ):
+        raise MeasurementAllowlistError(
+            f"live_evidence[{index}] deployment record drift"
+        )
     compose_file = info.get("compose_file")
     if not isinstance(compose_file, Mapping):
         raise MeasurementAllowlistError(
@@ -658,4 +937,6 @@ __all__ = [
     "phala_app_compose_hash",
     "replay_rtmr3",
     "validate_reconciliation",
+    "verify_evidence_manifest",
+    "write_evidence_manifest",
 ]

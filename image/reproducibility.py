@@ -47,6 +47,8 @@ PROVENANCE_FIELDS = (
     "attestation_path",
     "info_path",
 )
+EVIDENCE_BUNDLE = IMAGE_DIR / "evidence" / "m2"
+EVIDENCE_MANIFEST = EVIDENCE_BUNDLE / "manifest.json"
 DEPLOYMENT_FIELDS = ("app_id", "cvm_name")
 
 
@@ -194,10 +196,26 @@ def validate_definitions() -> dict[str, Any]:
         problems.append("forbidden build-time playwright dependency installer found")
     if problems:
         raise ReproducibilityError("; ".join(problems))
+    try:
+        from measurement_allowlist import (
+            MeasurementAllowlistError,
+            validate_reconciliation,
+        )
+
+        reconciliation = validate_reconciliation(
+            IMAGE_DIR / "measurement-reconciliation.json",
+            allowlist_path=IMAGE_DIR / "allowlist.json",
+            app_compose_path=IMAGE_DIR / "phala-app-compose.json",
+        )
+    except (ImportError, MeasurementAllowlistError) as error:
+        raise ReproducibilityError(
+            f"measurement evidence validation failed: {error}"
+        ) from error
     return {
         "dockerfile_images": list(dockerfile.external_images),
         "compose_services": list(compose.services),
         "dstack_socket_mounted": compose.mounts_dstack_socket,
+        "measurement_evidence": reconciliation["status"],
     }
 
 
@@ -335,10 +353,21 @@ def _require_live_provenance(entry: dict[str, Any], index: int) -> str:
         if not isinstance(value, str):
             raise ReproducibilityError(f"evidence[{index}] {field} must be a path")
         path = Path(value)
-        if not path.is_absolute() or not path.is_file():
+        if path.is_absolute() or ".." in path.parts:
             raise ReproducibilityError(
-                f"evidence[{index}] {field} is not an existing absolute file: {value!r}"
+                f"evidence[{index}] {field} must be repository-relative: {value!r}"
             )
+        path = IMAGE_DIR / path
+        if not path.is_file():
+            raise ReproducibilityError(
+                f"evidence[{index}] {field} does not exist: {value!r}"
+            )
+        try:
+            path.resolve().relative_to(IMAGE_DIR.resolve())
+        except ValueError as error:
+            raise ReproducibilityError(
+                f"evidence[{index}] {field} escapes the repository: {value!r}"
+            ) from error
         paths[field] = path
 
     metadata = _load_json(paths["build_metadata_path"], "BuildKit metadata")
@@ -477,6 +506,21 @@ def _require_live_provenance(entry: dict[str, Any], index: int) -> str:
     event_log = tcb_info.get("event_log")
     if not isinstance(event_log, list):
         raise ReproducibilityError(f"evidence[{index}] attestation has no event log")
+    try:
+        from measurement_allowlist import (
+            MeasurementAllowlistError,
+            replay_rtmr3,
+        )
+
+        replay = replay_rtmr3(event_log)
+    except (ImportError, MeasurementAllowlistError) as error:
+        raise ReproducibilityError(
+            f"evidence[{index}] RTMR3 replay failed: {error}"
+        ) from error
+    if replay["rtmr3"] != signed.get("rt_mr3"):
+        raise ReproducibilityError(
+            f"evidence[{index}] event log does not reproduce signed RTMR3"
+        )
     expected_events = {
         "compose-hash": entry["compose_hash"],
         "os-image-hash": entry["image_identity"],

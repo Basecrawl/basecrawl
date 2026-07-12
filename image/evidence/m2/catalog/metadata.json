@@ -1,0 +1,11 @@
+{
+    "bios": "ovmf.fd",
+    "kernel": "bzImage",
+    "cmdline": "console=ttyS0 init=/init panic=1 net.ifnames=0 biosdevname=0 mce=off oops=panic pci=noearly pci=nommconf random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock dstack.rootfs_hash=a2d0a2af747ac763d56745f81d6aba93c04112076a6c502a3a5e2b45dd8b7c96 dstack.rootfs_size=156594176",
+    "initrd": "initramfs.cpio.gz",
+    "rootfs": "rootfs.img.verity",
+    "version": "0.5.9",
+    "git_revision": "e3655d1390feee3736476f4bda35c4354b4a12fc",
+    "shared_ro": true,
+    "is_dev": false
+}

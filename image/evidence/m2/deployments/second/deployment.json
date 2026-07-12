@@ -1,0 +1,15 @@
+{
+  "cvm_id": "cvm_vKGDVVw8",
+  "vm_uuid": "23c04619-1332-40f9-807f-67df541996e1",
+  "app_id": "ba6462953533760fc71ba76e4c5243143c57cdc0",
+  "cvm_name": "basecrawl-reconcile-20260711-f01368",
+  "instance_type": "tdx.small",
+  "os_image": "dstack-0.5.9-bd369a8c",
+  "automatic_placement": true,
+  "requested_region": null,
+  "requested_node_id": null,
+  "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+  "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
+  "created": true,
+  "deleted": true
+}

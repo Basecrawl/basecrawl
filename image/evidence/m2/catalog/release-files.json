@@ -1,0 +1,22 @@
+{
+  "ovmf.fd": {
+    "sha256": "76888ce69c91aed86c43f840b913899b40b981964b7ce6018667f91ad06301f0",
+    "size": 4194304
+  },
+  "bzImage": {
+    "sha256": "92ceba363abfd655c4f1d3e6fe0df44868436dc4c25cf86efb11adf6c6db31dd",
+    "size": 8798208
+  },
+  "initramfs.cpio.gz": {
+    "sha256": "4662c4f04f56cb08ab1074da7307dda513468d02ee6e6b6d934373b07a8b3899",
+    "size": 7839982
+  },
+  "metadata.json": {
+    "sha256": "d166e9ffcb3c556983956fd6e81ba8114cd0a3fe4bbcdb1bdf085ac86f678eb0",
+    "size": 607
+  },
+  "rootfs.img.verity": {
+    "sha256": "e92ad3aeae158f08706f634509f756d6d838c81dd08eded68cc4aab041fe7fd8",
+    "size": 162791424
+  }
+}

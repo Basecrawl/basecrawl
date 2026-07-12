@@ -1,0 +1,30 @@
+{
+  "files": {
+    "build/build-1.metadata.json": "2ef2e4c13f0d61cb5060e060a4fb5cd38af94d5410bd97ca394bf9ab3a76df52",
+    "build/build-2.metadata.json": "f2530cf56c6e1e9abfde5259f4fa899f01273ffdd0a225e0047977ca65883a59",
+    "build/build-command.json": "44f9b6fcf92d7183e09e69f2e8871434abf0cfeac26fb3cac3652f3b05bffcd3",
+    "build/publish.metadata.json": "167c371ae24075954c5f8f7b92af60d9c4874eaa229e282f283d69162e675bb4",
+    "build/registry-manifest.json": "57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+    "catalog/digest.txt": "946f0d1827e6f723145c6b952a321100a7ebb5d1a24b0541dd002e4878526621",
+    "catalog/metadata.json": "d166e9ffcb3c556983956fd6e81ba8114cd0a3fe4bbcdb1bdf085ac86f678eb0",
+    "catalog/release-files.json": "388db1dec00575bf07762a0f934a5c992a7ee25f3b1dfb4d49815b38efd90b23",
+    "catalog/release.json": "5417900a1a7ac48383515236a95a4f56d51a4eb092ab065ed1f135a42eeaede9",
+    "catalog/sha256sum.txt": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+    "cleanup/final-inventory.json": "e05ea7b0b6a51cafca3e16b5db1101e75df089c6057a647c766ed5ddea7be82d",
+    "compose/docker-compose.yml": "4778611a0654dab542e1a2149d3b16275e81c0293dba652ad1424a54b0338740",
+    "compose/phala-app-compose.json": "3776fd82f1bf2f1312cacb78e4e8bda4f8846384c8ee256c24170aee943c8b5a",
+    "deployments/first/attestation.json": "d83b29963549d93af9fed1645921dfac8b1b8105dbf3dcb09602ad5a8cadca50",
+    "deployments/first/deployment.json": "d508247b2464898da050fbc691fe1d1be01f7fa7da87969fd8f3e753c923a74e",
+    "deployments/first/event-log.json": "4b3ef7563200d28193cfe99a9997e288ca1141b471f11925611b1ee7632bdd27",
+    "deployments/first/info.json": "4e771c80dde1f43f4319b8989a9b19abb6ddae6d85c7da489652ca998321149f",
+    "deployments/first/quote.hex": "7c2640a12b8ff49b440e6b1392235c55b338f53c73626a1ccbba0729f7404912",
+    "deployments/second/attestation.json": "f4c81a8556ac5614bd689387ba673b83d20fb7ce91ed6473c398e37ec5849c0c",
+    "deployments/second/deployment.json": "bb5a298ad03ac9c33c8004f3f312c877e0bdc786ef9a8ef20bfb973b904d3295",
+    "deployments/second/event-log.json": "fb5487c8dc213f55d044553728a442754063ea916c45a8b55d7492aaecb56ada",
+    "deployments/second/info.json": "bc196e4621a4e3cd5dc3769db444d432150c1a780bdf691bf5226978879c69f7",
+    "deployments/second/quote.hex": "37cb987e99a8296ffb73073ec302b36b24e195b6bd35192392a7096a5113477e",
+    "measurement/dstack-mr-invocation.json": "92121d3b528c19fcf08661a0f0949be802590274a2313a82fc35e054f3bbaf2a",
+    "measurement/dstack-mr-output.json": "bad10fca4371bc867cca359aeb7e74cccae282fbeec13240f19ee90a96027c24"
+  },
+  "version": 1
+}

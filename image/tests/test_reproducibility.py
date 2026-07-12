@@ -111,6 +111,10 @@ services:
         )
         self.assertIn("--platform linux/amd64", joined)
 
+    def test_validate_definitions_includes_durable_measurement_evidence(self) -> None:
+        report = repro.validate_definitions()
+        self.assertEqual(report["measurement_evidence"], "reconciled")
+
 
 class ReproducibilityEvidenceTests(unittest.TestCase):
     def test_two_matching_builds_and_deployments_pass(self) -> None:
@@ -172,6 +176,16 @@ class ReproducibilityEvidenceTests(unittest.TestCase):
         evidence[1]["app_id"] = evidence[0]["app_id"]
         with self.assertRaisesRegex(repro.ReproducibilityError, "app_id is not unique"):
             repro.assert_reproducible_evidence(evidence)
+
+    def test_absolute_tmp_provenance_is_rejected(self) -> None:
+        entry = matching_evidence()[0]
+        for field in repro.PROVENANCE_FIELDS:
+            entry[field] = f"/tmp/{field}.json"
+        with self.assertRaisesRegex(
+            repro.ReproducibilityError,
+            "repository-relative",
+        ):
+            repro._require_live_provenance(entry, 0)
 
 
 if __name__ == "__main__":

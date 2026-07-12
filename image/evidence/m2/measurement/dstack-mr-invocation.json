@@ -1,0 +1,20 @@
+{
+  "binary": "dstack-mr-cli 0.1.0",
+  "source_revision": "282eeb27d22d8f091ad0fa5a90e638f85cf68751",
+  "metadata": "../catalog/metadata.json",
+  "metadata_sha256": "d166e9ffcb3c556983956fd6e81ba8114cd0a3fe4bbcdb1bdf085ac86f678eb0",
+  "cpu": 1,
+  "memory": "2G",
+  "qemu_version": "8.0.0",
+  "arguments": [
+    "measure",
+    "--cpu",
+    "1",
+    "--memory",
+    "2G",
+    "--qemu-version",
+    "8.0.0",
+    "--json",
+    "../catalog/metadata.json"
+  ]
+}

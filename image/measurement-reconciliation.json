@@ -8,12 +8,14 @@
     "rtmr2": "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
   },
   "catalog": {
+    "digest_path": "evidence/m2/catalog/digest.txt",
     "digest_txt": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
     "is_dev": false,
     "metadata_sha256": "d166e9ffcb3c556983956fd6e81ba8114cd0a3fe4bbcdb1bdf085ac86f678eb0",
-    "metadata_source": "/tmp/dstack-0.5.9-official-release/dstack-0.5.9/metadata.json",
+    "metadata_source": "evidence/m2/catalog/metadata.json",
     "name": "dstack-0.5.9",
     "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+    "release_files_path": "evidence/m2/catalog/release-files.json",
     "release_files_sha256": {
       "bzImage": "92ceba363abfd655c4f1d3e6fe0df44868436dc4c25cf86efb11adf6c6db31dd",
       "initramfs.cpio.gz": "4662c4f04f56cb08ab1074da7307dda513468d02ee6e6b6d934373b07a8b3899",
@@ -21,21 +23,26 @@
       "ovmf.fd": "76888ce69c91aed86c43f840b913899b40b981964b7ce6018667f91ad06301f0",
       "rootfs.img.verity": "e92ad3aeae158f08706f634509f756d6d838c81dd08eded68cc4aab041fe7fd8"
     },
+    "release_identity_path": "evidence/m2/catalog/release.json",
+    "sha256sum_path": "evidence/m2/catalog/sha256sum.txt",
     "slug": "dstack-0.5.9-bd369a8c",
     "version": "0.5.9"
   },
   "cleanup": {
     "account_cvm_total_after_cleanup": 1,
+    "inventory_path": "evidence/m2/cleanup/final-inventory.json",
     "mission_owned_cvm_total_after_cleanup": 0,
     "protected_user_cvm_preserved": true,
     "temporary_cvms_deleted": true
   },
   "dstack_mr": {
-    "binary": "/root/.cargo/bin/dstack-mr",
+    "binary": "dstack-mr-cli 0.1.0",
     "cpu": 1,
+    "invocation_path": "evidence/m2/measurement/dstack-mr-invocation.json",
     "memory": "2G",
-    "metadata_path": "/tmp/dstack-0.5.9-official-release/dstack-0.5.9/metadata.json",
+    "metadata_path": "evidence/m2/catalog/metadata.json",
     "metadata_sha256": "d166e9ffcb3c556983956fd6e81ba8114cd0a3fe4bbcdb1bdf085ac86f678eb0",
+    "output_path": "evidence/m2/measurement/dstack-mr-output.json",
     "qemu_version": "8.0.0",
     "registers": {
       "mrtd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
@@ -45,11 +52,23 @@
     },
     "version": "dstack-mr-cli 0.1.0"
   },
+  "evidence_bundle": {
+    "manifest_path": "evidence/m2/manifest.json",
+    "version": 1
+  },
   "image": {
     "all_service_images_digest_pinned": true,
+    "build_command_path": "evidence/m2/build/build-command.json",
     "build_digest": "sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
-    "compose_file": "docker-compose.yml",
-    "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+    "build_metadata_paths": [
+      "evidence/m2/build/build-1.metadata.json",
+      "evidence/m2/build/build-2.metadata.json"
+    ],
+    "compose_file": "evidence/m2/compose/docker-compose.yml",
+    "image_ref": "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366",
+    "phala_app_compose": "evidence/m2/compose/phala-app-compose.json",
+    "publish_metadata_path": "evidence/m2/build/publish.metadata.json",
+    "registry_manifest_path": "evidence/m2/build/registry-manifest.json"
   },
   "live_event_replay": {
     "compose_hash_event": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
@@ -111,8 +130,10 @@
   "live_evidence": [
     {
       "app_id": "bd003bdb2818d54e93ef23e5490f3292b54685b7",
-      "attestation_path": "/tmp/basecrawl-quote-attestation-cli.json",
+      "attestation_path": "evidence/m2/deployments/first/attestation.json",
       "cvm_name": "basecrawl-quote-20260711-2238",
+      "deployment_path": "evidence/m2/deployments/first/deployment.json",
+      "event_log_path": "evidence/m2/deployments/first/event-log.json",
       "event_names": [
         "system-preparing",
         "app-id",
@@ -125,16 +146,18 @@
         "storage-fs",
         "system-ready"
       ],
-      "info_path": "/tmp/basecrawl-quote-cvm-final.json",
-      "quote_path": "/tmp/basecrawl-first-cert-quote.hex",
+      "info_path": "evidence/m2/deployments/first/info.json",
+      "quote_path": "evidence/m2/deployments/first/quote.hex",
       "quote_rtmr3": "b84947add72a9ec85d3c069fba3a08d3a694d9a4a52b5d0ad1e3d73fb18d4c4eeffd1587d0a6b9da0fccd2144ba1d7ce",
       "replayed_rtmr3": "b84947add72a9ec85d3c069fba3a08d3a694d9a4a52b5d0ad1e3d73fb18d4c4eeffd1587d0a6b9da0fccd2144ba1d7ce",
       "rtmr3": "b84947add72a9ec85d3c069fba3a08d3a694d9a4a52b5d0ad1e3d73fb18d4c4eeffd1587d0a6b9da0fccd2144ba1d7ce"
     },
     {
       "app_id": "ba6462953533760fc71ba76e4c5243143c57cdc0",
-      "attestation_path": "/tmp/basecrawl-reconcile-attestation.json",
+      "attestation_path": "evidence/m2/deployments/second/attestation.json",
       "cvm_name": "basecrawl-reconcile-20260711-f01368",
+      "deployment_path": "evidence/m2/deployments/second/deployment.json",
+      "event_log_path": "evidence/m2/deployments/second/event-log.json",
       "event_names": [
         "system-preparing",
         "app-id",
@@ -147,8 +170,8 @@
         "storage-fs",
         "system-ready"
       ],
-      "info_path": "/tmp/basecrawl-reconcile-get.json",
-      "quote_path": "/tmp/basecrawl-second-cert-quote.hex",
+      "info_path": "evidence/m2/deployments/second/info.json",
+      "quote_path": "evidence/m2/deployments/second/quote.hex",
       "quote_rtmr3": "e18384b488d1b6b06b1ef82a8d449416968bc47d553222259ba53f46b315c240a7a6f0d608cd3d90ad545fe9321004b2",
       "replayed_rtmr3": "e18384b488d1b6b06b1ef82a8d449416968bc47d553222259ba53f46b315c240a7a6f0d608cd3d90ad545fe9321004b2",
       "rtmr3": "e18384b488d1b6b06b1ef82a8d449416968bc47d553222259ba53f46b315c240a7a6f0d608cd3d90ad545fe9321004b2"
@@ -183,7 +206,7 @@
   },
   "local_source_build": {
     "git_revision": "<unknown>",
-    "metadata_path": "/tmp/repo-analysis/meta-dstack/repro-build/dist/dstack-0.5.9/metadata.json",
+    "metadata_path": "not-retained-noncanonical-local-build",
     "metadata_sha256": "7763b1f1c374f8a4f0c4c40f52f5cb8ec213ed03494d2d3588a5058c7010deca",
     "rootfs_hash": "526ff6fd10c96fdcbafd757489c4499d0a4385d76472302cdadc5ebba749908a",
     "rootfs_img_verity_sha256": "011b7131f003453f6ca91c333ddf8fa0cf36ea616234f21770046992685c805c"
