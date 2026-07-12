@@ -307,14 +307,17 @@
       "stage": "validation",
       "status": "passed",
       "validation": {
-        "command": "python3 -c replay_rtmr3 evidence/m2/deployments/first/event-log.json",
+        "command": "python3 image/replay_rtmr3.py image/evidence/m2/deployments/first/event-log.json",
         "exit_code": 0,
         "kind": "direct RTMR3 replay",
         "result": {
           "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
-          "status": "matched"
+          "rtmr3": "b84947add72a9ec85d3c069fba3a08d3a694d9a4a52b5d0ad1e3d73fb18d4c4eeffd1587d0a6b9da0fccd2144ba1d7ce"
         },
-        "status": "passed"
+        "status": "passed",
+        "stderr": "",
+        "stdout": "{\"compose_hash\":\"5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42\",\"rtmr3\":\"b84947add72a9ec85d3c069fba3a08d3a694d9a4a52b5d0ad1e3d73fb18d4c4eeffd1587d0a6b9da0fccd2144ba1d7ce\"}\n",
+        "working_directory": "/projects/platform-network/basecrawl"
       }
     },
     {
@@ -576,14 +579,17 @@
       "stage": "validation",
       "status": "passed",
       "validation": {
-        "command": "python3 -c replay_rtmr3 evidence/m2/deployments/second/event-log.json",
+        "command": "python3 image/replay_rtmr3.py image/evidence/m2/deployments/second/event-log.json",
         "exit_code": 0,
         "kind": "direct RTMR3 replay",
         "result": {
           "compose_hash": "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42",
-          "status": "matched"
+          "rtmr3": "e18384b488d1b6b06b1ef82a8d449416968bc47d553222259ba53f46b315c240a7a6f0d608cd3d90ad545fe9321004b2"
         },
-        "status": "passed"
+        "status": "passed",
+        "stderr": "",
+        "stdout": "{\"compose_hash\":\"5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42\",\"rtmr3\":\"e18384b488d1b6b06b1ef82a8d449416968bc47d553222259ba53f46b315c240a7a6f0d608cd3d90ad545fe9321004b2\"}\n",
+        "working_directory": "/projects/platform-network/basecrawl"
       }
     },
     {

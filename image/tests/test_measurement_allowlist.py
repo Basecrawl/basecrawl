@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import subprocess
 import shutil
 import sys
 import tempfile
@@ -204,9 +205,9 @@ class MeasurementAllowlistTests(unittest.TestCase):
                         elif mutation == "wrong_output":
                             history["Attachments"][0]["Digest"] = "sha256:" + "0" * 64
                         else:
-                            second_history = root / record["image"][
-                                "build_history_paths"
-                            ][1]
+                            second_history = (
+                                root / record["image"]["build_history_paths"][1]
+                            )
                             second_history.write_text(history_path.read_text())
                         if mutation in {"wrong_ref", "wrong_output"}:
                             history_path.write_text(json.dumps(history))
@@ -215,7 +216,9 @@ class MeasurementAllowlistTests(unittest.TestCase):
                     )
                     path = root / "measurement-reconciliation.json"
                     path.write_text(json.dumps(record))
-                    with self.assertRaises(measurements.MeasurementAllowlistError) as raised:
+                    with self.assertRaises(
+                        measurements.MeasurementAllowlistError
+                    ) as raised:
                         measurements.validate_reconciliation(
                             path,
                             allowlist_path=ALLOWLIST_PATH,
@@ -576,11 +579,11 @@ class MeasurementAllowlistTests(unittest.TestCase):
         for event_index, operation_id in mutations:
             with self.subTest(event_index=event_index, operation_id=operation_id):
                 self.assert_execution_mutation_rejected(
-                    lambda execution,
-                    event_index=event_index,
-                    operation_id=operation_id: execution["events"][
-                        event_index
-                    ].update(operation_id=operation_id),
+                    lambda execution, event_index=event_index, operation_id=operation_id: (
+                        execution["events"][event_index].update(
+                            operation_id=operation_id
+                        )
+                    ),
                     pattern="operation ID",
                 )
 
@@ -1040,6 +1043,127 @@ class MeasurementAllowlistTests(unittest.TestCase):
             "digest mismatch",
         ):
             measurements.replay_rtmr3(events)
+
+    def test_canonical_replay_cli_executes_both_retained_logs(self) -> None:
+        record = json.loads(RECONCILIATION_PATH.read_text())
+        for evidence in record["live_evidence"]:
+            event_path = IMAGE_DIR / evidence["event_log_path"]
+            command = [
+                sys.executable,
+                str(IMAGE_DIR / "replay_rtmr3.py"),
+                str(event_path.relative_to(IMAGE_DIR.parent)),
+            ]
+            completed = subprocess.run(
+                command,
+                cwd=IMAGE_DIR.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                json.loads(completed.stdout),
+                {
+                    "compose_hash": record["canonical_measurement"]["compose_hash"],
+                    "rtmr3": evidence["rtmr3"],
+                },
+            )
+            self.assertEqual(completed.stderr, "")
+
+    def test_canonical_replay_cli_fails_with_structured_error_on_tampered_log(
+        self,
+    ) -> None:
+        record = json.loads(RECONCILIATION_PATH.read_text())
+        event_path = IMAGE_DIR / record["live_evidence"][0]["event_log_path"]
+        events = json.loads(event_path.read_text())
+        runtime_event = next(event for event in events if event.get("imr") == 3)
+        runtime_event["event_payload"] = "00"
+        with tempfile.TemporaryDirectory() as temporary:
+            tampered = Path(temporary) / "event-log.json"
+            tampered.write_text(json.dumps(events))
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(IMAGE_DIR / "replay_rtmr3.py"),
+                    str(tampered),
+                ],
+                cwd=IMAGE_DIR.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "")
+        error = json.loads(completed.stderr)
+        self.assertEqual(error["error"]["code"], "rtmr3_replay_failed")
+        self.assertIn("digest mismatch", error["error"]["message"])
+
+    def test_execution_record_binds_replay_stdout_and_result(self) -> None:
+        record = measurements.validate_reconciliation(
+            RECONCILIATION_PATH,
+            allowlist_path=ALLOWLIST_PATH,
+            app_compose_path=APP_COMPOSE_PATH,
+        )
+        execution_path = IMAGE_DIR / record["evidence_bundle"]["execution_record_path"]
+        execution = json.loads(execution_path.read_text())
+        replay_events = {
+            event["deployment"]: event
+            for event in execution["events"]
+            if event["stage"] == "validation"
+            and event["validation"]["kind"] == "direct RTMR3 replay"
+        }
+        for deployment, event in replay_events.items():
+            validation = event["validation"]
+            result = json.loads(validation["stdout"])
+            self.assertEqual(result, validation["result"])
+            self.assertEqual(
+                result["rtmr3"],
+                record["live_evidence"][0 if deployment == "first" else 1]["rtmr3"],
+            )
+            self.assertEqual(type(validation["exit_code"]), int)
+            self.assertEqual(validation["exit_code"], 0)
+
+    def test_execution_record_rejects_non_integer_replay_exit_codes(self) -> None:
+        for replacement in (False, True, "0", 0.0, None, 1):
+            with self.subTest(replacement=replacement):
+                self.assert_execution_mutation_rejected(
+                    lambda execution, replacement=replacement: execution["events"][5][
+                        "validation"
+                    ].update(exit_code=replacement),
+                    pattern="validation exit code",
+                )
+
+    def test_execution_record_rejects_fabricated_replay_stdout(self) -> None:
+        def alter_stdout(execution: dict[str, object]) -> None:
+            execution["events"][5]["validation"]["stdout"] = json.dumps(
+                {
+                    "compose_hash": "0" * 64,
+                    "rtmr3": "0" * 96,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        self.assert_execution_mutation_rejected(
+            alter_stdout,
+            pattern="validation stdout",
+        )
+
+    def test_execution_record_rejects_replay_command_drift(self) -> None:
+        self.assert_execution_mutation_rejected(
+            lambda execution: execution["events"][5]["validation"].update(
+                command="python3 image/replay_rtmr3.py image/evidence/other.json"
+            ),
+            pattern="validation command",
+        )
+
+    def test_execution_record_rejects_replay_result_drift(self) -> None:
+        self.assert_execution_mutation_rejected(
+            lambda execution: execution["events"][5]["validation"]["result"].update(
+                rtmr3="0" * 96
+            ),
+            pattern="validation result",
+        )
 
     def test_missing_reconciliation_artifact_fails_closed(self) -> None:
         with self.assertRaises(measurements.MeasurementAllowlistError):

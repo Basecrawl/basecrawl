@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -34,6 +35,8 @@ CANONICAL_FIELDS = (
 REGISTER_FIELDS = frozenset({"mrtd", "rtmr0", "rtmr1", "rtmr2"})
 HEX96 = re.compile(r"^[0-9a-f]{96}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_WORKING_DIRECTORY = "/projects/platform-network/basecrawl"
 
 DSTACK_COMMIT = "282eeb27d22d8f091ad0fa5a90e638f85cf68751"
 META_DSTACK_COMMIT = "e3655d1390feee3736476f4bda35c4354b4a12fc"
@@ -831,6 +834,8 @@ def validate_reconciliation(
     _validate_execution_record(
         execution_record,
         deployment_records=deployment_records,
+        live_evidence=live_evidence,
+        canonical=canonical,
         root=record_root,
         manifest_files=manifest_files,
     )
@@ -899,6 +904,8 @@ def _validate_execution_record(
     value: Any,
     *,
     deployment_records: list[dict[str, Any]],
+    live_evidence: list[Any],
+    canonical: Mapping[str, str],
     root: Path,
     manifest_files: Mapping[str, str],
 ) -> None:
@@ -1069,6 +1076,9 @@ def _validate_execution_record(
                 event,
                 deployment_name=deployment_name,
                 expected_kind=EXECUTION_VALIDATION_KINDS[validation_index],
+                expected_evidence=live_evidence[0 if deployment_name == "first" else 1],
+                canonical=canonical,
+                root=root,
             )
             deployment_validation_index[deployment_name] = validation_index + 1
         elif stage == "deletion":
@@ -1228,14 +1238,17 @@ def _validate_validation_event(
     *,
     deployment_name: str,
     expected_kind: str,
+    expected_evidence: Mapping[str, Any],
+    canonical: Mapping[str, str],
+    root: Path,
 ) -> None:
     validation = event.get("validation")
-    if (
-        not isinstance(validation, Mapping)
-        or set(validation) != {"command", "exit_code", "kind", "result", "status"}
-        or validation.get("exit_code") != 0
-        or validation.get("status") != "passed"
-        or not isinstance(validation.get("result"), Mapping)
+    if not isinstance(validation, Mapping):
+        raise MeasurementAllowlistError("execution record validation result drift")
+    if type(validation.get("exit_code")) is not int or validation.get("exit_code") != 0:
+        raise MeasurementAllowlistError("execution record validation exit code drift")
+    if validation.get("status") != "passed" or not isinstance(
+        validation.get("result"), Mapping
     ):
         raise MeasurementAllowlistError("execution record validation result drift")
 
@@ -1255,12 +1268,14 @@ def _validate_validation_event(
             "artifacts": (f"{deployment_prefix}/quote.hex",),
         },
         "direct RTMR3 replay": {
-            "command": (f"python3 -c replay_rtmr3 {deployment_prefix}/event-log.json"),
+            "command": (
+                "python3 image/replay_rtmr3.py "
+                f"image/evidence/m2/deployments/{deployment_name}/event-log.json"
+            ),
+            "working_directory": REPOSITORY_WORKING_DIRECTORY,
             "result": {
-                "compose_hash": (
-                    "5f87b1082fdb39e7345db64bb5d5b5b62fff01b0afc624ad4da861ede4361a42"
-                ),
-                "status": "matched",
+                "compose_hash": canonical["compose_hash"],
+                "rtmr3": expected_evidence.get("rtmr3"),
             },
             "artifacts": (f"{deployment_prefix}/event-log.json",),
         },
@@ -1275,7 +1290,74 @@ def _validate_validation_event(
             "execution record validation kind or order drift"
         )
     expected = canonical_specs[expected_kind]
-    if validation.get("command") != expected["command"]:
+    if expected_kind == "direct RTMR3 replay":
+        if set(validation) != {
+            "command",
+            "exit_code",
+            "kind",
+            "result",
+            "status",
+            "stderr",
+            "stdout",
+            "working_directory",
+        }:
+            raise MeasurementAllowlistError(
+                "execution record validation result fields drift"
+            )
+        if (
+            validation.get("working_directory") != expected["working_directory"]
+            or not isinstance(validation.get("stdout"), str)
+            or not isinstance(validation.get("stderr"), str)
+            or validation.get("stderr") != ""
+        ):
+            raise MeasurementAllowlistError(
+                "execution record validation output metadata drift"
+            )
+        if validation.get("command") != expected["command"]:
+            raise MeasurementAllowlistError("execution record validation command drift")
+        try:
+            command = shlex.split(validation["command"])
+            completed = subprocess.run(
+                command,
+                cwd=Path(validation["working_directory"]),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise MeasurementAllowlistError(
+                "execution record replay command could not run"
+            ) from error
+        if completed.returncode != validation["exit_code"]:
+            raise MeasurementAllowlistError(
+                "execution record validation exit code does not match execution"
+            )
+        if (
+            completed.stdout != validation["stdout"]
+            or completed.stderr != validation["stderr"]
+        ):
+            raise MeasurementAllowlistError(
+                "execution record validation stdout/stderr does not match execution"
+            )
+        try:
+            replayed_output = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError) as error:
+            raise MeasurementAllowlistError(
+                "execution record replay command returned malformed JSON"
+            ) from error
+        if replayed_output != expected["result"]:
+            raise MeasurementAllowlistError(
+                "execution record validation stdout/result does not match signed evidence"
+            )
+    elif set(validation) != {"command", "exit_code", "kind", "result", "status"}:
+        raise MeasurementAllowlistError(
+            "execution record validation result fields drift"
+        )
+    if (
+        expected_kind != "direct RTMR3 replay"
+        and validation.get("command") != expected["command"]
+    ):
         raise MeasurementAllowlistError("execution record validation command drift")
     if dict(validation["result"]) != expected["result"]:
         raise MeasurementAllowlistError("execution record validation result drift")
@@ -1375,6 +1457,7 @@ def _validate_reconciliation_event(event: Mapping[str, Any]) -> None:
         not isinstance(validation, Mapping)
         or set(validation) != {"command", "exit_code", "result", "status"}
         or validation.get("command") != "python3 image/reproducibility.py validate"
+        or type(validation.get("exit_code")) is not int
         or validation.get("exit_code") != 0
         or validation.get("status") != "passed"
         or validation.get("result")
