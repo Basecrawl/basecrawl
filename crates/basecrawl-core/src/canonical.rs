@@ -38,6 +38,13 @@ pub struct ReportDataError {
 /// enclave public key as the final component, which makes a signature key substitution detectable
 /// from the hardware-signed report data.
 pub fn attestation_report_data(proof: &ScrapeProof) -> Result<String, ReportDataError> {
+    let response_hash = response_hash(
+        required(
+            proof.response.headers_hash.as_deref(),
+            "response.headers_hash",
+        )?,
+        required(proof.response.body_hash.as_deref(), "response.body_hash")?,
+    );
     let components = [
         required(proof.task_id.as_deref(), "task_id")?,
         required(proof.nonce.as_deref(), "nonce")?,
@@ -50,7 +57,7 @@ pub fn attestation_report_data(proof: &ScrapeProof) -> Result<String, ReportData
             proof.tls.handshake_transcript_hash.as_deref(),
             "tls.handshake_transcript_hash",
         )?,
-        required(proof.response.body_hash.as_deref(), "response.body_hash")?,
+        response_hash.as_str(),
         required(proof.result.result_hash.as_deref(), "result.result_hash")?,
         required(proof.egress.egress_ip.as_deref(), "egress.egress_ip")?,
         required(proof.egress.timestamp.as_deref(), "egress.timestamp")?,
@@ -125,6 +132,15 @@ pub fn headers_hash(headers: &[(String, String)]) -> String {
 /// digest so the later report-data binding never relies on a nullable body field.
 pub fn body_hash(body: &[u8]) -> String {
     hex(&Sha256::digest(body))
+}
+
+/// Compute the canonical response digest defined by architecture §5.4:
+/// `SHA256(response.headers_hash || response.body_hash)`.
+pub fn response_hash(headers_hash: &str, body_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(headers_hash.as_bytes());
+    hasher.update(body_hash.as_bytes());
+    hex(&hasher.finalize())
 }
 
 /// Compute the deterministic request-side digest defined by architecture §5.4:
@@ -253,7 +269,8 @@ mod tests {
                 ..Tls::default()
             },
             response: Response {
-                body_hash: Some("66".repeat(32)),
+                headers_hash: Some("66".repeat(32)),
+                body_hash: Some("67".repeat(32)),
                 ..Response::default()
             },
             result: ResultBlock {
@@ -274,14 +291,25 @@ mod tests {
         }
     }
 
+    fn independent_response_hash(headers_hash: &str, body_hash: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(headers_hash.as_bytes());
+        hasher.update(body_hash.as_bytes());
+        hex(&hasher.finalize())
+    }
+
     fn independent_report_data(proof: &ScrapeProof, domain_tag: &[u8]) -> String {
+        let response_hash = independent_response_hash(
+            proof.response.headers_hash.as_deref().unwrap(),
+            proof.response.body_hash.as_deref().unwrap(),
+        );
         let components = [
             proof.task_id.as_deref().unwrap(),
             proof.nonce.as_deref().unwrap(),
             proof.request.request_hash.as_deref().unwrap(),
             proof.tls.cert_chain_hash.as_deref().unwrap(),
             proof.tls.handshake_transcript_hash.as_deref().unwrap(),
-            proof.response.body_hash.as_deref().unwrap(),
+            response_hash.as_str(),
             proof.result.result_hash.as_deref().unwrap(),
             proof.egress.egress_ip.as_deref().unwrap(),
             proof.egress.timestamp.as_deref().unwrap(),
@@ -302,8 +330,8 @@ mod tests {
         let expected = independent_report_data(&proof, ATTESTATION_DOMAIN_TAG);
         assert_eq!(
             expected,
-            "3288310d6374c6e8a5f2f7b2e55c5b83f25f041847721a9d28899e2ab0762ff7\
-             35f2c02f077819911f71fd1953d66f8544842dfb966fd4ebe734d32f7ba74771"
+            "a4cab8203edc5783d578e0f44e62c372cdeb879789db1048d9ee20a7cc1f3101\
+             e8c29b0c71afa2942eb95da7384757b975bf2850317bc2cde861a0e946d06e5b"
         );
         assert_eq!(attestation_report_data(&proof).unwrap(), expected);
     }
@@ -350,7 +378,10 @@ mod tests {
         mutations.push(("transcript_hash", changed));
         let mut changed = proof.clone();
         changed.response.body_hash = Some("06".repeat(32));
-        mutations.push(("response_hash", changed));
+        mutations.push(("response_body_hash", changed));
+        let mut changed = proof.clone();
+        changed.response.headers_hash = Some("09".repeat(32));
+        mutations.push(("response_headers_hash", changed));
         let mut changed = proof.clone();
         changed.result.result_hash = Some("07".repeat(32));
         mutations.push(("result_hash", changed));
@@ -367,7 +398,7 @@ mod tests {
         changed.sdk_signature.enclave_pubkey = Some("aa".repeat(32));
         mutations.push(("enclave_pubkey", changed));
 
-        assert_eq!(mutations.len(), 11);
+        assert_eq!(mutations.len(), 12);
         for (field, changed) in mutations {
             assert_ne!(
                 attestation_report_data(&changed).unwrap(),
@@ -378,9 +409,41 @@ mod tests {
     }
 
     #[test]
+    fn header_only_response_mutation_breaks_quote_binding_recomputation() {
+        let quote_bound_proof = attestation_proof();
+        let quote_report_data = attestation_report_data(&quote_bound_proof).unwrap();
+        let mut mutated_proof = quote_bound_proof.clone();
+        mutated_proof.response.headers_hash = Some("ab".repeat(32));
+
+        assert_eq!(
+            quote_report_data,
+            independent_report_data(&quote_bound_proof, ATTESTATION_DOMAIN_TAG)
+        );
+        assert_ne!(
+            quote_report_data,
+            independent_report_data(&mutated_proof, ATTESTATION_DOMAIN_TAG)
+        );
+        assert_ne!(
+            quote_report_data,
+            attestation_report_data(&mutated_proof).unwrap(),
+            "a proof with mutated response headers must not recompute the quote-bound report_data"
+        );
+    }
+
+    #[test]
     fn report_data_component_order_is_canonical() {
         let proof = attestation_proof();
         let correct = attestation_report_data(&proof).unwrap();
+        let response_hash = independent_response_hash(
+            proof.response.headers_hash.as_deref().unwrap(),
+            proof.response.body_hash.as_deref().unwrap(),
+        );
+        let swapped_response_hash = independent_response_hash(
+            proof.response.body_hash.as_deref().unwrap(),
+            proof.response.headers_hash.as_deref().unwrap(),
+        );
+        assert_ne!(response_hash, swapped_response_hash);
+
         let mut hasher = Sha512::new();
         hasher.update(ATTESTATION_DOMAIN_TAG);
         for component in [
@@ -390,7 +453,7 @@ mod tests {
             proof.tls.cert_chain_hash.as_deref().unwrap(),
             proof.tls.handshake_transcript_hash.as_deref().unwrap(),
             proof.result.result_hash.as_deref().unwrap(),
-            proof.response.body_hash.as_deref().unwrap(),
+            response_hash.as_str(),
             proof.egress.egress_ip.as_deref().unwrap(),
             proof.egress.timestamp.as_deref().unwrap(),
             proof.egress.fingerprint_seed.as_deref().unwrap(),
@@ -440,6 +503,24 @@ mod tests {
             attestation_report_data(&empty).unwrap_err(),
             ReportDataError {
                 field: "tls.handshake_transcript_hash"
+            }
+        );
+
+        let mut missing_response_headers = attestation_proof();
+        missing_response_headers.response.headers_hash = None;
+        assert_eq!(
+            attestation_report_data(&missing_response_headers).unwrap_err(),
+            ReportDataError {
+                field: "response.headers_hash"
+            }
+        );
+
+        let mut missing_response_body = attestation_proof();
+        missing_response_body.response.body_hash = None;
+        assert_eq!(
+            attestation_report_data(&missing_response_body).unwrap_err(),
+            ReportDataError {
+                field: "response.body_hash"
             }
         );
 
