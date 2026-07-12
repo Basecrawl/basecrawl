@@ -6,6 +6,7 @@ members = [
     "bindings/python",
     "crates/basecrawl-core",
     "crates/basecrawl-ffi",
+    "crates/basecrawl-fp",
     "crates/basecrawl-proof",
     "crates/basecrawl-render",
     "crates/basecrawl-seal",

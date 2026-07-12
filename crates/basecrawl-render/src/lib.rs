@@ -202,6 +202,19 @@ pub struct RenderConfig {
     pub max_scrolls: usize,
     /// When true, a detected cookie/consent overlay is dismissed before capture.
     pub dismiss_consent: bool,
+    /// `Accept-Language` passed to CDP `Network.setUserAgentOverride`.
+    pub accept_language: Option<String>,
+    /// Platform token passed to CDP `Network.setUserAgentOverride`.
+    pub platform: Option<String>,
+    /// IANA timezone applied via `Emulation.setTimezoneOverride`.
+    pub timezone: Option<String>,
+    /// Locale applied via `Emulation.setLocaleOverride`.
+    pub locale: Option<String>,
+    /// Script injected via `Page.addScriptToEvaluateOnNewDocument` before any page script runs.
+    /// Used by the seeded fingerprint generator for canvas/WebGL noise and navigator overrides.
+    pub fingerprint_script: Option<String>,
+    /// Optional Chromium window size override; defaults to (1280, 800) when unset.
+    pub window_size: Option<(u32, u32)>,
 }
 
 impl Default for RenderConfig {
@@ -227,6 +240,12 @@ impl Default for RenderConfig {
             auto_scroll: true,
             max_scrolls: DEFAULT_MAX_SCROLLS,
             dismiss_consent: true,
+            accept_language: None,
+            platform: None,
+            timezone: None,
+            locale: None,
+            fingerprint_script: None,
+            window_size: None,
         }
     }
 }
@@ -896,6 +915,31 @@ fn preflight_sealed_document_dns(url: &Url, deadline: Instant) -> Result<(), Ren
     Ok(())
 }
 
+/// Apply CDP timezone + locale overrides when the seeded fingerprint generator supplied them.
+fn apply_emulation_overrides(
+    tab: &Arc<Tab>,
+    deadline: Instant,
+    timeout: Duration,
+    timezone: Option<&str>,
+    locale: Option<&str>,
+) -> Result<(), RenderError> {
+    if let Some(timezone_id) = timezone {
+        set_tab_deadline(tab, deadline, timeout)?;
+        tab.call_method(Emulation::SetTimezoneOverride {
+            timezone_id: timezone_id.to_string(),
+        })
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+    }
+    if let Some(locale) = locale {
+        set_tab_deadline(tab, deadline, timeout)?;
+        tab.call_method(Emulation::SetLocaleOverride {
+            locale: Some(locale.to_string()),
+        })
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+    }
+    Ok(())
+}
+
 fn remaining_or_dns(deadline: Instant) -> Result<Duration, RenderError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -1092,7 +1136,8 @@ pub fn render_until(
     resource_budget.ensure_available()?;
     // VAL-CONF-013: sealed DoH preflight + SOCKS readiness before any Chromium target exists.
     preflight_sealed_document_dns(url, deadline)?;
-    let browser = launch_browser(deadline, config.timeout, (1280, 800))?;
+    let window_size = config.window_size.unwrap_or((1280, 800));
+    let browser = launch_browser(deadline, config.timeout, window_size)?;
     let tab = browser
         .new_tab()
         .map_err(|e| RenderError::Launch(e.to_string()))?;
@@ -1103,9 +1148,20 @@ pub fn render_until(
     set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
         set_tab_deadline(&tab, deadline, config.timeout)?;
-        tab.set_user_agent(&config.user_agent, None, None)
-            .map_err(|e| RenderError::Render(e.to_string()))?;
+        tab.set_user_agent(
+            &config.user_agent,
+            config.accept_language.as_deref(),
+            config.platform.as_deref(),
+        )
+        .map_err(|e| RenderError::Render(e.to_string()))?;
     }
+    apply_emulation_overrides(
+        &tab,
+        deadline,
+        config.timeout,
+        config.timezone.as_deref(),
+        config.locale.as_deref(),
+    )?;
     set_tab_deadline(&tab, deadline, config.timeout)?;
     let top_frame_id = top_frame_id(&tab)?;
     configure_resource_guard(
@@ -1132,6 +1188,19 @@ pub fn render_until(
         run_immediately: Some(true),
     })
     .map_err(|e| RenderError::Render(e.to_string()))?;
+
+    // Seeded canvas/WebGL + navigator script (VAL-ANTIBOT-035) runs before page scripts so the
+    // document fingerprints the measured generator profile rather than the fixed Chromium build.
+    if let Some(script) = config.fingerprint_script.as_ref() {
+        set_tab_deadline(&tab, deadline, config.timeout)?;
+        tab.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: script.clone(),
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: Some(true),
+        })
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+    }
 
     browser.complete_setup();
     set_tab_deadline(&tab, deadline, config.timeout)?;
@@ -1482,6 +1551,16 @@ pub struct ScreenshotConfig {
     /// When true, capture the entire scrollable page (beyond the fold) rather than just the
     /// viewport rectangle.
     pub full_page: bool,
+    /// `Accept-Language` passed to CDP `Network.setUserAgentOverride`.
+    pub accept_language: Option<String>,
+    /// Platform token passed to CDP `Network.setUserAgentOverride`.
+    pub platform: Option<String>,
+    /// IANA timezone applied via `Emulation.setTimezoneOverride`.
+    pub timezone: Option<String>,
+    /// Locale applied via `Emulation.setLocaleOverride`.
+    pub locale: Option<String>,
+    /// Script injected via `Page.addScriptToEvaluateOnNewDocument` for canvas/WebGL diversity.
+    pub fingerprint_script: Option<String>,
 }
 
 impl Default for ScreenshotConfig {
@@ -1501,6 +1580,11 @@ impl Default for ScreenshotConfig {
             width: DEFAULT_VIEWPORT_WIDTH,
             height: DEFAULT_VIEWPORT_HEIGHT,
             full_page: false,
+            accept_language: None,
+            platform: None,
+            timezone: None,
+            locale: None,
+            fingerprint_script: None,
         }
     }
 }
@@ -1567,8 +1651,29 @@ pub fn screenshot_until(
     set_tab_deadline(&tab, deadline, config.timeout)?;
     if !config.user_agent.is_empty() {
         set_tab_deadline(&tab, deadline, config.timeout)?;
-        tab.set_user_agent(&config.user_agent, None, None)
-            .map_err(|e| RenderError::Render(e.to_string()))?;
+        tab.set_user_agent(
+            &config.user_agent,
+            config.accept_language.as_deref(),
+            config.platform.as_deref(),
+        )
+        .map_err(|e| RenderError::Render(e.to_string()))?;
+    }
+    apply_emulation_overrides(
+        &tab,
+        deadline,
+        config.timeout,
+        config.timezone.as_deref(),
+        config.locale.as_deref(),
+    )?;
+    if let Some(script) = config.fingerprint_script.as_ref() {
+        set_tab_deadline(&tab, deadline, config.timeout)?;
+        tab.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: script.clone(),
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: Some(true),
+        })
+        .map_err(|e| RenderError::Render(e.to_string()))?;
     }
     let resource_config = RenderConfig {
         request_headers: config.request_headers.clone(),
@@ -1580,6 +1685,11 @@ pub fn screenshot_until(
         resource_budget: Some(resource_budget.clone()),
         origin_pacer: config.origin_pacer.clone(),
         document_request_policy: config.document_request_policy.clone(),
+        accept_language: config.accept_language.clone(),
+        platform: config.platform.clone(),
+        timezone: config.timezone.clone(),
+        locale: config.locale.clone(),
+        fingerprint_script: config.fingerprint_script.clone(),
         ..RenderConfig::default()
     };
     set_tab_deadline(&tab, deadline, config.timeout)?;

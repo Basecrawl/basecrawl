@@ -226,6 +226,7 @@ name = "basecrawl-core"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "basecrawl-fp",
  "basecrawl-proof",
  "basecrawl-render",
  "basecrawl-seal",
@@ -262,6 +263,15 @@ dependencies = [
  "basecrawl-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "basecrawl-fp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

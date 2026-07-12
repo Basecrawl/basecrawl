@@ -81,6 +81,11 @@ pub struct FetchConfig {
     /// Crawl-wide direct/browser transmission scheduler. Direct fetches and CDP continuations
     /// share this state, so a screenshot or render cannot bypass the prior request's crawl delay.
     pub(crate) origin_pacer: OriginPacer,
+    /// Seeded TLS 1.3 cipher suite names (from hit `basecrawl_fp`) in ClientHello preference order.
+    /// Empty means the provider default order.
+    pub tls13_cipher_names: Vec<String>,
+    /// Seeded TLS supported-group names in ClientHello preference order. Empty means provider default.
+    pub tls_group_order: Vec<String>,
 }
 
 impl Default for FetchConfig {
@@ -94,6 +99,8 @@ impl Default for FetchConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             crawl_delay: Duration::ZERO,
             origin_pacer: OriginPacer::default(),
+            tls13_cipher_names: Vec::new(),
+            tls_group_order: Vec::new(),
         }
     }
 }
@@ -236,7 +243,7 @@ fn is_transport_managed_header(name: &str) -> bool {
 
 /// Reject field names that cannot be emitted as an HTTP/1.1 field line and values that would
 /// smuggle a second line. This validation is shared by the CLI and every FFI caller.
-fn validate_header_pair(name: &str, value: &str) -> Result<(), Error> {
+pub fn validate_header_pair(name: &str, value: &str) -> Result<(), Error> {
     let valid_name = !name.is_empty()
         && name
             .bytes()
@@ -451,7 +458,12 @@ fn fetch_https(
     let egress_ip = tcp.local_addr().map_err(classify_io)?.ip();
 
     let capture = Arc::new(TlsCaptureState::default());
-    let client_config = tls_config(capture.clone(), config.insecure)?;
+    let client_config = tls_config(
+        capture.clone(),
+        config.insecure,
+        &config.tls13_cipher_names,
+        &config.tls_group_order,
+    )?;
     let mut connection =
         ClientConnection::new(Arc::new(client_config), server_name).map_err(|error| {
             Error::TlsCapture(format!("could not create rustls connection: {error}"))
@@ -538,7 +550,16 @@ pub(crate) fn resolve_address_with(
 /// verifier can reject an invalid legacy peer as `certificate_validation` before its negotiated
 /// version is rejected as unsuitable for authenticity evidence. Resumption is disabled to
 /// guarantee each scrape has a complete certificate-bearing handshake.
-fn tls_config(capture: Arc<TlsCaptureState>, insecure: bool) -> Result<ClientConfig, Error> {
+///
+/// Non-security fingerprint dimensions (TLS 1.3 cipher offer order and supported-group order) are
+/// parameterized by the seed-derived lists so honest miners emit diverse JA3/JA4 values while
+/// security-critical params (cert validation, protocol versions offered) stay fixed.
+fn tls_config(
+    capture: Arc<TlsCaptureState>,
+    insecure: bool,
+    tls13_cipher_names: &[String],
+    tls_group_order: &[String],
+) -> Result<ClientConfig, Error> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let verifier: Arc<dyn ServerCertVerifier> = if insecure {
         Arc::new(InsecureVerifier)
@@ -553,20 +574,107 @@ fn tls_config(capture: Arc<TlsCaptureState>, insecure: bool) -> Result<ClientCon
         inner: verifier,
         capture,
     });
-    let mut config = ClientConfig::builder_with_protocol_versions(&[
-        &rustls::version::TLS13,
-        &rustls::version::TLS12,
-    ])
-    .with_root_certificates(RootCertStore::from_iter(
-        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-    ))
-    .with_no_client_auth();
+
+    let mut provider = rustls::crypto::ring::default_provider();
+    if !tls13_cipher_names.is_empty() {
+        provider.cipher_suites =
+            order_tls13_cipher_suites(&provider.cipher_suites, tls13_cipher_names);
+    }
+    if !tls_group_order.is_empty() {
+        provider.kx_groups = order_kx_groups(tls_group_order);
+    }
+
+    let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|error| Error::TlsCapture(format!("could not configure TLS versions: {error}")))?
+        .with_root_certificates(RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ))
+        .with_no_client_auth();
     config.dangerous().set_certificate_verifier(verifier);
     config.resumption = Resumption::disabled();
     // This fetcher implements HTTP/1.1 itself. Do not offer h2, which a raw HTTP/1 parser cannot
     // decode, and do not offer ALPN values that would permit a different application protocol.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+/// Reorder the provider's TLS 1.3 suites to the seed-selected preference while keeping any
+/// remaining (TLS 1.2) suites after them so leftover peers still validate cleanly.
+fn order_tls13_cipher_suites(
+    default_suites: &[rustls::SupportedCipherSuite],
+    preferred_names: &[String],
+) -> Vec<rustls::SupportedCipherSuite> {
+    use rustls::crypto::ring::cipher_suite::{
+        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+    };
+    let mut ordered = Vec::with_capacity(default_suites.len());
+    for name in preferred_names {
+        let suite = match name.as_str() {
+            "TLS13_AES_256_GCM_SHA384" => Some(TLS13_AES_256_GCM_SHA384),
+            "TLS13_AES_128_GCM_SHA256" => Some(TLS13_AES_128_GCM_SHA256),
+            "TLS13_CHACHA20_POLY1305_SHA256" => Some(TLS13_CHACHA20_POLY1305_SHA256),
+            _ => None,
+        };
+        if let Some(suite) = suite {
+            ordered.push(suite);
+        }
+    }
+    for suite in default_suites {
+        let already = ordered.iter().any(|placed| {
+            std::mem::discriminant(placed) == std::mem::discriminant(suite)
+                || suite_id(placed) == suite_id(suite)
+        });
+        if !already {
+            ordered.push(*suite);
+        }
+    }
+    if ordered.is_empty() {
+        default_suites.to_vec()
+    } else {
+        ordered
+    }
+}
+
+fn suite_id(suite: &rustls::SupportedCipherSuite) -> u16 {
+    u16::from(suite.suite())
+}
+
+fn order_kx_groups(preferred: &[String]) -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+    use rustls::crypto::ring::kx_group::{SECP256R1, SECP384R1, X25519};
+    let mut ordered: Vec<&'static dyn rustls::crypto::SupportedKxGroup> =
+        Vec::with_capacity(preferred.len());
+    for name in preferred {
+        let group = match name.as_str() {
+            "X25519" => Some(X25519),
+            "secp256r1" => Some(SECP256R1),
+            "secp384r1" => Some(SECP384R1),
+            _ => None,
+        };
+        if let Some(group) = group {
+            if !ordered
+                .iter()
+                .any(|existing| existing.name() == group.name())
+            {
+                ordered.push(group);
+            }
+        }
+    }
+    // Fall back to the provider default order if nothing matched.
+    if ordered.is_empty() {
+        vec![X25519, SECP256R1, SECP384R1]
+    } else {
+        // Append any missing default groups so handshake still supports full set.
+        for group in [X25519, SECP256R1, SECP384R1] {
+            if !ordered
+                .iter()
+                .any(|existing| existing.name() == group.name())
+            {
+                ordered.push(group);
+            }
+        }
+        ordered
+    }
 }
 
 fn build_http_request(

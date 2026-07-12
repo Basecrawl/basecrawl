@@ -18,6 +18,7 @@ path = "src/bin/basecrawl.rs"
 basecrawl-proof = { path = "../basecrawl-proof" }
 basecrawl-render = { path = "../basecrawl-render" }
 basecrawl-seal = { path = "../basecrawl-seal" }
+basecrawl-fp = { path = "../basecrawl-fp" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

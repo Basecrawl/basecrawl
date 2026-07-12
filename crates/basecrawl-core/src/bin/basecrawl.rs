@@ -158,6 +158,13 @@ struct Cli {
     /// public key is committed into report_data.
     #[arg(long, default_value_t = false)]
     sign_proof: bool,
+
+    /// Optional per-miner/per-task fingerprint seed. When set, non-security fingerprint dimensions
+    /// (JA3/JA4 cipher order, header order, UA, viewport, timezone, locale, canvas/WebGL) are a
+    /// pure function of this seed. When omitted, the seed is derived from task_id/nonce. The
+    /// normalized seed always appears in egress.fingerprint_seed and report_data.
+    #[arg(long = "fingerprint-seed", value_name = "SEED")]
+    fingerprint_seed: Option<String>,
 }
 
 fn run(cli: Cli) -> Result<String, Error> {
@@ -251,6 +258,7 @@ fn run(cli: Cli) -> Result<String, Error> {
         robots_policy: cli.robots,
         attest: cli.attest || cli.sign_proof,
         sign_proof: cli.sign_proof,
+        fingerprint_seed: cli.fingerprint_seed,
     };
 
     let proof = scrape(&raw_url, &options)?;

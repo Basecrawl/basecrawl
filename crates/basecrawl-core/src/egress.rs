@@ -3,28 +3,26 @@
 //! These fields are intentionally outside the deterministic result surface: they describe the
 //! network route and fetch time of one observation rather than the crawled content. Landmark RTT
 //! collection belongs to the later geo feature, so this module emits its stable empty-object shape
-//! at M1.
+//! at M1. The `fingerprint_seed` is the auditable seed that parameterized the non-security
+//! fingerprint dimensions (VAL-ANTIBOT-036) and is committed into `report_data`.
 
 use crate::error::Error;
 use basecrawl_proof::Egress;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-const FINGERPRINT_SEED_DOMAIN_TAG: &[u8] = b"basecrawl/fingerprint-seed/v1\0";
-
 /// Assemble egress metadata captured at the successful-fetch boundary.
 ///
 /// `egress_ip` is the source address selected by the operating system for the actual outbound
-/// route. The fingerprint seed is derived from the canonical request material so all bindings
-/// report the same proof for the same crawl. The public-IP corroboration and landmark RTT
-/// population are deferred to geo validation, but the M1 wire shape is complete now.
+/// route. `fingerprint_seed` is the already-normalized (64-hex) seed that drove the per-miner /
+/// per-task fingerprint profile; it is logged here so the emitted variation is auditable and
+/// bound into the attested `report_data` digest. Landmark RTT population is deferred to geo.
 pub fn build(
     egress_ip: IpAddr,
     fetched_at: OffsetDateTime,
-    fingerprint_material: &str,
+    fingerprint_seed: &str,
 ) -> Result<Egress, Error> {
     let timestamp = fetched_at
         .format(&Rfc3339)
@@ -34,23 +32,8 @@ pub fn build(
         egress_ip: Some(egress_ip.to_string()),
         landmark_rtts: BTreeMap::new(),
         timestamp: Some(timestamp),
-        fingerprint_seed: Some(fingerprint_seed(fingerprint_material)),
+        fingerprint_seed: Some(fingerprint_seed.to_string()),
     })
-}
-
-fn fingerprint_seed(material: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(FINGERPRINT_SEED_DOMAIN_TAG);
-    hasher.update(material.as_bytes());
-    hex(&hasher.finalize())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 #[cfg(test)]
@@ -60,10 +43,11 @@ mod tests {
 
     #[test]
     fn build_emits_complete_m1_egress_shape() {
+        let seed = "11".repeat(32);
         let egress = build(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             OffsetDateTime::now_utc(),
-            "request-hash",
+            &seed,
         )
         .expect("egress metadata");
 
@@ -73,25 +57,28 @@ mod tests {
         assert!(parsed.offset().is_utc());
         assert_eq!(egress.egress_ip.as_deref(), Some("127.0.0.1"));
         assert!(egress.landmark_rtts.is_empty());
-        assert_eq!(egress.fingerprint_seed.as_deref().map(str::len), Some(64));
+        assert_eq!(egress.fingerprint_seed.as_deref(), Some(seed.as_str()));
     }
 
     #[test]
-    fn fingerprint_seed_is_deterministic_for_an_identical_scrape_input() {
+    fn fingerprint_seed_is_logged_verbatim() {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let fetched_at = OffsetDateTime::UNIX_EPOCH;
+        let seed = basecrawl_fp::normalize_seed("miner-task-seed");
 
-        let first = build(ip, fetched_at, "request-hash").expect("first egress metadata");
-        let second = build(ip, fetched_at, "request-hash").expect("second egress metadata");
+        let first = build(ip, fetched_at, &seed).expect("first egress metadata");
+        let second = build(ip, fetched_at, &seed).expect("second egress metadata");
 
         assert_eq!(first.fingerprint_seed, second.fingerprint_seed);
+        assert_eq!(first.fingerprint_seed.as_deref(), Some(seed.as_str()));
     }
 
     #[test]
-    fn fingerprint_seed_changes_when_request_material_changes() {
-        assert_ne!(
-            fingerprint_seed("first-request-hash"),
-            fingerprint_seed("second-request-hash")
-        );
+    fn different_seeds_remain_distinct_in_egress() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let fetched_at = OffsetDateTime::UNIX_EPOCH;
+        let a = build(ip, fetched_at, &basecrawl_fp::normalize_seed("a")).unwrap();
+        let b = build(ip, fetched_at, &basecrawl_fp::normalize_seed("b")).unwrap();
+        assert_ne!(a.fingerprint_seed, b.fingerprint_seed);
     }
 }

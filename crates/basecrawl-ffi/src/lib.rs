@@ -61,6 +61,8 @@ struct BindingOptions {
     attest: Option<bool>,
     #[serde(alias = "sign_proof")]
     sign_proof: Option<bool>,
+    #[serde(alias = "fingerprint_seed")]
+    fingerprint_seed: Option<String>,
 }
 
 /// Error returned to bindings as the same structured JSON shape as core errors.
@@ -186,6 +188,9 @@ fn parse_options(options_json: Option<&str>) -> Result<ScrapeOptions, BindingErr
     }
     if let Some(sign_proof) = binding_options.sign_proof {
         options.sign_proof = sign_proof;
+    }
+    if let Some(fingerprint_seed) = binding_options.fingerprint_seed {
+        options.fingerprint_seed = Some(fingerprint_seed);
     }
 
     Ok(options)

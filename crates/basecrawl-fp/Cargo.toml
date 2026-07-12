@@ -1,0 +1,16 @@
+[package]
+name = "basecrawl-fp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Seeded fingerprint generator: bounded JA3/JA4, headers, UA/viewport/timezone/locale, canvas/WebGL"
+
+[lib]
+name = "basecrawl_fp"
+path = "src/lib.rs"
+
+[dependencies]
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true

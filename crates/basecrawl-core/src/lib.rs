@@ -28,7 +28,7 @@ use basecrawl_proof::{
     Attestation, Request, Response, ResultBlock, SdkSignature, SCRAPE_PROOF_VERSION,
 };
 use content::ContentKind;
-use fetch::{FetchConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT};
+use fetch::{FetchConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_SECS};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -106,6 +106,10 @@ pub struct ScrapeOptions {
     /// Request an enclave-held Ed25519 signature over the canonical proof. This requires
     /// attestation and never accepts host-supplied key material.
     pub sign_proof: bool,
+    /// Optional explicit fingerprint seed (per-miner/per-task). When unset, the seed is derived
+    /// from `task_id`/`nonce`, falling back to a stable material from the request surface. The
+    /// normalized seed always appears in `egress.fingerprint_seed` and is bound into `report_data`.
+    pub fingerprint_seed: Option<String>,
 }
 
 impl Default for ScrapeOptions {
@@ -135,6 +139,7 @@ impl Default for ScrapeOptions {
             robots_policy: RobotsPolicy::Enforce,
             attest: false,
             sign_proof: false,
+            fingerprint_seed: None,
         }
     }
 }
@@ -160,17 +165,48 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         return Err(Error::StructuredExtractionUnsupported);
     }
 
-    // Build this once before robots/DNS/rendering. It is the single validated ordered effective
-    // header list shared by request hashing, direct HTTP/HTTPS, and Chromium.
-    let effective_headers = fetch::effective_headers(&options.headers, DEFAULT_USER_AGENT)?;
+    // Resolve the per-miner/per-task fingerprint seed first so every outgoing client dimension
+    // (TLS cipher order → JA3/JA4, header order, UA, viewport, timezone, locale, canvas/WebGL)
+    // is a pure function of that seed. The seed is later logged in egress and bound into
+    // report_data (VAL-ANTIBOT-033..037).
+    let fingerprint_seed = basecrawl_fp::resolve_seed(
+        options.fingerprint_seed.as_deref(),
+        options.task_id.as_deref(),
+        options.nonce.as_deref(),
+        &format!("GET\0{}", url.as_str()),
+    );
+    let fingerprint = basecrawl_fp::generate(&fingerprint_seed);
+
+    // Seed chooses viewport when the caller left the measured-image default; an explicit
+    // non-default viewport from the CLI/SDK wins.
+    let default_viewport = (
+        basecrawl_render::DEFAULT_VIEWPORT_WIDTH,
+        basecrawl_render::DEFAULT_VIEWPORT_HEIGHT,
+    );
+    let viewport = if options.viewport == default_viewport {
+        (fingerprint.viewport_width, fingerprint.viewport_height)
+    } else {
+        options.viewport
+    };
+
+    // Seed-owned header order + UA (plus caller credentials) is the single validated ordered
+    // effective header list shared by request hashing, direct HTTP/HTTPS, and Chromium.
+    let effective_headers =
+        basecrawl_fp::effective_fingerprint_headers(&fingerprint, &options.headers);
+    // Validate entropy so a bad header never reaches the wire.
+    for (name, value) in &effective_headers {
+        fetch::validate_header_pair(name, value)?;
+    }
     let config = FetchConfig {
         timeout: Duration::from_secs(options.timeout_secs),
         headers: effective_headers,
         credential_origin: Some(url.clone()),
-        user_agent: DEFAULT_USER_AGENT.to_string(),
+        user_agent: fingerprint.user_agent.clone(),
         insecure: options.insecure,
         max_body_bytes: options.max_body_bytes,
         crawl_delay: Duration::from_millis(options.crawl_delay_ms),
+        tls13_cipher_names: fingerprint.tls13_cipher_names.clone(),
+        tls_group_order: fingerprint.tls_group_order.clone(),
         ..FetchConfig::default()
     };
     let document_policy =
@@ -259,6 +295,12 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 wait_for: options.wait_for.clone(),
                 actions: options.actions.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,
+                accept_language: Some(fingerprint.accept_language.clone()),
+                platform: Some(fingerprint.platform.clone()),
+                timezone: Some(fingerprint.timezone.clone()),
+                locale: Some(fingerprint.locale.clone()),
+                fingerprint_script: Some(basecrawl_fp::browser_injection_script(&fingerprint)),
+                window_size: Some((fingerprint.viewport_width, fingerprint.viewport_height)),
                 ..basecrawl_render::RenderConfig::default()
             },
             deadline,
@@ -328,9 +370,16 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                         document_request_policy: Some(render_document_policy(
                             document_policy.clone(),
                         )),
-                        width: options.viewport.0,
-                        height: options.viewport.1,
+                        width: viewport.0,
+                        height: viewport.1,
                         full_page: options.screenshot_full_page,
+                        accept_language: Some(fingerprint.accept_language.clone()),
+                        platform: Some(fingerprint.platform.clone()),
+                        timezone: Some(fingerprint.timezone.clone()),
+                        locale: Some(fingerprint.locale.clone()),
+                        fingerprint_script: Some(basecrawl_fp::browser_injection_script(
+                            &fingerprint,
+                        )),
                     },
                     deadline,
                 )?;
@@ -376,6 +425,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 &config,
                 &document_policy,
                 render_resource_budget.clone(),
+                &fingerprint,
                 deadline,
             )?;
             if let Some(agg) = aggregated_markdown.as_mut() {
@@ -409,7 +459,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let completeness_manifest = canonical::completeness_manifest(&format_names, &formats_produced);
     let manifest_sha256 =
         canonical::manifest_sha256(url.as_str(), options.nonce.as_deref(), &result_hash);
-    let egress = egress::build(fetched.egress_ip, fetched.fetched_at, &request_hash)?;
+    let egress = egress::build(fetched.egress_ip, fetched.fetched_at, &fingerprint.seed)?;
 
     let mut proof = ScrapeProof {
         version: SCRAPE_PROOF_VERSION,
@@ -539,6 +589,7 @@ fn crawl_page(
     config: &FetchConfig,
     document_policy: &robots::DocumentPolicy,
     render_resource_budget: basecrawl_render::RenderResourceBudget,
+    fingerprint: &basecrawl_fp::FingerprintProfile,
     deadline: Instant,
 ) -> Result<(String, String, Url), Error> {
     let fetched = fetch::fetch_document_until(url, config, deadline, |target| {
@@ -566,6 +617,12 @@ fn crawl_page(
                 document_request_policy: Some(render_document_policy(document_policy.clone())),
                 wait_for: options.wait_for.clone(),
                 max_redirects: fetch::MAX_REDIRECTS,
+                accept_language: Some(fingerprint.accept_language.clone()),
+                platform: Some(fingerprint.platform.clone()),
+                timezone: Some(fingerprint.timezone.clone()),
+                locale: Some(fingerprint.locale.clone()),
+                fingerprint_script: Some(basecrawl_fp::browser_injection_script(fingerprint)),
+                window_size: Some((fingerprint.viewport_width, fingerprint.viewport_height)),
                 ..basecrawl_render::RenderConfig::default()
             },
             deadline,
