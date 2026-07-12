@@ -1,4 +1,4 @@
-use basecrawl_core::attestation::{get_quote_at, QuoteRequestError};
+use basecrawl_core::attestation::{get_quote_at, quote_report_data, QuoteRequestError};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -67,6 +67,7 @@ fn get_quote_posts_a_full_report_data_value_and_validates_the_response() {
     server.join().unwrap();
     fs::remove_file(&path).unwrap();
     assert_eq!(response.report_data, REPORT_DATA);
+    assert_eq!(quote_report_data(&response.quote).unwrap(), REPORT_DATA);
     assert!(response.quote.len() >= 1264);
     assert!(!response.event_log.is_null());
     assert!(!response.vm_config.is_null());
@@ -92,6 +93,25 @@ fn get_quote_rejects_a_report_data_mismatch() {
         error,
         QuoteRequestError::ReportDataMismatch { .. }
     ));
+}
+
+#[test]
+fn get_quote_rejects_a_quote_embedded_report_data_mismatch() {
+    let path = socket_path("quote-mismatch");
+    let body = serde_json::json!({
+        "quote": quote_fixture(&"ff".repeat(64)),
+        "event_log": [{"event": "fixture"}],
+        "report_data": REPORT_DATA,
+        "vm_config": {"cpu": 1}
+    })
+    .to_string();
+    let server = serve_once(&path, body);
+
+    let error = get_quote_at(&path, REPORT_DATA).unwrap_err();
+
+    server.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(matches!(error, QuoteRequestError::QuoteReportDataMismatch));
 }
 
 #[test]

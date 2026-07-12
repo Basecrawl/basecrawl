@@ -444,7 +444,8 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         sdk_signature: SdkSignature::default(),
     };
     if options.attest {
-        let report_data = canonical::attestation_report_data(&proof);
+        let report_data = canonical::attestation_report_data(&proof)
+            .map_err(|error| Error::Attestation(format!("report_data assembly failed: {error}")))?;
         let quote = attestation::get_quote(&report_data).map_err(|error| {
             Error::Attestation(format!("guest-agent quote request failed: {error}"))
         })?;

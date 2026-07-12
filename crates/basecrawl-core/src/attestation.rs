@@ -114,6 +114,29 @@ pub fn quote_measurement(quote_hex: &str) -> Result<QuoteMeasurement, QuoteReque
     })
 }
 
+/// Recover the full 64-byte report data embedded in a TDX v4 TD10 quote.
+///
+/// Callers use this value, rather than trusting a free-floating JSON field, when checking that a
+/// quote carries the expected ScrapeProof binding.
+pub fn quote_report_data(quote_hex: &str) -> Result<String, QuoteRequestError> {
+    let quote = decode_hex(quote_hex).ok_or(QuoteRequestError::InvalidQuote)?;
+    if quote.len() < QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES {
+        return Err(QuoteRequestError::QuoteTooShort {
+            actual: quote_hex.len(),
+            minimum: MIN_QUOTE_HEX_LEN,
+        });
+    }
+    if u16::from_le_bytes([quote[0], quote[1]]) != QUOTE_VERSION
+        || u32::from_le_bytes([quote[4], quote[5], quote[6], quote[7]]) != TDX_TEE_TYPE
+    {
+        return Err(QuoteRequestError::InvalidQuoteHeader);
+    }
+    Ok(encode_hex(
+        &quote[QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET
+            ..QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES],
+    ))
+}
+
 /// Request a quote from the production dstack socket.
 pub fn get_quote(report_data: &str) -> Result<QuoteResponse, QuoteRequestError> {
     get_quote_at(Path::new(DEFAULT_DSTACK_SOCKET), report_data)
@@ -204,9 +227,7 @@ fn validate_quote_response(
     {
         return Err(QuoteRequestError::InvalidQuoteHeader);
     }
-    let embedded_report_data = &quote[QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET
-        ..QUOTE_HEADER_BYTES + TD_REPORT_DATA_OFFSET + TD_REPORT_DATA_BYTES];
-    let embedded_report_data = encode_hex(embedded_report_data);
+    let embedded_report_data = quote_report_data(&response.quote)?;
     response.quote = encode_hex(&quote);
     response.report_data = response.report_data.to_ascii_lowercase();
     if response.report_data != expected_report_data {

@@ -12,6 +12,7 @@ use basecrawl_proof::{CompletenessManifest, FormatCompleteness, ScrapeProof};
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::BTreeMap;
+use thiserror::Error;
 
 /// Result formats that contribute to the deterministic quorum surface, in canonical order.
 /// `screenshot` and `json` are intentionally absent (see module docs).
@@ -23,36 +24,54 @@ pub const COMPLETENESS_MANIFEST_VERSION: u32 = 1;
 /// Domain separation for the ScrapeProof hardware-attestation binding.
 pub const ATTESTATION_DOMAIN_TAG: &[u8] = b"basecrawl/scrape-proof-report-data/v1\0";
 
+/// A required section 5.4 component was absent from a proof selected for attestation.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("ScrapeProof cannot be attested without {field}")]
+pub struct ReportDataError {
+    pub field: &'static str,
+}
+
 /// Assemble the full-width SHA-512 report-data binding for a proof.
 ///
-/// Components are NUL-delimited in the architecture-defined order.  Empty optional fields are
-/// represented by an empty component, preserving positional binding rather than silently dropping
-/// a field.  The enclave public key is not available until the M2 signing-key feature populates
-/// it, so attestation callers must not claim a signed SDK identity until then.
-pub fn attestation_report_data(proof: &ScrapeProof) -> String {
+/// Components are concatenated byte-for-byte in the architecture-defined order. The pinned domain
+/// tag ends in NUL, separating this protocol from other report-data constructions without adding
+/// bytes between the ten components that are absent from the section 5.4 contract. The enclave
+/// public key is not available until the M2 signing-key feature populates it, so attestation
+/// callers must not claim a signed SDK identity until then.
+pub fn attestation_report_data(proof: &ScrapeProof) -> Result<String, ReportDataError> {
     let components = [
-        proof.task_id.as_deref().unwrap_or_default(),
-        proof.nonce.as_deref().unwrap_or_default(),
-        proof.request.request_hash.as_deref().unwrap_or_default(),
-        proof.tls.cert_chain_hash.as_deref().unwrap_or_default(),
-        proof
-            .tls
-            .handshake_transcript_hash
-            .as_deref()
-            .unwrap_or_default(),
-        proof.response.body_hash.as_deref().unwrap_or_default(),
-        proof.result.result_hash.as_deref().unwrap_or_default(),
-        proof.egress.egress_ip.as_deref().unwrap_or_default(),
-        proof.egress.timestamp.as_deref().unwrap_or_default(),
-        proof.egress.fingerprint_seed.as_deref().unwrap_or_default(),
+        required(proof.task_id.as_deref(), "task_id")?,
+        required(proof.nonce.as_deref(), "nonce")?,
+        required(
+            proof.request.request_hash.as_deref(),
+            "request.request_hash",
+        )?,
+        required(proof.tls.cert_chain_hash.as_deref(), "tls.cert_chain_hash")?,
+        required(
+            proof.tls.handshake_transcript_hash.as_deref(),
+            "tls.handshake_transcript_hash",
+        )?,
+        required(proof.response.body_hash.as_deref(), "response.body_hash")?,
+        required(proof.result.result_hash.as_deref(), "result.result_hash")?,
+        required(proof.egress.egress_ip.as_deref(), "egress.egress_ip")?,
+        required(proof.egress.timestamp.as_deref(), "egress.timestamp")?,
+        required(
+            proof.egress.fingerprint_seed.as_deref(),
+            "egress.fingerprint_seed",
+        )?,
     ];
     let mut hasher = Sha512::new();
     hasher.update(ATTESTATION_DOMAIN_TAG);
     for component in components {
         hasher.update(component.as_bytes());
-        hasher.update([0]);
     }
-    hex(&hasher.finalize())
+    Ok(hex(&hasher.finalize()))
+}
+
+fn required<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, ReportDataError> {
+    value
+        .filter(|value| !value.is_empty())
+        .ok_or(ReportDataError { field })
 }
 
 /// Serialize a JSON value into its compact canonical representation.
@@ -196,6 +215,10 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use basecrawl_proof::{
+        Attestation, Egress, Request, Response, ResultBlock, SdkSignature, Tls,
+        SCRAPE_PROOF_VERSION,
+    };
     use serde_json::json;
 
     fn base_surface() -> BTreeMap<String, Value> {
@@ -206,6 +229,208 @@ mod tests {
             json!({"title": "Title", "statusCode": 200}),
         );
         m
+    }
+
+    fn attestation_proof() -> ScrapeProof {
+        ScrapeProof {
+            version: SCRAPE_PROOF_VERSION,
+            task_id: Some("task-123".to_string()),
+            nonce: Some("validator-nonce-a".to_string()),
+            request: Request {
+                method: "GET".to_string(),
+                url: "https://example.com/".to_string(),
+                headers_hash: Some("11".repeat(32)),
+                body_hash: Some("22".repeat(32)),
+                request_hash: Some("33".repeat(32)),
+                formats: vec!["markdown".to_string()],
+            },
+            tls: Tls {
+                cert_chain_hash: Some("44".repeat(32)),
+                handshake_transcript_hash: Some("55".repeat(32)),
+                ..Tls::default()
+            },
+            response: Response {
+                body_hash: Some("66".repeat(32)),
+                ..Response::default()
+            },
+            result: ResultBlock {
+                result_hash: Some("77".repeat(32)),
+                ..ResultBlock::default()
+            },
+            egress: Egress {
+                egress_ip: Some("203.0.113.5".to_string()),
+                timestamp: Some("2026-07-12T12:34:56Z".to_string()),
+                fingerprint_seed: Some("88".repeat(32)),
+                ..Egress::default()
+            },
+            attestation: Attestation::default(),
+            sdk_signature: SdkSignature::default(),
+        }
+    }
+
+    fn independent_report_data(proof: &ScrapeProof, domain_tag: &[u8]) -> String {
+        let components = [
+            proof.task_id.as_deref().unwrap(),
+            proof.nonce.as_deref().unwrap(),
+            proof.request.request_hash.as_deref().unwrap(),
+            proof.tls.cert_chain_hash.as_deref().unwrap(),
+            proof.tls.handshake_transcript_hash.as_deref().unwrap(),
+            proof.response.body_hash.as_deref().unwrap(),
+            proof.result.result_hash.as_deref().unwrap(),
+            proof.egress.egress_ip.as_deref().unwrap(),
+            proof.egress.timestamp.as_deref().unwrap(),
+            proof.egress.fingerprint_seed.as_deref().unwrap(),
+        ];
+        let mut hasher = Sha512::new();
+        hasher.update(domain_tag);
+        for component in components {
+            hasher.update(component.as_bytes());
+        }
+        hex(&hasher.finalize())
+    }
+
+    #[test]
+    fn report_data_matches_exact_section_5_4_preimage() {
+        let proof = attestation_proof();
+        let expected = independent_report_data(&proof, ATTESTATION_DOMAIN_TAG);
+        assert_eq!(
+            expected,
+            "a76e1b18204aad10a802c825d58c7207a2bb6334c47a7b37adc83a83b79fa7b\
+             be204a3990d2f2e56f75fb2f7804a1cc59e0fb0ec8245ecde84439939194b88cd"
+        );
+        assert_eq!(attestation_report_data(&proof).unwrap(), expected);
+    }
+
+    #[test]
+    fn report_data_is_full_width_sha512_without_zero_padding() {
+        let report_data = attestation_report_data(&attestation_proof()).unwrap();
+        assert_eq!(report_data.len(), 128);
+        assert!(report_data.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(&report_data[64..], "0".repeat(64));
+    }
+
+    #[test]
+    fn report_data_requires_the_pinned_domain_tag() {
+        let proof = attestation_proof();
+        let report_data = attestation_report_data(&proof).unwrap();
+        assert_ne!(report_data, independent_report_data(&proof, b""));
+        assert_ne!(
+            report_data,
+            independent_report_data(&proof, b"basecrawl/other-protocol/v1\0")
+        );
+    }
+
+    #[test]
+    fn every_section_5_4_component_is_load_bearing() {
+        let proof = attestation_proof();
+        let report_data = attestation_report_data(&proof).unwrap();
+        let mut mutations: Vec<(&str, ScrapeProof)> = Vec::new();
+
+        let mut changed = proof.clone();
+        changed.task_id = Some("task-changed".to_string());
+        mutations.push(("task_id", changed));
+        let mut changed = proof.clone();
+        changed.nonce = Some("nonce-changed".to_string());
+        mutations.push(("nonce", changed));
+        let mut changed = proof.clone();
+        changed.request.request_hash = Some("03".repeat(32));
+        mutations.push(("request_hash", changed));
+        let mut changed = proof.clone();
+        changed.tls.cert_chain_hash = Some("04".repeat(32));
+        mutations.push(("cert_chain_hash", changed));
+        let mut changed = proof.clone();
+        changed.tls.handshake_transcript_hash = Some("05".repeat(32));
+        mutations.push(("transcript_hash", changed));
+        let mut changed = proof.clone();
+        changed.response.body_hash = Some("06".repeat(32));
+        mutations.push(("response_hash", changed));
+        let mut changed = proof.clone();
+        changed.result.result_hash = Some("07".repeat(32));
+        mutations.push(("result_hash", changed));
+        let mut changed = proof.clone();
+        changed.egress.egress_ip = Some("198.51.100.9".to_string());
+        mutations.push(("egress_ip", changed));
+        let mut changed = proof.clone();
+        changed.egress.timestamp = Some("2026-07-12T12:34:57Z".to_string());
+        mutations.push(("timestamp", changed));
+        let mut changed = proof.clone();
+        changed.egress.fingerprint_seed = Some("08".repeat(32));
+        mutations.push(("fingerprint_seed", changed));
+
+        assert_eq!(mutations.len(), 10);
+        for (field, changed) in mutations {
+            assert_ne!(
+                attestation_report_data(&changed).unwrap(),
+                report_data,
+                "mutating {field} must change report_data"
+            );
+        }
+    }
+
+    #[test]
+    fn report_data_component_order_is_canonical() {
+        let proof = attestation_proof();
+        let correct = attestation_report_data(&proof).unwrap();
+        let mut hasher = Sha512::new();
+        hasher.update(ATTESTATION_DOMAIN_TAG);
+        for component in [
+            proof.task_id.as_deref().unwrap(),
+            proof.nonce.as_deref().unwrap(),
+            proof.request.request_hash.as_deref().unwrap(),
+            proof.tls.cert_chain_hash.as_deref().unwrap(),
+            proof.tls.handshake_transcript_hash.as_deref().unwrap(),
+            proof.result.result_hash.as_deref().unwrap(),
+            proof.response.body_hash.as_deref().unwrap(),
+            proof.egress.egress_ip.as_deref().unwrap(),
+            proof.egress.timestamp.as_deref().unwrap(),
+            proof.egress.fingerprint_seed.as_deref().unwrap(),
+        ] {
+            hasher.update(component.as_bytes());
+        }
+        assert_ne!(correct, hex(&hasher.finalize()));
+    }
+
+    #[test]
+    fn fresh_nonce_changes_report_data_and_stale_nonce_does_not_match() {
+        let stale = attestation_proof();
+        let stale_report_data = attestation_report_data(&stale).unwrap();
+        let mut current = stale.clone();
+        current.nonce = Some("validator-nonce-b".to_string());
+        let current_report_data = attestation_report_data(&current).unwrap();
+
+        assert_ne!(stale_report_data, current_report_data);
+        assert_eq!(
+            stale_report_data,
+            independent_report_data(&stale, ATTESTATION_DOMAIN_TAG)
+        );
+        assert_eq!(
+            current_report_data,
+            independent_report_data(&current, ATTESTATION_DOMAIN_TAG)
+        );
+        assert_ne!(
+            stale_report_data,
+            independent_report_data(&current, ATTESTATION_DOMAIN_TAG),
+            "a replayed quote remains bound to its stale nonce"
+        );
+    }
+
+    #[test]
+    fn attestation_refuses_missing_or_empty_components() {
+        let mut missing = attestation_proof();
+        missing.nonce = None;
+        assert_eq!(
+            attestation_report_data(&missing).unwrap_err(),
+            ReportDataError { field: "nonce" }
+        );
+
+        let mut empty = attestation_proof();
+        empty.tls.handshake_transcript_hash = Some(String::new());
+        assert_eq!(
+            attestation_report_data(&empty).unwrap_err(),
+            ReportDataError {
+                field: "tls.handshake_transcript_hash"
+            }
+        );
     }
 
     #[test]
