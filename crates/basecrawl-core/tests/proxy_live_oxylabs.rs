@@ -253,7 +253,7 @@ fn base_cmd() -> Command {
     cmd
 }
 
-fn run_live(
+fn run_live_once(
     args: &[&str],
     proxy_url: &str,
     session: Option<&str>,
@@ -285,6 +285,37 @@ fn run_live(
     cmd.output().expect("spawn basecrawl live")
 }
 
+/// Bounded retries for transient provider gateway failures only (HTTP CONNECT 502/503).
+/// Permanent policy / redaction / hard_path failures are never retried.
+fn run_live(
+    args: &[&str],
+    proxy_url: &str,
+    session: Option<&str>,
+    country: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut last = run_live_once(args, proxy_url, session, country, extra_env);
+    if last.status.success() {
+        return last;
+    }
+    for backoff_ms in [400_u64, 900, 1500] {
+        let stderr = String::from_utf8_lossy(&last.stderr);
+        let transient = stderr.contains("proxy CONNECT failed with HTTP status 502")
+            || stderr.contains("proxy CONNECT failed with HTTP status 503")
+            || stderr.contains("proxy CONNECT failed with HTTP status 504")
+            || stderr.contains("\"kind\":\"transport_error\"");
+        if !transient {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(backoff_ms));
+        last = run_live_once(args, proxy_url, session, country, extra_env);
+        if last.status.success() {
+            return last;
+        }
+    }
+    last
+}
+
 fn scan_for_secrets(text: &str, creds: &LiveCreds) {
     assert!(
         !text.contains(&creds.pass),
@@ -314,10 +345,11 @@ fn assert_scrape_ok(out: &Output) -> Value {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "expected exit 0, got {:?}\nstderr_len={} stdout_len={}",
+        "expected exit 0, got {:?}\nstderr_len={} stdout_len={} stderr_body={}",
         out.status.code(),
         stderr.len(),
-        stdout.len()
+        stdout.len(),
+        stderr.chars().take(500).collect::<String>()
     );
     serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
@@ -393,15 +425,26 @@ fn is_public_ip(ip: &str) -> bool {
 
 fn host_direct_public_ip() -> Option<String> {
     // Lightweight direct fetch (no residential proxy) for topology comparison. Best-effort only.
+    // Explicitly clear proxy env so curl does not inherit Oxylabs ambient vars from the gate.
     let candidates = [
         "https://api.ipify.org?format=json",
         "https://ifconfig.me/ip",
     ];
     for url in candidates {
-        let out = Command::new("curl")
-            .args(["-sS", "-m", "12", url])
-            .output()
-            .ok()?;
+        let mut cmd = Command::new("curl");
+        for key in [
+            "BASECRAWL_HTTP_PROXY",
+            "BASECRAWL_HTTPS_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.env_remove(key);
+        }
+        let out = cmd.args(["-sS", "-m", "12", "--noproxy", "*", url]).output().ok()?;
         if !out.status.success() {
             continue;
         }
@@ -488,28 +531,47 @@ fn val_proxy_031_live_residential_smoke_returns_200_and_non_local_exit() {
 
     let _guard = live_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let proxy = creds.proxy_url();
-    // Username may already embed -cc-US; only add sticky sessid here.
-    let sess = unique_sessid("live31-");
     let host_ip = host_direct_public_ip();
 
     // Residential class forces hard-path Chromium policy (VAL-STEALTH-001/017). Never pass
-    // `--no-js` here — dual-stack soft fallback is refused. Non-HTML geo JSON still dials the
-    // residential upstream via the hard-path planner without claiming soft identity success under --no-js.
-    let out = run_live(
-        &[
-            LIVE_GEO_URL,
-            "--formats",
-            "rawHtml",
-            "--timeout",
-            "45",
-            "--render-timeout",
-            "30",
-        ],
-        &proxy,
-        Some(&sess),
-        None,
-        &[],
-    );
+    // `--no-js` here — dual-stack soft fallback is refused.
+    // Prefer html+rawHtml so paper trails match the Chromium composer smoke and so a short
+    // provider CONNECT flake can be deferred behind a distinct sticky sessid (fresh dial family).
+    let mut out = None;
+    let mut last_out = None;
+    for attempt in 0..4 {
+        let sess = unique_sessid(&format!("live31a{attempt}-"));
+        let attempt_out = run_live(
+            &[
+                LIVE_GEO_URL,
+                "--formats",
+                "html,rawHtml",
+                "--timeout",
+                "60",
+                "--render-timeout",
+                "45",
+            ],
+            &proxy,
+            Some(&sess),
+            None,
+            &[],
+        );
+        if attempt_out.status.success() {
+            out = Some(attempt_out);
+            break;
+        }
+        let stderr = String::from_utf8_lossy(&attempt_out.stderr).into_owned();
+        let transient = stderr.contains("proxy CONNECT failed with HTTP status 502")
+            || stderr.contains("proxy CONNECT failed with HTTP status 503")
+            || stderr.contains("proxy CONNECT failed with HTTP status 504")
+            || stderr.contains("\"kind\":\"transport_error\"");
+        last_out = Some(attempt_out);
+        if !transient {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1000 + attempt as u64 * 500));
+    }
+    let out = out.or(last_out).expect("live 031 attempt produced output");
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
