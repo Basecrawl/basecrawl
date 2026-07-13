@@ -90,6 +90,7 @@ fn attestation_proof_with_pubkey(pubkey_hex: &str) -> basecrawl_proof::ScrapePro
             landmark_rtts: BTreeMap::from([("paris".into(), 11.2), ("nyc".into(), 78.4)]),
             timestamp: Some("2026-07-12T12:34:56Z".into()),
             fingerprint_seed: Some("bb".repeat(32)),
+            proxy_class: None,
         },
         attestation: Attestation::default(),
         sdk_signature: SdkSignature {
@@ -303,6 +304,7 @@ fn val_geo_009_build_egress_includes_landmark_rtts() {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
         &"cc".repeat(32),
         map.clone(),
+        basecrawl_proof::ProxyClass::Direct,
     )
     .expect("egress");
     assert_eq!(egress.landmark_rtts, map);

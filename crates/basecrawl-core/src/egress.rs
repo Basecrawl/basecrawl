@@ -9,7 +9,7 @@
 
 use crate::error::Error;
 use crate::rtt_echo::LandmarkMeasurement;
-use basecrawl_proof::Egress;
+use basecrawl_proof::{Egress, ProxyClass};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use time::format_description::well_known::Rfc3339;
@@ -22,20 +22,30 @@ use time::OffsetDateTime;
 /// per-task fingerprint profile; it is logged here so the emitted variation is auditable and
 /// bound into the attested `report_data` digest. Landmark RTTs default empty; use
 /// [`build_with_landmark_rtts`] once the enclave has measured them (VAL-GEO-009).
+///
+/// `proxy_class` is the **truthful** dial class (`direct|datacenter|residential|mobile`) and
+/// must never claim a commercial class for a direct success (VAL-PROXY-026..028).
 pub fn build(
     egress_ip: IpAddr,
     fetched_at: OffsetDateTime,
     fingerprint_seed: &str,
 ) -> Result<Egress, Error> {
-    build_with_landmark_rtts(egress_ip, fetched_at, fingerprint_seed, BTreeMap::new())
+    build_with_landmark_rtts(
+        egress_ip,
+        fetched_at,
+        fingerprint_seed,
+        BTreeMap::new(),
+        ProxyClass::Direct,
+    )
 }
 
-/// Assemble egress metadata including enclave-recorded landmark RTTs.
+/// Assemble egress metadata including enclave-recorded landmark RTTs and a truthful proxy class.
 pub fn build_with_landmark_rtts(
     egress_ip: IpAddr,
     fetched_at: OffsetDateTime,
     fingerprint_seed: &str,
     landmark_rtts: BTreeMap<String, f64>,
+    proxy_class: ProxyClass,
 ) -> Result<Egress, Error> {
     let timestamp = fetched_at
         .format(&Rfc3339)
@@ -46,6 +56,7 @@ pub fn build_with_landmark_rtts(
         landmark_rtts,
         timestamp: Some(timestamp),
         fingerprint_seed: Some(fingerprint_seed.to_string()),
+        proxy_class: Some(proxy_class),
     })
 }
 
@@ -90,6 +101,7 @@ mod tests {
         assert_eq!(egress.egress_ip.as_deref(), Some("127.0.0.1"));
         assert!(egress.landmark_rtts.is_empty());
         assert_eq!(egress.fingerprint_seed.as_deref(), Some(seed.as_str()));
+        assert_eq!(egress.proxy_class, Some(ProxyClass::Direct));
     }
 
     #[test]

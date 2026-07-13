@@ -60,6 +60,11 @@ pub enum Error {
     #[error("invalid proxy configuration: {0}")]
     InvalidProxy(String),
 
+    /// Required commercial proxy class cannot be dialed (missing upstream / refused dial).
+    /// Fail closed: never emit a success proof claiming residential/mobile for direct egress.
+    #[error("required proxy class '{required}' unavailable: {detail}")]
+    ProxyClassUnavailable { required: String, detail: String },
+
     #[error("robots policy denied the requested path")]
     RobotsDenied(Value),
 
@@ -131,6 +136,7 @@ impl Error {
             Error::InvalidViewport(_) => "invalid_viewport",
             Error::InvalidActions(_) => "invalid_actions",
             Error::InvalidProxy(_) => "invalid_proxy",
+            Error::ProxyClassUnavailable { .. } => "proxy_class_unavailable",
             Error::RobotsDenied(_) => "robots_denied",
             Error::Timeout(_) => "timeout",
             Error::Transport(_) => "transport_error",
@@ -218,6 +224,12 @@ impl Error {
                 let mut scrubbed = robots.clone();
                 redact_json_value(&mut scrubbed, &[], URL_SHAPED_JSON_KEYS);
                 obj.insert("robots".into(), scrubbed);
+            }
+            Error::ProxyClassUnavailable { required, .. } => {
+                obj.insert(
+                    "required_proxy_class".into(),
+                    Value::String(required.clone()),
+                );
             }
             _ => {}
         }

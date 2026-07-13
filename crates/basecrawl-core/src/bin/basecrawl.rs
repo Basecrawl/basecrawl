@@ -172,6 +172,27 @@ struct Cli {
     /// `ALL_PROXY` when set. Credentials stay out of ScrapeProof and host-visible logs.
     #[arg(long = "proxy", value_name = "URL")]
     proxy: Option<String>,
+
+    /// Sticky session id embedded into the provider-agnostic proxy username template
+    /// (e.g. `…-sessid-S1`). Same id reuses the same exit hop when the upstream supports stickiness.
+    #[arg(long = "proxy-session", value_name = "ID")]
+    proxy_session: Option<String>,
+
+    /// Country code token embedded into the provider-agnostic proxy username
+    /// (e.g. `…-cc-US`). Not an Oxylabs-only API flag.
+    #[arg(long = "proxy-country", value_name = "CC")]
+    proxy_country: Option<String>,
+
+    /// Full dial-time username template using `{user}`, `{country}`/`{cc}`, `{session}`/`{sessid}`.
+    /// When omitted, country/session append as `{user}-cc-{country}-sessid-{session}`.
+    #[arg(long = "proxy-username-template", value_name = "TEMPLATE")]
+    proxy_username_template: Option<String>,
+
+    /// Required/declared proxy class: `direct|datacenter|residential|mobile`.
+    /// Commercial classes without a viable upstream fail closed (no forged success proof).
+    /// Emitted `egress.proxy_class` always reflects the actual dial path.
+    #[arg(long = "proxy-class", value_name = "CLASS")]
+    proxy_class: Option<String>,
 }
 
 fn run(cli: Cli) -> Result<String, Error> {
@@ -241,6 +262,15 @@ fn run(cli: Cli) -> Result<String, Error> {
         None => Vec::new(),
     };
 
+    let proxy_class = match cli.proxy_class.as_deref() {
+        None => None,
+        Some(raw) => Some(basecrawl_proof::ProxyClass::parse(raw).ok_or_else(|| {
+            Error::InvalidProxy(format!(
+                "unknown proxy class '{raw}' (supported: direct, datacenter, residential, mobile)"
+            ))
+        })?),
+    };
+
     let options = ScrapeOptions {
         formats,
         task_id: cli.task_id,
@@ -268,6 +298,10 @@ fn run(cli: Cli) -> Result<String, Error> {
         fingerprint_seed: cli.fingerprint_seed,
         landmark_rtts: None,
         proxy: cli.proxy,
+        proxy_session: cli.proxy_session,
+        proxy_country: cli.proxy_country,
+        proxy_username_template: cli.proxy_username_template,
+        proxy_class,
     };
 
     let proof = scrape(&raw_url, &options)?;

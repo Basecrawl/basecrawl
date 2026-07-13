@@ -58,6 +58,7 @@ fn sample_proof(seed: &str) -> ScrapeProof {
             landmark_rtts: BTreeMap::new(),
             timestamp: Some("2026-07-12T00:00:00Z".into()),
             fingerprint_seed: Some(seed.to_string()),
+            proxy_class: None,
         },
         attestation: Attestation::default(),
         sdk_signature: SdkSignature {

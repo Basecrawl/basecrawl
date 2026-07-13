@@ -122,6 +122,18 @@ pub struct ScrapeOptions {
     /// When unset, [`proxy::resolve_proxy`] consults that env stack. Credentials never appear in
     /// ScrapeProof or host-visible logs (VAL-PROXY-023/024).
     pub proxy: Option<String>,
+    /// Sticky session id embedded into the dial-time username via the provider-agnostic template
+    /// (`…-sessid-{session}` or `{sessid}` placeholder) — VAL-PROXY-010/011.
+    pub proxy_session: Option<String>,
+    /// Country code token embedded into the dial-time username (`…-cc-{country}` / `{cc}`) —
+    /// VAL-PROXY-013/014. Provider-agnostic; not an Oxylabs-only flag.
+    pub proxy_country: Option<String>,
+    /// Optional full username template with `{user}`, `{country}`/`{cc}`, `{session}`/`{sessid}`.
+    pub proxy_username_template: Option<String>,
+    /// Required/declared proxy class for this scrape (`direct|datacenter|residential|mobile`).
+    /// Commercial class without a viable upstream fails closed (VAL-PROXY-020/021/028).
+    /// Emitted `egress.proxy_class` is always the truthful dial class, never a forged wish.
+    pub proxy_class: Option<basecrawl_proof::ProxyClass>,
 }
 
 impl Default for ScrapeOptions {
@@ -154,6 +166,10 @@ impl Default for ScrapeOptions {
             fingerprint_seed: None,
             landmark_rtts: None,
             proxy: None,
+            proxy_session: None,
+            proxy_country: None,
+            proxy_username_template: None,
+            proxy_class: None,
         }
     }
 }
@@ -229,8 +245,20 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     }
     // Resolve the soft-path egress proxy before any origin dial. Explicit CLI/config wins over
     // ambient BASECRAWL_HTTP(S)_PROXY / HTTPS_PROXY / ALL_PROXY (VAL-PROXY-005/006). Failures of
-    // a configured upstream are hard errors (no silent direct fallback; VAL-PROXY-020).
-    let proxy = proxy::resolve_proxy(options.proxy.as_deref(), &url)?;
+    // a configured upstream are hard errors (no silent direct fallback; VAL-PROXY-020). Sticky
+    // session + country are applied via provider-agnostic username templates (VAL-PROXY-010..014).
+    let proxy_plan = proxy::ProxyPlan {
+        explicit_url: options.proxy.clone(),
+        username: proxy::UsernameTemplateOptions {
+            country: options.proxy_country.clone(),
+            session: options.proxy_session.clone(),
+            template: options.proxy_username_template.clone(),
+        },
+        required_class: options.proxy_class,
+        configured_class: options.proxy_class.filter(|c| c.requires_upstream()),
+    };
+    let proxy = proxy::resolve_proxy_plan(&proxy_plan, &url)?;
+    let dialed_proxy_class = proxy::truthful_proxy_class(proxy.as_ref(), options.proxy_class)?;
     let config = FetchConfig {
         timeout: Duration::from_secs(options.timeout_secs),
         headers: effective_headers,
@@ -500,8 +528,15 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             fetched.fetched_at,
             &fingerprint.seed,
             rtts.clone(),
+            dialed_proxy_class,
         )?,
-        None => egress::build(fetched.egress_ip, fetched.fetched_at, &fingerprint.seed)?,
+        None => egress::build_with_landmark_rtts(
+            fetched.egress_ip,
+            fetched.fetched_at,
+            &fingerprint.seed,
+            std::collections::BTreeMap::new(),
+            dialed_proxy_class,
+        )?,
     };
 
     let mut proof = ScrapeProof {

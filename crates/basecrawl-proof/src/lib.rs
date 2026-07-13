@@ -182,6 +182,54 @@ pub struct FormatCompleteness {
     pub key_field_count: u64,
 }
 
+/// Finite egress proxy class vocabulary (VAL-PROXY-026..028).
+///
+/// Truthful emission only: the producer must set this from the **actual dial path**, never
+/// from an arbitrary operator wish string that contradicts a direct/unproxied success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyClass {
+    /// Origin dialed without an upstream commercial/mock proxy.
+    Direct,
+    Datacenter,
+    Residential,
+    Mobile,
+}
+
+impl ProxyClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProxyClass::Direct => "direct",
+            ProxyClass::Datacenter => "datacenter",
+            ProxyClass::Residential => "residential",
+            ProxyClass::Mobile => "mobile",
+        }
+    }
+
+    /// Parse a documented class token. Rejects unknown strings so a forged class cannot slip
+    /// through silently.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "direct" | "none" => Some(ProxyClass::Direct),
+            "datacenter" | "dc" => Some(ProxyClass::Datacenter),
+            "residential" | "res" => Some(ProxyClass::Residential),
+            "mobile" => Some(ProxyClass::Mobile),
+            _ => None,
+        }
+    }
+
+    /// Classes that require a successful upstream proxy dial (cannot be claimed for direct egress).
+    pub fn requires_upstream(self) -> bool {
+        !matches!(self, ProxyClass::Direct)
+    }
+}
+
+impl std::fmt::Display for ProxyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Network egress metadata (egress IP, geo landmark RTTs, timestamp, fingerprint seed).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Egress {
@@ -189,6 +237,11 @@ pub struct Egress {
     pub landmark_rtts: BTreeMap<String, f64>,
     pub timestamp: Option<String>,
     pub fingerprint_seed: Option<String>,
+    /// Actual egress proxy class of the dial path when known
+    /// (`direct|datacenter|residential|mobile`). Omitted only when genuinely unknown; never set
+    /// to a higher commercial class than what was dialed (VAL-PROXY-026..028).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_class: Option<ProxyClass>,
 }
 
 /// Signed measurement registers carried by an Intel TDX TD10 report.

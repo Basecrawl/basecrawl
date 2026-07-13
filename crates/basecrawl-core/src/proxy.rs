@@ -1,11 +1,14 @@
 //! Universal egress proxy configuration and dialer (HTTP CONNECT, HTTPS-scheme proxy URLs, SOCKS5).
 //!
 //! Provider-agnostic: any standard `http(s)://[user:pass@]host:port` or
-//! `socks5://[user:pass@]host:port` upstream works. Credentials are zeroized on drop and never
-//! appear in Display/Debug, ScrapeProof, or host-visible error messages (VAL-PROXY-023/024).
+//! `socks5://[user:pass@]host:port` upstream works. Username templates embed sticky session and
+//! country tokens for any compatible vendor (`{user}-cc-{country}-sessid-{session}` shape) without
+//! hardcoding an Oxylabs SDK (VAL-PROXY-010..014). Credentials are zeroized on drop and never
+//! appear in Display/Debug, ScrapeProof, or host-visible error messages (VAL-PROXY-023/024/025).
 
 use crate::error::Error;
 use base64::Engine;
+use basecrawl_proof::ProxyClass;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -35,6 +38,99 @@ impl ProxyKind {
     }
 }
 
+/// Provider-agnostic username template variables for sticky sessions and country targeting.
+///
+/// Templates may use `{user}`, `{country}` / `{cc}`, and `{session}` / `{sessid}` placeholders
+/// (or a literal base username with append-style tokens when the template is empty). This is not
+/// an Oxylabs-only encoding — any provider whose username protocol embeds these tokens works.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsernameTemplateOptions {
+    /// ISO country code token (e.g. `US`). Case-preserving trim only.
+    pub country: Option<String>,
+    /// Sticky session identifier bound into the upstream username (e.g. `S1`).
+    pub session: Option<String>,
+    /// Optional full template. When set, placeholders are substituted. When unset and
+    /// country/session are set, tokens are appended to the base proxy username in a
+    /// provider-agnostic shape: `{base}-cc-{country}-sessid-{session}`.
+    pub template: Option<String>,
+}
+
+/// Resolve optional variables against a base username and produce the dial-time username.
+///
+/// Returns `None` when neither a base username nor a non-empty rendered template is available.
+pub fn render_username(
+    base_username: Option<&str>,
+    options: &UsernameTemplateOptions,
+) -> Result<Option<String>, Error> {
+    let base = base_username.unwrap_or("").trim();
+    let country = options
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let session = options
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(tpl) = options
+        .template
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if tpl.contains('{') {
+            // Require known placeholders only — prevent accidental credential injection shapes.
+            let mut out = tpl.to_string();
+            out = out.replace("{user}", base);
+            out = out.replace("{username}", base);
+            out = out.replace("{country}", country.unwrap_or(""));
+            out = out.replace("{cc}", country.unwrap_or(""));
+            out = out.replace("{session}", session.unwrap_or(""));
+            out = out.replace("{sessid}", session.unwrap_or(""));
+            if out.contains('{') {
+                return Err(Error::InvalidProxy(
+                    "username template has unknown placeholders (supported: {user}, {username}, {country}, {cc}, {session}, {sessid})".to_string(),
+                ));
+            }
+            let out = out.trim();
+            if out.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(out.to_string()));
+        }
+        // Literal template with no placeholders wins as the whole username.
+        return Ok(Some(tpl.to_string()));
+    }
+
+    if country.is_none() && session.is_none() {
+        if base.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(base.to_string()));
+    }
+
+    if base.is_empty() {
+        return Err(Error::InvalidProxy(
+            "proxy username base is required when country/session template tokens are set"
+                .to_string(),
+        ));
+    }
+
+    let mut out = base.to_string();
+    if let Some(cc) = country {
+        // Provider-agnostic country token (compatible with Oxylabs-style `-cc-US` and hermetic mock).
+        out.push_str("-cc-");
+        out.push_str(cc);
+    }
+    if let Some(sess) = session {
+        out.push_str("-sessid-");
+        out.push_str(sess);
+    }
+    Ok(Some(out))
+}
+
 /// Parsed, redaction-safe proxy configuration for the soft (rustls) egress path.
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -44,6 +140,9 @@ pub struct ProxyConfig {
     pub username: Option<String>,
     /// Zeroized on drop so stack dumps and long-lived process memory hold the secret less.
     pub password: Option<Zeroizing<String>>,
+    /// Truthful class of this configured upstream when known. Never a client wish that can remain
+    /// when dial did not happen; producer overwrites with actual dial outcome.
+    pub proxy_class: Option<ProxyClass>,
 }
 
 impl fmt::Debug for ProxyConfig {
@@ -52,8 +151,10 @@ impl fmt::Debug for ProxyConfig {
             .field("kind", &self.kind)
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("username", &self.username.as_deref().map(|_| "<redacted>"))
+            // Username may embed residential customer ids / sess material: redact host-visible form.
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("proxy_class", &self.proxy_class)
             .finish()
     }
 }
@@ -109,16 +210,50 @@ impl ProxyConfig {
             port,
             username,
             password,
+            // Class is not in the URL; operators set it separately. Default assumes datacenter
+            // for a configured open proxy URL until the operator marks a higher commercial class.
+            proxy_class: Some(ProxyClass::Datacenter),
         })
     }
 
-    /// Operator-safe description: scheme + host:port, optional username only (never password).
+    /// Apply sticky session / country username template substitutions (provider-agnostic).
+    pub fn apply_username_template(
+        &mut self,
+        options: &UsernameTemplateOptions,
+    ) -> Result<(), Error> {
+        self.username = render_username(self.username.as_deref(), options)?;
+        Ok(())
+    }
+
+    /// Record the truthful class for this configured upstream path. Does not authorize forging
+    /// class without dial — emission uses the dialed outcome only.
+    pub fn set_proxy_class(&mut self, class: ProxyClass) {
+        self.proxy_class = Some(class);
+    }
+
+    /// Apply sticky session / country username template substitutions (provider-agnostic).
+    pub fn with_username_template(
+        mut self,
+        options: &UsernameTemplateOptions,
+    ) -> Result<Self, Error> {
+        self.apply_username_template(options)?;
+        Ok(self)
+    }
+
+    /// Record the truthful class for this configured upstream path.
+    pub fn with_proxy_class(mut self, class: ProxyClass) -> Self {
+        self.set_proxy_class(class);
+        self
+    }
+
+    /// Host-visible identity without secret password. Prefer not embedding long secret-bearing
+    /// usernames in logs; this still may show a non-secret template username for operators.
+    /// ScrapeProof never embeds this string (VAL-PROXY-023/025).
     pub fn redacted_url(&self) -> String {
         match &self.username {
-            Some(user) => format!(
-                "{}://{}:***@{}:{}",
+            Some(_user) => format!(
+                "{}://***:***@{}:{}",
                 self.kind.as_str(),
-                user,
                 self.host,
                 self.port
             ),
@@ -149,6 +284,89 @@ impl ProxyConfig {
             }
             ProxyKind::Socks5 => socks5_connect(stream, self, target_host, target_port, deadline),
         }
+    }
+}
+
+/// Operator-facing dial plan for a scrape: optional upstream + template options + declared class.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyPlan {
+    /// Explicit proxy URL (wins over env). Empty string is treated as unset.
+    pub explicit_url: Option<String>,
+    /// Sticky session + country username template knobs.
+    pub username: UsernameTemplateOptions,
+    /// Required/declared class for this scrape. When `Some(residential|mobile|datacenter)`, the
+    /// upstream must dial successfully or the scrape fails closed (VAL-PROXY-020/021). When
+    /// `Some(direct)`, a configured upstream is refused rather than silently re-classed.
+    pub required_class: Option<ProxyClass>,
+    /// Configured class of the upstream when dial succeeds and no higher claim is made.
+    /// Defaults to [`ProxyClass::Datacenter`] for any resolved upstream URL.
+    pub configured_class: Option<ProxyClass>,
+}
+
+/// Resolve the soft-path proxy for a scrape and apply username templates.
+///
+/// Fail-closed rules (VAL-PROXY-020/021/028):
+/// * Required commercial class with no resolvable upstream → error (no direct success proof).
+/// * Direct-required class with an upstream configured → error (refuse dual story).
+/// * Successful dial class is computed later from whether the proxy was actually used.
+pub fn resolve_proxy_plan(plan: &ProxyPlan, target: &Url) -> Result<Option<ProxyConfig>, Error> {
+    let mut resolved = resolve_proxy(plan.explicit_url.as_deref(), target)?;
+    if let Some(cfg) = resolved.as_mut() {
+        cfg.apply_username_template(&plan.username)?;
+        let class = plan
+            .configured_class
+            .or(plan.required_class.filter(|c| c.requires_upstream()))
+            .unwrap_or(ProxyClass::Datacenter);
+        // Operator-required higher class upgrades only when an upstream exists; never invents dial.
+        if let Some(req) = plan.required_class {
+            if req.requires_upstream() {
+                cfg.set_proxy_class(req);
+            } else {
+                cfg.set_proxy_class(class);
+            }
+        } else {
+            cfg.set_proxy_class(class);
+        }
+    }
+
+    match (plan.required_class, resolved.as_ref()) {
+        (Some(ProxyClass::Direct), Some(_)) => {
+            return Err(Error::InvalidProxy(
+                "proxy_class=direct forbids a configured upstream proxy".to_string(),
+            ));
+        }
+        (Some(req), None) if req.requires_upstream() => {
+            return Err(Error::ProxyClassUnavailable {
+                required: req.as_str().to_string(),
+                detail: "required proxy class has no upstream dial path configured".to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    Ok(resolved)
+}
+
+/// Truthful `egress.proxy_class` from the actual dial path (VAL-PROXY-026..028).
+///
+/// * Proxy absent → `direct` (never residential/mobile).
+/// * Proxy present and dialed → configured/required commercial class, defaulting to datacenter.
+/// * Operator cannot force a higher class without a matching dial (resolved = None → direct).
+pub fn truthful_proxy_class(
+    dialed_proxy: Option<&ProxyConfig>,
+    required: Option<ProxyClass>,
+) -> Result<ProxyClass, Error> {
+    match (dialed_proxy, required) {
+        (None, Some(req)) if req.requires_upstream() => Err(Error::ProxyClassUnavailable {
+            required: req.as_str().to_string(),
+            detail: "required proxy class was not dialed".to_string(),
+        }),
+        (None, _) => Ok(ProxyClass::Direct),
+        (Some(cfg), Some(req)) if req.requires_upstream() => {
+            // Dial happened; advertise the actual configured class carried on the dial path.
+            Ok(cfg.proxy_class.unwrap_or(req))
+        }
+        (Some(cfg), _) => Ok(cfg.proxy_class.unwrap_or(ProxyClass::Datacenter)),
     }
 }
 
@@ -572,14 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn redacted_url_never_contains_password() {
-        let proxy = ProxyConfig::parse("http://user:supersecret@10.0.0.5:8080").unwrap();
+    fn redacted_url_never_contains_password_or_secret_username() {
+        let proxy =
+            ProxyConfig::parse("http://customer-secret-user:supersecret@127.0.0.1:21010").unwrap();
         let redacted = proxy.redacted_url();
         assert!(!redacted.contains("supersecret"));
-        assert!(redacted.contains("user"));
+        assert!(!redacted.contains("customer-secret-user"));
         assert!(redacted.contains("***"));
         let dbg = format!("{proxy:?}");
         assert!(!dbg.contains("supersecret"));
+        assert!(!dbg.contains("customer-secret-user"));
         let disp = format!("{proxy}");
         assert!(!disp.contains("supersecret"));
     }
@@ -595,5 +815,57 @@ mod tests {
         // Note: this unit test only checks parse path; COM integration covers env/CLI override.
         let cfg = ProxyConfig::parse("socks5://127.0.0.1:1").unwrap();
         assert_eq!(cfg.kind, ProxyKind::Socks5);
+    }
+
+    #[test]
+    fn username_template_appends_country_and_session() {
+        let rendered = render_username(
+            Some("customer-USER"),
+            &UsernameTemplateOptions {
+                country: Some("US".into()),
+                session: Some("S1".into()),
+                template: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rendered.as_deref(), Some("customer-USER-cc-US-sessid-S1"));
+    }
+
+    #[test]
+    fn username_template_placeholders() {
+        let rendered = render_username(
+            Some("cust"),
+            &UsernameTemplateOptions {
+                country: Some("DE".into()),
+                session: Some("abc".into()),
+                template: Some("user-{user}-cc-{cc}-sessid-{sessid}".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(rendered.as_deref(), Some("user-cust-cc-DE-sessid-abc"));
+    }
+
+    #[test]
+    fn truthful_class_direct_when_no_proxy() {
+        assert_eq!(
+            truthful_proxy_class(None, None).unwrap(),
+            ProxyClass::Direct
+        );
+        assert_eq!(
+            truthful_proxy_class(None, Some(ProxyClass::Direct)).unwrap(),
+            ProxyClass::Direct
+        );
+        let err = truthful_proxy_class(None, Some(ProxyClass::Residential)).unwrap_err();
+        assert_eq!(err.kind(), "proxy_class_unavailable");
+    }
+
+    #[test]
+    fn truthful_class_from_dialed_proxy() {
+        let mut cfg = ProxyConfig::parse("http://127.0.0.1:1").unwrap();
+        cfg.set_proxy_class(ProxyClass::Residential);
+        assert_eq!(
+            truthful_proxy_class(Some(&cfg), Some(ProxyClass::Residential)).unwrap(),
+            ProxyClass::Residential
+        );
     }
 }
