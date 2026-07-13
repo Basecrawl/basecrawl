@@ -1,0 +1,85 @@
+{
+  "a": {
+    "l0": "pass",
+    "l1": "pass",
+    "trust": "high",
+    "tcb": "UpToDate",
+    "l2_cert": {
+      "l2.cert": "pass",
+      "san": "matched",
+      "chain": "trusted_root"
+    },
+    "l2_binding": {
+      "l2.binding": "pass",
+      "bound_hashes": [
+        "request_hash",
+        "cert_chain_hash",
+        "transcript_hash",
+        "response_hash",
+        "result_hash"
+      ]
+    },
+    "authentic": true,
+    "reward_gate": "open",
+    "verdict": {
+      "l0": "pass",
+      "l1": "pass",
+      "l2": "pass",
+      "authentic": true,
+      "reward_gate": "open",
+      "trust": "high"
+    }
+  },
+  "b": {
+    "l0": "pass",
+    "l1": "pass",
+    "trust": "high",
+    "tcb": "UpToDate",
+    "l2_cert": {
+      "l2.cert": "pass",
+      "san": "matched",
+      "chain": "trusted_root"
+    },
+    "l2_binding": {
+      "l2.binding": "pass",
+      "bound_hashes": [
+        "request_hash",
+        "cert_chain_hash",
+        "transcript_hash",
+        "response_hash",
+        "result_hash"
+      ]
+    },
+    "authentic": true,
+    "reward_gate": "open",
+    "verdict": {
+      "l0": "pass",
+      "l1": "pass",
+      "l2": "pass",
+      "authentic": true,
+      "reward_gate": "open",
+      "trust": "high"
+    }
+  },
+  "cross020": {
+    "allowlisted": {
+      "l0": "pass",
+      "l1": "pass",
+      "l2": "pass",
+      "authentic": true,
+      "reward_gate": "open",
+      "trust": "high"
+    },
+    "non_allowlisted": {
+      "l1": "reject",
+      "reason": "measurement_not_allowlisted",
+      "message": "measurement_not_allowlisted (tdx pin=f06dfda6dce1cf90\u2026)",
+      "reward_gate": "closed",
+      "weight": 0.0
+    },
+    "get_weights": {
+      "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY": 1.0,
+      "forked-hotkey": 0.0
+    }
+  }
+}

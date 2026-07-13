@@ -1,0 +1,15 @@
+{
+  "allowlisted": {
+    "status": "pass",
+    "trust": "high",
+    "reward_gate": "open",
+    "weight": 1.0
+  },
+  "non_allowlisted": {
+    "status": "reject",
+    "reason": "measurement_not_allowlisted",
+    "message": "measurement_not_allowlisted (tdx pin=f06dfda6dce1cf90\u2026)",
+    "reward_gate": "closed",
+    "weight": 0.0
+  }
+}

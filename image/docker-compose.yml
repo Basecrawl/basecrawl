@@ -1,6 +1,6 @@
 services:
   basecrawl:
-    image: "docker.io/mathiiss/basecrawl-cvm@sha256:57a2ecdc9257846ca69dce38c53a464b68e9a08575fb45d8d18aed5b6b28f366"
+    image: "docker.io/mathiiss/basecrawl-cvm@sha256:ba24465efe709c3f071696d807076eb5517d671c1e6f17ca0fe7143178d51e1a"
     entrypoint:
       - "/bin/sh"
       - "-c"
@@ -8,8 +8,15 @@ services:
       - >-
         set -eu;
         /usr/local/bin/basecrawl --help >/dev/null;
-        REPORT_DATA=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f;
         while [ ! -S /var/run/dstack.sock ]; do sleep 1; done;
+        INFO="$(curl --fail --silent --show-error --max-time 30
+        --unix-socket /var/run/dstack.sock http://dstack/Info)";
+        printf 'BASECRAWL_INFO=%s\n' "$$INFO";
+        PROOF_A="$$(/usr/local/bin/basecrawl --attest --task-id m10-live-evidence-task-001 --nonce m10-validator-nonce-A-001 --formats markdown,metadata,rawHtml --timeout 60 --no-js https://example.com/)";
+        printf 'BASECRAWL_PROOF_A=%s\n' "$$PROOF_A";
+        PROOF_B="$$(/usr/local/bin/basecrawl --attest --task-id m10-live-evidence-task-001 --nonce m10-validator-nonce-B-002 --formats markdown,metadata,rawHtml --timeout 60 --no-js https://example.com/)";
+        printf 'BASECRAWL_PROOF_B=%s\n' "$$PROOF_B";
+        REPORT_DATA=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f;
         RESPONSE="$(curl --fail --silent --show-error --max-time 60
         --unix-socket /var/run/dstack.sock -X POST http://dstack/GetQuote
         -H 'Content-Type: application/json'

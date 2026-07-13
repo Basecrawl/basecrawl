@@ -1,0 +1,75 @@
+{
+  "VAL-TEE-005_006_007_008_009": "report_data independent recompute matched; full 64-byte rsa/sha512 no zero pad; domain tag pinned; field mutations diverge; order sensitive",
+  "VAL-TEE-011_025": {
+    "nonce_a": "m10-validator-nonce-A-001",
+    "nonce_b": "m10-validator-nonce-B-002",
+    "rd_a": "acc50c213035baed9198efa2f3bab845b972ef1a1e263c0febf7f8367aae2d000b61b08f8b44e8486b77be40fdccb13c2163e0b1a9fd683112dfc70e492be513",
+    "rd_b": "eb5c5de761409d620c578c8da7e497b472f60d6e56880a8130346a08cbc635344ad7fdcbc187b527dc2c66d6a1bd56477c2fabf433017b25d1dd656cd2ef2947",
+    "distinct": true,
+    "stale_replay_detectable": true
+  },
+  "VAL-TEE-026": {
+    "host_socket_missing": "{\"error\":{\"kind\":\"attestation_error\",\"message\":\"TDX attestation failed: guest-agent signing request failed: dstack signing socket is unavailable: No such file or directory (os error 2)\",\"task_id\":\"task:sha256:2b3c689c2c44fb7b15ce4f93caf2cd3da37efaef7063bfd9d6134289c58c0ec0\"}}\n"
+  },
+  "VAL-TEE-029": {
+    "enclave_pubkey": "8c714bd881ad357e622b4867bf48dc3e4c7d1cc802e859a094e96fa175ec8186",
+    "sig_present": true,
+    "sig_verifies": true,
+    "bound_in_report_data": true
+  },
+  "VAL-AUTH-046": {
+    "l0": "pass",
+    "l1": "pass",
+    "l2": "pass",
+    "authentic": true,
+    "reward_gate": "open",
+    "trust": "high"
+  },
+  "VAL-CROSS-001": {
+    "lifecycle": "generate(task/nonces)->live_CVM_scrape->L0-L5_auth_gate->score/weight",
+    "authentic": true,
+    "weight": 1.0
+  },
+  "VAL-CROSS-020": {
+    "allowlisted": {
+      "l0": "pass",
+      "l1": "pass",
+      "l2": "pass",
+      "authentic": true,
+      "reward_gate": "open",
+      "trust": "high"
+    },
+    "non_allowlisted": {
+      "l1": "reject",
+      "reason": "measurement_not_allowlisted",
+      "message": "measurement_not_allowlisted (tdx pin=f06dfda6dce1cf90\u2026)",
+      "reward_gate": "closed",
+      "weight": 0.0
+    },
+    "get_weights": {
+      "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY": 1.0,
+      "forked-hotkey": 0.0
+    }
+  },
+  "VAL-CROSS-021": {
+    "offline_mrtd_eq_live": true,
+    "offline_rtmr0_eq_live": true,
+    "offline_rtmr1_eq_live": true,
+    "offline_rtmr2_eq_live": true,
+    "allowlist_eq_live": true,
+    "compose_hash_eq": true
+  },
+  "cleanup": {
+    "mission_cvms": 0,
+    "api_total": 0,
+    "protected_untouched": true
+  },
+  "image": {
+    "digest": "sha256:ba24465efe709c3f071696d807076eb5517d671c1e6f17ca0fe7143178d51e1a",
+    "repo": "docker.io/mathiiss/basecrawl-cvm",
+    "tag": "m10-live-7bb2ed1",
+    "compose_hash": "4d6af8330c0904980a4a934b3628b1089f3733c6175df4594a5fd1874e847009",
+    "source_commit": "75a436606307ce519aeef0b45949f52117fdd3fb",
+    "includes_7bb2ed1": true
+  }
+}

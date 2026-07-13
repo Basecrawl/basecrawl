@@ -1,0 +1,4 @@
+{
+  "success": false,
+  "error": "Failed to delete CVM basecrawl-m10-20260713-120815: The requested CVM was not found"
+}

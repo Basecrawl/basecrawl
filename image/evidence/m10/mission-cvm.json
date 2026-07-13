@@ -1,0 +1,88 @@
+{
+  "id": "cvm_pjg4zBeB",
+  "name": "basecrawl-m10-20260713-120815",
+  "app_id": "6b210d5638bdd44c5cd2303b7c35567924d5d347",
+  "vm_uuid": "879dcc23-ab10-4a5a-9a4d-7fd069482f91",
+  "instance_id": null,
+  "resource": {
+    "instance_type": "tdx.small",
+    "vcpu": 1,
+    "memory_in_gb": 2,
+    "disk_in_gb": 20,
+    "gpus": 0,
+    "compute_billing_price": "0.058000",
+    "billing_period": "hourly"
+  },
+  "node_info": {
+    "object_type": "node",
+    "id": 18,
+    "node_id": 9,
+    "name": "prod9",
+    "region": "US-WEST-1",
+    "device_id": "573f4908a95b4159c4c262fc8244a485a77d874dc4b1bdf28d38afe80ca77431",
+    "device_ids": [],
+    "ppid": "62d54040cb9dfc08bb13006fa75ece56",
+    "status": "ONLINE",
+    "version": "v0.5.7 (git:9c5c5e2b9c945945c193)"
+  },
+  "os": {
+    "name": "dstack-0.5.9",
+    "version": "0.5.9",
+    "is_dev": false,
+    "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033"
+  },
+  "kms_type": "phala",
+  "kms_info": {
+    "chain_id": null,
+    "dstack_kms_address": "",
+    "dstack_app_address": null,
+    "deployer_address": null,
+    "rpc_endpoint": "https://kms.dstack-pha-prod7.phala.network",
+    "encrypted_env_pubkey": "804b0e855ac821e505896236765eb448799447d2f70d666b65f6e55730a05938"
+  },
+  "status": "processing",
+  "in_progress": true,
+  "progress": {
+    "target": "running",
+    "started_at": "2026-07-13T12:08:18.095484Z",
+    "correlation_id": "10d8e5bd1cbb775c0ac8a34965306930"
+  },
+  "compose_hash": "4d6af8330c0904980a4a934b3628b1089f3733c6175df4594a5fd1874e847009",
+  "docker_compose_hash": "cd3053ba5508691c70385d3820a05d85e23a5603be0472ba0b45f19bee309947",
+  "pre_launch_script_hash": "bf12939bc82c9bdd103b6b1226913e6da58ed7cfcfc7c7ae808ac0813715b9a8",
+  "gateway": {
+    "base_domain": "dstack-pha-prod9.phala.network",
+    "cname": "_.dstack-pha-prod9.phala.network"
+  },
+  "logs": {
+    "serial": "https://cloud-api.phala.network/prod9/logs?id=879dcc23-ab10-4a5a-9a4d-7fd069482f91&ch=serial",
+    "stdout": "https://cloud-api.phala.network/prod9/logs?id=879dcc23-ab10-4a5a-9a4d-7fd069482f91&ch=stdout",
+    "stderr": "https://cloud-api.phala.network/prod9/logs?id=879dcc23-ab10-4a5a-9a4d-7fd069482f91&ch=stderr",
+    "container_log_base": "https://cloud-api.phala.com/logs/prod7/containers/6b210d5638bdd44c5cd2303b7c35567924d5d347"
+  },
+  "services": [],
+  "endpoints": [],
+  "public_logs": true,
+  "public_sysinfo": true,
+  "public_tcbinfo": true,
+  "gateway_enabled": true,
+  "secure_time": false,
+  "storage_fs": "zfs",
+  "workspace": {
+    "object_type": "workspace",
+    "id": "wks_vKGJ7pe8",
+    "name": "echobt's projects",
+    "slug": "echobts-projects",
+    "avatar_url": null
+  },
+  "creator": {
+    "object_type": "user",
+    "id": "usr_BKylEJel",
+    "username": "echobt",
+    "avatar_url": "https://avatars.githubusercontent.com/u/154886644?v=4"
+  },
+  "created_at": "2026-07-13T12:08:18.025698Z",
+  "deleted_at": null,
+  "listed": false,
+  "project_type": null
+}
