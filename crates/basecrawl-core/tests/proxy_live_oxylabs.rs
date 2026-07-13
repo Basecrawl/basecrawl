@@ -444,7 +444,10 @@ fn host_direct_public_ip() -> Option<String> {
         ] {
             cmd.env_remove(key);
         }
-        let out = cmd.args(["-sS", "-m", "12", "--noproxy", "*", url]).output().ok()?;
+        let out = cmd
+            .args(["-sS", "-m", "12", "--noproxy", "*", url])
+            .output()
+            .ok()?;
         if !out.status.success() {
             continue;
         }
