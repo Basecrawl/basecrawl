@@ -582,6 +582,21 @@ fn tall_page() -> String {
     fixture_page("<main><div style=\"height: 1800px\">Fixture tall screenshot content</div></main>")
 }
 
+/// Minimal example.com-shaped page for metadata-only assertions.
+///
+/// Intentionally omits `<meta charset>` so VAL-CRAWL-053 can assert charset stays absent when the
+/// response is bare `text/html` (no Content-Type charset parameter either).
+fn example_like_page() -> String {
+    "<!doctype html><html lang=\"en\"><head>\
+<title>Example Domain</title>\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+</head><body><div><h1>Example Domain</h1>\
+<p>This domain is for use in documentation examples without needing permission.</p>\
+<p><a href=\"https://www.iana.org/domains/example\">More information...</a></p>\
+</div></body></html>"
+        .to_string()
+}
+
 fn fixture_response(path: &str) -> (&'static str, &'static str, String) {
     match path {
         "/quotes/" => ("200 OK", "text/html; charset=utf-8", quotes_page()),
@@ -593,6 +608,8 @@ fn fixture_response(path: &str) -> (&'static str, &'static str, String) {
         "/scroll/" => ("200 OK", "text/html; charset=utf-8", scroll_page()),
         "/js/" => ("200 OK", "text/html; charset=utf-8", js_page()),
         "/tall/" => ("200 OK", "text/html; charset=utf-8", tall_page()),
+        // VAL-CRAWL-053/054: example.com-shaped metadata (bare text/html, viewport, no charset).
+        "/example/" => ("200 OK", "text/html", example_like_page()),
         // VAL-CRAWL-034: empty success response with no body (No Content).
         "/status/204" => ("204 No Content", "text/plain; charset=utf-8", String::new()),
         "/missing" => (

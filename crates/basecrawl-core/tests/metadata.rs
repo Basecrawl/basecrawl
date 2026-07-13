@@ -43,13 +43,16 @@ fn fixture_metadata_reports_title_language_charset_source_and_status() {
 
 #[test]
 fn example_metadata_reports_viewport_language_and_title() {
-    let meta = scrape_metadata("https://example.com/");
+    // Hermetic loopback stand-in for example.com (VAL-CRAWL-053/054): bare `text/html` with no
+    // charset declaration, plus viewport / lang / title. Public example.com DNS is flaky on GHA.
+    let url = common::fixture_url("/example/");
+    let meta = scrape_metadata(&url);
     assert_eq!(meta["title"], "Example Domain");
     assert_eq!(meta["language"], "en");
-    // example.com declares a viewport meta tag (VAL-CRAWL-054).
+    // example.com-shaped page declares a viewport meta tag (VAL-CRAWL-054).
     assert_eq!(meta["viewport"], "width=device-width, initial-scale=1");
-    // example.com declares no charset (bare `text/html`, no `<meta charset>`), so it must be
-    // absent rather than fabricated (VAL-CRAWL-053).
+    // Bare `text/html` with no `<meta charset>` must leave charset absent, not fabricated
+    // (VAL-CRAWL-053).
     assert!(
         meta.get("charset").is_none(),
         "charset must be absent when undeclared: {}",
