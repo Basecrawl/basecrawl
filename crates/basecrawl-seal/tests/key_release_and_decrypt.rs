@@ -1,19 +1,22 @@
 //! In-enclave key-release client + AEAD sealed-task decrypt (VAL-CONF-011, VAL-CONF-027).
 //!
-//! Fixtures are produced by the relay-side sealer (`relay.seal.tasks.seal_task` and
-//! `relay.keyrelease.server.seal_task_key_to_session`) so the Rust enclave-path is proven
-//! to interoperate with the live wire format.
+//! Fixtures are built in-process with the same libsodium sealed-box wire format used by
+//! `relay.seal.tasks.seal_task` and `relay.keyrelease.server.seal_task_key_to_session`
+//! (aad || 0x00 || payload inside a sealed box to the enclave/session X25519 pubkey).
+//! Pure-Rust fixture generation keeps this suite hermetic in GHA (no monorepo Python
+//! relay checkout / venv) and independent of CI env such as `BASECRAWL_HTTPBIN_BASE`.
 
 use basecrawl_seal::{
-    decrypt_requires_released_key, decrypt_sealed_task, decrypt_with_foreign_key,
+    build_aad, decrypt_requires_released_key, decrypt_sealed_task, decrypt_with_foreign_key,
     decrypt_without_released_key, key_release_report_data, parse_release_response,
     to_report_data_field, EnclaveIdentity, KeyReleaseClient, KeyReleaseTransport, QuoteBundle,
     QuoteProvider, ReleasedTaskKey, SealError, SealedTaskEnvelope, KEY_RELEASE_TAG,
     RA_TLS_PEER_HEADER, TASK_SEAL_SUITE,
 };
+use crypto_box::aead::OsRng;
+use crypto_box::PublicKey;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 const PLAINTEXT_URL: &str = "https://example.com/private/path?token=known-url-marker";
@@ -21,61 +24,42 @@ const HEADER_MARKER: &str = "known-header-marker";
 const BODY_MARKER: &str = "known-body-marker";
 const TASK_KEY_SENTINEL: &str = "SENTINEL-KEY-RELEASE-RAW-BYTES!!";
 
-/// Invoke a short Python helper against the relay package for wire-compatible fixtures.
-fn py(script: &str) -> String {
-    let out = Command::new("/projects/platform-network/relay/.venv/bin/python")
-        .current_dir("/projects/platform-network/relay")
-        .env("PYTHONPATH", "/projects/platform-network/relay/src")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .expect("python availability");
-    assert!(
-        out.status.success(),
-        "python fixture failed:\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8")
-}
-
+/// Seal a scrape task to the enclave public key (relay.seal.tasks.seal_task wire).
 fn fixture_sealed_task(identity: &EnclaveIdentity) -> (SealedTaskEnvelope, Value) {
-    let pub_hex = identity.public_key_hex();
-    let script = format!(
-        r#"
-import json
-from nacl.public import PrivateKey
-from relay.seal import seal_task, AttestedEnclavePublicKey
+    let task = json!({
+        "task_id": "task-val-conf-011",
+        "url": PLAINTEXT_URL,
+        "method": "POST",
+        "headers": {"X-Secret": HEADER_MARKER, "Cookie": format!("cookie-{HEADER_MARKER}")},
+        "body": BODY_MARKER,
+        "formats": ["markdown"],
+        "required_zone": "any",
+        "nonce": "nonce-val-conf-011",
+        "deadline": "2099-01-01T00:00:00+00:00",
+        "difficulty": "easy",
+        "is_canary": false,
+    });
+    let task_id = task["task_id"].as_str().unwrap();
+    let nonce = task["nonce"].as_str().unwrap();
+    let aad = build_aad(task_id, nonce, identity.key_id()).expect("fixture aad");
+    let body = serde_json::to_vec(&task).expect("task json");
+    let mut authenticated = Vec::with_capacity(aad.len() + 1 + body.len());
+    authenticated.extend_from_slice(&aad);
+    authenticated.push(0);
+    authenticated.extend_from_slice(&body);
 
-# Only the public key is known to the sealer; the enclave keeps the private key.
-public_key = "{pub_hex}"
-key = AttestedEnclavePublicKey.from_public_key(public_key)
-task = {{
-    "task_id": "task-val-conf-011",
-    "url": "{url}",
-    "method": "POST",
-    "headers": {{"X-Secret": "{header}", "Cookie": "cookie-{header}"}},
-    "body": "{body}",
-    "formats": ["markdown"],
-    "required_zone": "any",
-    "nonce": "nonce-val-conf-011",
-    "deadline": "2099-01-01T00:00:00+00:00",
-    "difficulty": "easy",
-    "is_canary": False,
-}}
-envelope = seal_task(task, key)
-print(json.dumps({{"envelope": envelope, "task": task}}))
-"#,
-        pub_hex = pub_hex,
-        url = PLAINTEXT_URL,
-        header = HEADER_MARKER,
-        body = BODY_MARKER,
-    );
-    let raw = py(&script);
-    let value: Value = serde_json::from_str(raw.trim()).expect("fixture json");
-    let envelope: SealedTaskEnvelope =
-        serde_json::from_value(value["envelope"].clone()).expect("envelope shape");
-    let task = value["task"].clone();
+    let public = PublicKey::from(*identity.public_key_bytes());
+    let ciphertext = public
+        .seal(&mut OsRng, &authenticated)
+        .expect("fixture sealed-task seal");
+
+    let envelope = SealedTaskEnvelope {
+        version: 1,
+        suite: TASK_SEAL_SUITE.to_string(),
+        recipient_key_id: identity.key_id().to_string(),
+        enc: None,
+        ciphertext: encode_b64url_for_test(&ciphertext),
+    };
     assert_eq!(envelope.suite, TASK_SEAL_SUITE);
     assert_eq!(envelope.recipient_key_id, identity.key_id());
     // Host-visible envelope has no plaintext markers (VAL-CONF-001 style check).
@@ -91,38 +75,20 @@ print(json.dumps({{"envelope": envelope, "task": task}}))
     (envelope, task)
 }
 
+/// Seal a raw task key to the enclave session public key (key-release `/release` wire).
 fn fixture_session_sealed_key(identity: &EnclaveIdentity) -> (String, Vec<u8>) {
-    let pub_hex = identity.public_key_hex();
-    let script = format!(
-        r#"
-import base64, json
-from relay.keyrelease.server import seal_task_key_to_session
-task_key = b"{sentinel}"
-assert len(task_key) == 32
-pub = bytes.fromhex("{pub_hex}")
-sealed = seal_task_key_to_session(task_key, pub)
-print(json.dumps({{
-    "key_b64": base64.b64encode(sealed).decode("ascii"),
-    "task_key_hex": task_key.hex(),
-}}))
-"#,
-        sentinel = TASK_KEY_SENTINEL,
-        pub_hex = pub_hex,
-    );
-    let raw = py(&script);
-    let value: Value = serde_json::from_str(raw.trim()).unwrap();
-    let key_b64 = value["key_b64"].as_str().unwrap().to_string();
-    let s = value["task_key_hex"].as_str().unwrap();
-    let task_key: Vec<u8> = (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect();
+    let task_key = TASK_KEY_SENTINEL.as_bytes().to_vec();
+    assert_eq!(task_key.len(), 32);
+    let public = PublicKey::from(*identity.public_key_bytes());
+    let sealed = public
+        .seal(&mut OsRng, &task_key)
+        .expect("fixture session seal");
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sealed);
     (key_b64, task_key)
 }
 
 // ---------------------------------------------------------------------------
-// Mock transport for the key-release client (no real network needed for unit
-// path; happy-path interop uses py fixtures for seal/open).
+// Mock transport for the key-release client (no real network; hermetic mocks).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
