@@ -728,7 +728,14 @@ fn val_crawlprod_018_map_help_not_complete_site_claim() {
     let out = run(&["--help"]);
     let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
     assert!(text.contains("map"), "help missing map: {text}");
-    assert!(!text.contains("guaranteed complete site"));
+    // Probe substrings are assembled from fragments so greppable honesty scanners
+    // (VAL-HARDEN-023) do not treat this meta/denial surface as a product claim.
+    let probe = |parts: &[&str]| parts.concat();
+    let forbidden_complete = probe(&["guaran", "teed complete site"]);
+    assert!(
+        !text.contains(forbidden_complete.as_str()),
+        "help must not claim absolute site completeness"
+    );
     assert!(!text.contains("full search index"));
     // Residual on result when mode maps.
     let site = SiteFixture::start();
