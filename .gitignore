@@ -18,6 +18,9 @@
 # Disposable mission dev state
 /tmp/relay-dev/
 
+# Local documentation evidence (never publish)
+.docs-evidence/
+
 # Editor / OS
 .DS_Store
 *.swp
