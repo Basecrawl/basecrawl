@@ -116,6 +116,7 @@ Do not market this as "undetectable" or "defeats all bot vendors." It is an iden
 | Permissions | `permissions.query({name:'notifications'})` is aligned with `Notification.permission` when both exist; other PermissionName values are residual. |
 | TEE.fail (self-hosted) | Physical DDR5 interposer residual; prefer managed-cloud TDX for high-stakes confidential work. See [SECURITY.md](../SECURITY.md). |
 | Network metadata | Sealed DNS / content confidentiality do not erase all host-owned network observables. |
+| Dual-fetch timing residual | Hard Chromium runs still start with a soft rustls document preflight (challenge triage / redirects) before the browser identity capture. Residual multi-handshake timing may be detector-visible. Soft preflight content is never labeled as residential Chromium success; see [SECURITY.md](../SECURITY.md). |
 | Provider spend | Live residential sessions cost money; use sticky short sessions and rate limits. |
 
 ## Quick examples
