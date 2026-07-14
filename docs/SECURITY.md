@@ -50,6 +50,7 @@ Universal proxy support (HTTP CONNECT / SOCKS5, sticky/session and country usern
 | WebRTC residual | Hard path forces WebRTC IP handling policy (`disable_non_proxied_udp`) and inject redacts host/LAN ICE candidates so private addresses do not enter page capture/ScrapeProof. Constructor presence, SDP shape, and non-host candidate classes may still residual-leak. |
 | iframe surface residual | `Page.addScriptToEvaluateOnNewDocument` re-applies the stealth inject per new document (including same-origin iframes) so `chrome` / `webdriver` stay parent-coherent. Cross-origin frames, closed shadow roots, and timing races remain residual. |
 | Class forgery | Product fails closed when residential/mobile is required but upstream is unavailable; never advertise a forged class on success. |
+| Soft TLS chrome-impersonate residual | Soft path may align rustls ClientHello suite/group offer toward a documented Chrome-like profile (`--tls-impersonate chrome`). This is stronger than pure seed suite reorder for JA3-family bootstrap, still **in-process** (cert/transcript capture stays complete). Soft digests are labeled `soft_synthetic_impersonate` — **not** native Chromium wire/packet capture. Soft succeeds keep `fetch_path=direct` and never claim residential without a dialed residential proxy. Hard/residential seize still requires real Chromium. Invalid profiles fail closed. Residual GREASE/ALPS/HTTP2 settings fingerprints and modern edge detectors remain. Not undetectable. |
 
 Operator flag reference: [operators/proxy-and-egress.md](operators/proxy-and-egress.md).
 

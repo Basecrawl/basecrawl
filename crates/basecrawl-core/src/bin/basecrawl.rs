@@ -288,6 +288,16 @@ struct Cli {
     /// the next task_id starts clean without operator process surgery).
     #[arg(long = "keep-browser-profile", default_value_t = false)]
     keep_browser_profile: bool,
+
+    /// Soft-path TLS chrome-impersonate profile for rustls ClientHello / JA3-family
+    /// (`chrome`). Aligns soft TLS suite+group offer toward a documented Chrome-like profile
+    /// (stronger than pure random seed suite reorder). Improves bootstrap alignment / success-rate
+    /// for soft targets only; residual bot detection still applies; never anonymity and never hard
+    /// Chromium wire equivalence. Invalid profile tokens fail closed. Soft scrapes with this flag
+    /// still emit `fetch_path=direct` and never claim residential without a dialed residential
+    /// proxy. Hard/residential seize still requires real Chromium.
+    #[arg(long = "tls-impersonate", value_name = "PROFILE")]
+    tls_impersonate: Option<String>,
 }
 
 fn run(cli: Cli) -> Result<String, Error> {
@@ -422,6 +432,7 @@ fn run(cli: Cli) -> Result<String, Error> {
         wipe_profile_on_complete: !cli.keep_browser_profile,
         json_schema,
         json_prompt,
+        tls_impersonate: cli.tls_impersonate.clone(),
     };
 
     match mode.as_str() {

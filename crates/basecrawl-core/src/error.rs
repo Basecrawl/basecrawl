@@ -110,6 +110,12 @@ pub enum Error {
     #[error("hard path policy error: {0}")]
     HardPath(String),
 
+    /// Soft-path TLS chrome-impersonate refused an invalid / weak profile, or capture required
+    /// under `--attest` was incomplete (VAL-UTLS-002/007). Fail closed — never silently rot into
+    /// random suite reorder while claiming chrome-impersonate success.
+    #[error("tls impersonate error: {0}")]
+    TlsImpersonate(String),
+
     /// Hard path observed a bot-challenge / block interstitial and refused silent success
     /// (VAL-STEALTH-016).
     #[error("blocked by bot challenge (HTTP {status_code}): {detail}")]
@@ -192,6 +198,7 @@ impl Error {
             Error::InvalidProxy(_) => "invalid_proxy",
             Error::ProxyClassUnavailable { .. } => "proxy_class_unavailable",
             Error::HardPath(_) => "hard_path_policy",
+            Error::TlsImpersonate(_) => "tls_impersonate_unsupported",
             Error::ChallengeBlocked { .. } => "challenge_blocked",
             Error::RobotsDenied(_) => "robots_denied",
             Error::Timeout(_) => "timeout",
@@ -304,6 +311,10 @@ impl Error {
                     "required_proxy_class".into(),
                     Value::String(required.clone()),
                 );
+            }
+            Error::TlsImpersonate(detail) => {
+                obj.insert("capability".into(), Value::String("tls_impersonate".into()));
+                obj.insert("reason".into(), Value::String(detail.clone()));
             }
             Error::ChallengeBlocked { status_code, .. } => {
                 obj.insert("status_code".into(), Value::Number((*status_code).into()));

@@ -60,6 +60,7 @@ fn sample_proof(seed: &str) -> ScrapeProof {
             fingerprint_seed: Some(seed.to_string()),
             proxy_class: None,
             fetch_path: None,
+            soft_tls_impersonate: None,
         },
         attestation: Attestation::default(),
         sdk_signature: SdkSignature {

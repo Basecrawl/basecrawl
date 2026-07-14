@@ -171,6 +171,11 @@ pub struct ScrapeOptions {
     /// Optional natural-language extract prompt (`--json-prompt` / `--prompt`). Gated with schema;
     /// does not alone enable forged success.
     pub json_prompt: Option<String>,
+    /// Soft-path TLS chrome-impersonate profile (`chrome`). None = pure seed suite reorder only.
+    /// Invalid tokens fail closed (VAL-UTLS-002/007). Soft path never upgrades to chromium
+    /// fetch_path or residential class (VAL-UTLS-003/004). Applied only on rustls soft fetch;
+    /// hard Chromium path ignores the soft TLS offer as residential seize evidence (VAL-UTLS-010).
+    pub tls_impersonate: Option<String>,
 }
 
 impl Default for ScrapeOptions {
@@ -215,6 +220,7 @@ impl Default for ScrapeOptions {
             wipe_profile_on_complete: true,
             json_schema: None,
             json_prompt: None,
+            tls_impersonate: None,
         }
     }
 }
@@ -269,11 +275,47 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     );
     // Fail closed if a seed ever selects a weak security surface (VAL-ANTIBOT-038 / BOT-08).
     // Non-security dimensions (JA3/JA4, headers, UA, viewport, tz, locale, canvas) still vary.
-    let fingerprint = basecrawl_fp::generate_validated(&fingerprint_seed).map_err(|detail| {
-        Error::TlsCapture(format!(
-            "fingerprint seed violated security-critical TLS invariants: {detail}"
-        ))
-    })?;
+    let mut fingerprint =
+        basecrawl_fp::generate_validated(&fingerprint_seed).map_err(|detail| {
+            Error::TlsCapture(format!(
+                "fingerprint seed violated security-critical TLS invariants: {detail}"
+            ))
+        })?;
+
+    // Soft chrome-impersonate ClientHello (VAL-UTLS-001..008): stronger than pure random suite
+    // reorder. Invalid / weak profiles fail closed before any dial. Capture stays in-process.
+    let soft_tls_impersonate = match options.tls_impersonate.as_deref() {
+        None => None,
+        Some(raw) => {
+            let profile = basecrawl_fp::SoftTlsImpersonate::parse(raw)
+                .map_err(|err| Error::TlsImpersonate(err.message()))?;
+            basecrawl_fp::assert_chrome_security_floor().map_err(|detail| {
+                Error::TlsImpersonate(format!(
+                    "soft chrome profile below security floor: {detail}"
+                ))
+            })?;
+            // Under --attest, soft impersonate still requires complete cert/transcript capture
+            // on the rustls path. Capature remains enabled by product security invariants;
+            // refuse any future mode that would skip capture while claiming attest success.
+            if options.attest {
+                let floor = basecrawl_fp::security_critical_tls_params();
+                if !floor.cert_chain_capture_enabled || !floor.transcript_capture_enabled {
+                    return Err(Error::TlsImpersonate(
+                        "tls impersonate under --attest requires in-enclave cert/transcript capture"
+                            .into(),
+                    ));
+                }
+            }
+            profile.apply(&mut fingerprint);
+            // Re-check invariants after chrome-order swap (still TLS 1.3 closed set).
+            basecrawl_fp::assert_security_invariants(&fingerprint).map_err(|detail| {
+                Error::TlsImpersonate(format!(
+                    "chrome soft profile violated security-critical TLS invariants: {detail}"
+                ))
+            })?;
+            Some(profile)
+        }
+    };
 
     // Seed chooses viewport when the caller left the measured-image default; an explicit
     // non-default viewport from the CLI/SDK wins.
@@ -748,24 +790,30 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
                 .into(),
         ));
     }
-    let egress = match &options.landmark_rtts {
-        Some(rtts) => egress::build_with_landmark_rtts(
-            fetched.egress_ip,
-            fetched.fetched_at,
-            &fingerprint.seed,
-            rtts.clone(),
-            dialed_proxy_class,
-            fetch_path,
-        )?,
-        None => egress::build_with_landmark_rtts(
-            fetched.egress_ip,
-            fetched.fetched_at,
-            &fingerprint.seed,
-            std::collections::BTreeMap::new(),
-            dialed_proxy_class,
-            fetch_path,
-        )?,
+    // Soft audit only when soft rustls was the wire path *and* chrome-impersonate was applied.
+    // Hard Chromium proof must not sell soft TLS as residential identity (VAL-UTLS-003/006/010).
+    let soft_impersonate_egress = match (soft_tls_impersonate, fetch_path) {
+        (Some(profile), basecrawl_proof::FetchPath::Direct) => {
+            let audit = basecrawl_fp::SoftTlsImpersonateAudit::from_applied(profile, &fingerprint);
+            Some(basecrawl_proof::SoftTlsImpersonateEgress {
+                profile: audit.profile,
+                ja_label: audit.ja_label,
+                soft_ja3: audit.soft_ja3,
+                soft_ja4: audit.soft_ja4,
+            })
+        }
+        _ => None,
     };
+    let landmark_map = options.landmark_rtts.clone().unwrap_or_default();
+    let egress = egress::build_with_soft_tls_impersonate(
+        fetched.egress_ip,
+        fetched.fetched_at,
+        &fingerprint.seed,
+        landmark_map,
+        dialed_proxy_class,
+        fetch_path,
+        soft_impersonate_egress,
+    )?;
 
     let mut proof = ScrapeProof {
         version: SCRAPE_PROOF_VERSION,

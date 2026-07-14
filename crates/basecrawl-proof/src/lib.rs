@@ -282,6 +282,27 @@ pub struct Egress {
     /// `chromium` rather than a soft-only identity (VAL-STEALTH-001/010).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_path: Option<FetchPath>,
+    /// Soft-path TLS chrome-impersonate audit (VAL-UTLS-*). Present only when the soft rustls
+    /// path applied a chrome-like ClientHello profile. Digests are labeled soft/synthetic/
+    /// impersonate and must never be read as native Chromium wire/packet capture.
+    /// Soft impersonate never implies `fetch_path=chromium` or residential class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_tls_impersonate: Option<SoftTlsImpersonateEgress>,
+}
+
+/// Soft-path chrome-impersonate audit fields, exclusive to rustls/direct `fetch_path`
+/// (VAL-UTLS-003/006). Hard Chromium success does not carry these fields as a substitute for
+/// real browser wire identity (VAL-UTLS-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoftTlsImpersonateEgress {
+    /// Applied soft profile token (`chrome`).
+    pub profile: String,
+    /// Always a soft/synthetic/impersonate label (never native Chromium wire capture claim).
+    pub ja_label: String,
+    /// Soft synthetic JA3-family digest under the chrome-oriented domain.
+    pub soft_ja3: String,
+    /// Soft synthetic JA4-family digest under the chrome-oriented domain.
+    pub soft_ja4: String,
 }
 
 /// Signed measurement registers carried by an Intel TDX TD10 report.

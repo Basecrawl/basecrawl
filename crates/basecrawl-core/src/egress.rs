@@ -49,9 +49,41 @@ pub fn build_with_landmark_rtts(
     proxy_class: ProxyClass,
     fetch_path: FetchPath,
 ) -> Result<Egress, Error> {
+    build_with_soft_tls_impersonate(
+        egress_ip,
+        fetched_at,
+        fingerprint_seed,
+        landmark_rtts,
+        proxy_class,
+        fetch_path,
+        None,
+    )
+}
+
+/// Assemble egress with optional soft-path TLS impersonate audit (VAL-UTLS-003/006).
+///
+/// Soft chrome-impersonate **never** upgrades `fetch_path` to chromium or invents residential
+/// class. When `fetch_path` is chromium (hard identity), soft audit is cleared so hard proof
+/// is not sold as soft TLS (VAL-UTLS-010).
+pub fn build_with_soft_tls_impersonate(
+    egress_ip: IpAddr,
+    fetched_at: OffsetDateTime,
+    fingerprint_seed: &str,
+    landmark_rtts: BTreeMap<String, f64>,
+    proxy_class: ProxyClass,
+    fetch_path: FetchPath,
+    soft_tls_impersonate: Option<basecrawl_proof::SoftTlsImpersonateEgress>,
+) -> Result<Egress, Error> {
     let timestamp = fetched_at
         .format(&Rfc3339)
         .map_err(|error| Error::EgressMetadata(error.to_string()))?;
+
+    // Soft audit fields only belong on soft rustls successes.
+    let soft_tls_impersonate = if fetch_path == FetchPath::Direct {
+        soft_tls_impersonate
+    } else {
+        None
+    };
 
     Ok(Egress {
         egress_ip: Some(egress_ip.to_string()),
@@ -60,6 +92,7 @@ pub fn build_with_landmark_rtts(
         fingerprint_seed: Some(fingerprint_seed.to_string()),
         proxy_class: Some(proxy_class),
         fetch_path: Some(fetch_path),
+        soft_tls_impersonate,
     })
 }
 
@@ -106,6 +139,7 @@ mod tests {
         assert_eq!(egress.fingerprint_seed.as_deref(), Some(seed.as_str()));
         assert_eq!(egress.proxy_class, Some(ProxyClass::Direct));
         assert_eq!(egress.fetch_path, Some(FetchPath::Direct));
+        assert!(egress.soft_tls_impersonate.is_none());
     }
 
     #[test]

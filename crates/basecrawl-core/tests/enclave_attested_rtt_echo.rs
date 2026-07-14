@@ -92,6 +92,7 @@ fn attestation_proof_with_pubkey(pubkey_hex: &str) -> basecrawl_proof::ScrapePro
             fingerprint_seed: Some("bb".repeat(32)),
             proxy_class: None,
             fetch_path: None,
+            soft_tls_impersonate: None,
         },
         attestation: Attestation::default(),
         sdk_signature: SdkSignature {

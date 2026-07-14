@@ -12,11 +12,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub mod security;
+pub mod tls_impersonate;
 pub use security::{
     assert_security_invariants, security_critical_tls_params, security_snapshot_for_seed,
     CertificateValidationPolicy, OfferedTlsVersions, SecurityCriticalTlsParams,
     SeedSecuritySnapshot, REQUIRED_NEGOTIATED_TLS_VERSION, SECURITY_TLS13_CIPHER_SUITE_IANA,
     SECURITY_TLS_GROUP_ALLOWLIST,
+};
+pub use tls_impersonate::{
+    assert_chrome_security_floor, SoftTlsImpersonate, SoftTlsImpersonateAudit,
+    SoftTlsImpersonateError, CHROME_TLS13_CIPHER_NAMES, CHROME_TLS13_CIPHER_ORDER,
+    CHROME_TLS_GROUP_ORDER, SOFT_TLS_FP_LABEL,
 };
 
 // generate_validated is defined below next to generate.

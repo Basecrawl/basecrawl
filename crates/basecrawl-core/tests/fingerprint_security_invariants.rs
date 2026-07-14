@@ -72,6 +72,7 @@ fn sample_proof_for_seed(seed: &str, cert_chain_hash: &str, transcript_hash: &st
             fingerprint_seed: Some(seed.to_string()),
             proxy_class: None,
             fetch_path: None,
+            soft_tls_impersonate: None,
         },
         attestation: Attestation::default(),
         sdk_signature: SdkSignature {

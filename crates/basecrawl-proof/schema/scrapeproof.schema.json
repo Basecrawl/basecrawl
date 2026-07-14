@@ -176,6 +176,34 @@
           "type": "string",
           "enum": ["direct", "chromium"],
           "description": "Truthful client path used for the scrape. Hard/residential requests must report chromium rather than a soft-only identity."
+        },
+        "soft_tls_impersonate": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Soft-path rustls chrome ClientHello/JA3-family impersonate audit. Digests are soft/synthetic/impersonate, not native Chromium packet capture. Never implies fetch_path=chromium or residential class.",
+          "required": ["profile", "ja_label", "soft_ja3", "soft_ja4"],
+          "properties": {
+            "profile": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Soft impersonate profile token (e.g. chrome)."
+            },
+            "ja_label": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Must identify soft/synthetic/impersonate digests (must never claim native Chromium wire equivalence)."
+            },
+            "soft_ja3": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Soft synthetic JA3-family digest for the chrome-like rustls ClientHello profile."
+            },
+            "soft_ja4": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Soft synthetic JA4-family digest for the chrome-like rustls ClientHello profile."
+            }
+          }
         }
       }
     },
