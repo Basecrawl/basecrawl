@@ -61,6 +61,36 @@ pub use robots::RobotsPolicy;
 /// The default HTTP method for a scrape.
 pub const DEFAULT_METHOD: &str = product_request::DEFAULT_METHOD;
 
+/// RAII guard that wipes a sticky Chromium profile on drop when wipe-on-complete is enabled.
+///
+/// Success paths call [`StickyProfileWipeGuard::wipe_now`] explicitly; error/timeout returns rely
+/// on `Drop` so fixed-task_id retries cannot re-attach a half-written profile that near-hangs
+/// Chrome launches under suite load.
+struct StickyProfileWipeGuard {
+    key: Option<String>,
+    enabled: bool,
+}
+
+impl StickyProfileWipeGuard {
+    fn wipe_now(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(key) = self.key.take() {
+            let _ = stealth::wipe_sticky_profile(&key);
+        } else {
+            let _ = stealth::wipe_current_sticky_profile();
+        }
+        self.enabled = false;
+    }
+}
+
+impl Drop for StickyProfileWipeGuard {
+    fn drop(&mut self) {
+        self.wipe_now();
+    }
+}
+
 /// Default cap on the number of pages crawled when pagination following is enabled.
 pub const DEFAULT_MAX_PAGES: usize = 5;
 
@@ -406,19 +436,33 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     };
     // Sticky profile for multipage cookie continuity on one task; wiped across task_ids
     // (VAL-STEALTH-011..014). Soft-only scrapes skip an empty profile.
-    let sticky_profile_dir = if will_use_browser {
-        let key = options
-            .task_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or(options.proxy_session.as_deref())
-            .unwrap_or("anonymous");
+    // Acquire a wipe guard immediately so timeout/render failures still remove the jar
+    // (otherwise fixed-task_id retries reattach a partially-written Chromium profile and
+    // stall on the next hard-path scrape with "browser operation deadline exceeded").
+    let sticky_wipe_key = if will_use_browser {
+        Some(
+            options
+                .task_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(options.proxy_session.as_deref())
+                .unwrap_or("anonymous")
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let sticky_profile_dir = if let Some(key) = sticky_wipe_key.as_deref() {
         Some(
             stealth::acquire_sticky_profile(key)
                 .map_err(|error| Error::HardPath(error.to_string()))?,
         )
     } else {
         None
+    };
+    let mut sticky_profile_guard = StickyProfileWipeGuard {
+        key: sticky_wipe_key.clone(),
+        enabled: options.wipe_profile_on_complete && sticky_wipe_key.is_some(),
     };
     // Chromium hard path shares the soft-path dialer via a DoH-preserving composer
     // (VAL-PROXY-012/015..019). Only start when the scrape will launch headless Chromium so soft
@@ -518,13 +562,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     // Refuse hard-path silent success when the origin already returned a classic challenge page
     // before Chromium rolls (VAL-STEALTH-016). Still fail closed if the rendered DOM is a block page.
     if hard_required && stealth::looks_like_challenge_interstitial(&body_str, fetched.status_code) {
-        if options.wipe_profile_on_complete {
-            if let Some(key) = options.task_id.as_deref().filter(|s| !s.is_empty()) {
-                let _ = stealth::wipe_sticky_profile(key);
-            } else {
-                let _ = stealth::wipe_current_sticky_profile();
-            }
-        }
+        sticky_profile_guard.wipe_now();
         return Err(Error::ChallengeBlocked {
             status_code: fetched.status_code,
             detail: "hard path observed a bot-challenge / block response (VAL-STEALTH-016)".into(),
@@ -575,13 +613,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         if hard_required
             && stealth::looks_like_challenge_interstitial(&rendered.html, fetched.status_code)
         {
-            if options.wipe_profile_on_complete {
-                if let Some(key) = options.task_id.as_deref().filter(|s| !s.is_empty()) {
-                    let _ = stealth::wipe_sticky_profile(key);
-                } else {
-                    let _ = stealth::wipe_current_sticky_profile();
-                }
-            }
+            sticky_profile_guard.wipe_now();
             return Err(Error::ChallengeBlocked {
                 status_code: fetched.status_code,
                 detail: "hard path observed a bot-challenge / block interstitial rather than the primary document (VAL-STEALTH-016)".into(),
@@ -594,13 +626,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         if hard_required
             && stealth::looks_like_challenge_interstitial(&body_str, fetched.status_code)
         {
-            if options.wipe_profile_on_complete {
-                if let Some(key) = options.task_id.as_deref().filter(|s| !s.is_empty()) {
-                    let _ = stealth::wipe_sticky_profile(key);
-                } else {
-                    let _ = stealth::wipe_current_sticky_profile();
-                }
-            }
+            sticky_profile_guard.wipe_now();
             return Err(Error::ChallengeBlocked {
                 status_code: fetched.status_code,
                 detail: "hard path observed a bot-challenge / block response (VAL-STEALTH-016)"
@@ -778,13 +804,7 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
         && content_kind == ContentKind::Html
         && fetch_path != basecrawl_proof::FetchPath::Chromium
     {
-        if options.wipe_profile_on_complete {
-            if let Some(key) = options.task_id.as_deref().filter(|s| !s.is_empty()) {
-                let _ = stealth::wipe_sticky_profile(key);
-            } else {
-                let _ = stealth::wipe_current_sticky_profile();
-            }
-        }
+        sticky_profile_guard.wipe_now();
         return Err(Error::HardPath(
             "hard/residential request completed without a Chromium identity (dual-stack mismatch)"
                 .into(),
@@ -860,19 +880,9 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             "signed proofs require attestation".to_string(),
         ));
     }
-    if options.wipe_profile_on_complete {
-        // Task ends → wipe sticky jar so the next task_id starts clean (VAL-STEALTH-013/014).
-        // Browser process itself is already Drop-killed by the render crate.
-        if let Some(key) = options
-            .task_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or(options.proxy_session.as_deref())
-        {
-            let _ = stealth::wipe_sticky_profile(key);
-        } else {
-            let _ = stealth::wipe_current_sticky_profile();
-        }
+    // Explicit wipe (or disarm: Drop guard wipes for any early return/timeout path).
+    if sticky_profile_guard.enabled {
+        sticky_profile_guard.wipe_now();
     }
 
     if options.attest {

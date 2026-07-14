@@ -1071,6 +1071,12 @@ const STEALTH_EXTRA_ARGS: &[&str] = &[
 
 /// Remove Chromium session restore artifacts so sticky-profile relaunches honor the requested URL.
 /// Cookie / local storage files are intentionally preserved (VAL-STEALTH-011).
+///
+/// Also clears **stale Singleton\* locks** left by deadline-killed Chromium processes. Fixed
+/// CLI `--task-id` keys currently re-attach the on-disk profile across process boundaries;
+/// a leftover `SingletonLock` symlink whose owner PID is gone makes Chrome hang until the
+/// scrape browser-operation deadline expires (observed as flaky VAL-CROSS-STEALTH hard-path
+/// failures under suite load).
 fn sanitize_sticky_profile_for_relaunch(dir: &std::path::Path) {
     for rel in [
         "Default/Sessions",
@@ -1088,6 +1094,7 @@ fn sanitize_sticky_profile_for_relaunch(dir: &std::path::Path) {
             let _ = std::fs::remove_file(&path);
         }
     }
+    clear_stale_chromium_singleton_locks(dir);
     // Prefer not restoring on crash; Preferences is JSON – best-effort strip of session restore.
     let prefs = dir.join("Default/Preferences");
     if prefs.is_file() {
@@ -1107,6 +1114,50 @@ fn sanitize_sticky_profile_for_relaunch(dir: &std::path::Path) {
             }
         }
     }
+}
+
+/// Drop Chromium Singleton* markers when no live owner process remains.
+///
+/// Chrome writes `SingletonLock` as a symlink `hostname-pid`. When a prior scrape is
+/// deadline-killed, the process dies but leaves the lock; re-using the sticky profile then
+/// stalls launch until the caller deadline. Cookie jars under `Default/` are preserved.
+fn clear_stale_chromium_singleton_locks(dir: &std::path::Path) {
+    let lock = dir.join("SingletonLock");
+    let lock_meta = match std::fs::symlink_metadata(&lock) {
+        Ok(meta) => meta,
+        Err(_) => return,
+    };
+
+    let owner_alive = if lock_meta.file_type().is_symlink() {
+        match std::fs::read_link(&lock) {
+            Ok(target) => {
+                let target = target.to_string_lossy();
+                // Format is typically "hostname-pid".
+                target
+                    .rsplit_once('-')
+                    .and_then(|(_, pid)| pid.parse::<u32>().ok())
+                    .filter(|pid| *pid > 1)
+                    .is_some_and(process_is_alive)
+            }
+            Err(_) => false,
+        }
+    } else {
+        // Non-symlink residue cannot represent a live Chrome singleton holder.
+        false
+    };
+
+    if owner_alive {
+        return;
+    }
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    // Portable-enough check without binding lib: /proc/<pid> on Linux hosts.
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 
 /// Default args overridden/ignored so automation is not advertised on the hard path.
