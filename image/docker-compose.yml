@@ -1,6 +1,6 @@
 services:
   basecrawl:
-    image: "docker.io/mathiiss/basecrawl-cvm@sha256:31a25ee29a355d4d369fc0eeb0683bea19bf635edbd19f493e6e2dffa01a0aaa"
+    image: "docker.io/mathiiss/basecrawl-cvm@sha256:c088e452da7b182ba4546c524045404755c172443154c815a3c6aefe996a8a52"
     entrypoint:
       - "/bin/sh"
       - "-c"
@@ -12,9 +12,9 @@ services:
         INFO="$(curl --fail --silent --show-error --max-time 30
         --unix-socket /var/run/dstack.sock http://dstack/Info)";
         printf 'BASECRAWL_INFO=%s\n' "$$INFO";
-        PROOF_A="$$(/usr/local/bin/basecrawl --attest --task-id m17-live-evidence-task-001 --nonce m17-validator-nonce-A-001 --formats markdown,metadata,rawHtml --timeout 60 --no-js https://example.com/)";
+        PROOF_A="$$(/usr/local/bin/basecrawl --attest --task-id m21-live-evidence-task-001 --nonce m21-validator-nonce-A-001 --formats markdown,metadata,rawHtml --timeout 60 --no-js https://example.com/)";
         printf 'BASECRAWL_PROOF_A=%s\n' "$$PROOF_A";
-        PROOF_B="$$(/usr/local/bin/basecrawl --attest --task-id m17-live-evidence-task-001 --nonce m17-validator-nonce-B-002 --formats markdown,metadata,rawHtml --timeout 60 --no-js https://example.com/)";
+        PROOF_B="$$(/usr/local/bin/basecrawl --attest --task-id m21-live-evidence-task-001 --nonce m21-validator-nonce-B-002 --formats markdown,metadata,rawHtml --timeout 60 --no-js https://example.com/)";
         printf 'BASECRAWL_PROOF_B=%s\n' "$$PROOF_B";
         REPORT_DATA=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f;
         RESPONSE="$(curl --fail --silent --show-error --max-time 60
