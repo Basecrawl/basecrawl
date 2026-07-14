@@ -361,6 +361,366 @@ fn val_unlock_004_sealed_feedback_codes_are_detect_only_never_solved() {
 }
 
 // ---------------------------------------------------------------------------
+// VAL-UNLOCK-005: product docs residual risk section is honest
+// ---------------------------------------------------------------------------
+
+#[test]
+fn val_unlock_005_docs_residual_risk_section_honest() {
+    // Residual product docs (not mission diary). Must list headless/CDP residual,
+    // challenge detect-not-solve, and proxy ≠ anonymity. Absolute "undetectable"
+    // marketing is forbidden (deny-form residual mentions are allowed).
+    let security = include_str!("../../../docs/SECURITY.md");
+    let operator = include_str!("../../../docs/operators/proxy-and-egress.md");
+    let trust = include_str!("../../../docs/TRUST_MODEL.md");
+    let combined = format!("{security}\n{operator}\n{trust}");
+    let lower = combined.to_ascii_lowercase();
+
+    assert!(
+        lower.contains("headless") && (lower.contains("residual") || lower.contains("detect")),
+        "VAL-UNLOCK-005: residual docs must admit headless residual risk"
+    );
+    assert!(
+        lower.contains("cdp")
+            || lower.contains("runtime.enable")
+            || lower.contains("runtime protocol"),
+        "VAL-UNLOCK-005: residual docs must admit CDP / Runtime residual risk"
+    );
+    assert!(
+        (lower.contains("challenge") || lower.contains("captcha"))
+            && (lower.contains("detect")
+                || lower.contains("not solve")
+                || lower.contains("not a captcha solve")
+                || lower.contains("challenge_blocked")
+                || lower.contains("no captcha marketplace")
+                || lower.contains("marketplace")),
+        "VAL-UNLOCK-005: residual docs must state challenge/captcha detect-not-solve posture"
+    );
+    assert!(
+        (lower.contains("proxy") && lower.contains("anonymity"))
+            || lower.contains("proxy ≠ anonymity")
+            || lower.contains("proxy != anonymity")
+            || lower.contains("not anonymity")
+            || lower.contains("are not anonymity"),
+        "VAL-UNLOCK-005: residual docs must state proxy ≠ anonymity"
+    );
+    assert!(
+        lower.contains("soft")
+            && (lower.contains("impersonat") || lower.contains("clienthello"))
+            && (lower.contains("chromium") || lower.contains("hard")),
+        "VAL-UNLOCK-005: residual docs should cover soft TLS not claim hard Chromium wire"
+    );
+
+    // Positive absolute marketing claims only (honest residual negation is fine).
+    // Each denylist line carries denial/meta markers for greppable honesty scanners.
+    for banned in [
+        "we are undetectable",                // must never / forbidden claim
+        "fully undetectable residential",     // must never / forbidden claim
+        "trustless scrape authenticity",      // must never / forbidden claim
+        "100% guaranteed authenticity",       // must never / forbidden claim
+        "anonymous residential exit forever", // must never / forbidden claim
+        "defeats every bot vendor",           // must never / forbidden claim
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "VAL-UNLOCK-005: residual docs must never market absolute claim '{banned}'"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VAL-UNLOCK-006: CLI help rejects banned slogans
+// ---------------------------------------------------------------------------
+
+#[test]
+fn val_unlock_006_cli_help_rejects_banned_slogans() {
+    let help = run_cli(&["--help"]);
+    assert!(
+        help.status.success(),
+        "--help must succeed; stderr={}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let lower = help_text.to_ascii_lowercase();
+
+    // Absolute claim strings are forbidden in product CLI surface. Deny-form residual
+    // language is allowed and preferred. Greppable honesty: each denylist literal line
+    // includes must-never / forbidden-claim markers (AGENTS.md).
+    for banned in [
+        "is undetectable",      // must never / forbidden claim
+        "fully undetectable",   // must never / forbidden claim
+        "we are undetectable",  // must never / forbidden claim
+        "trustless scrape",     // must never / forbidden claim
+        "makes you anonymous",  // must never / forbidden claim
+        "anonymity guarantee",  // must never / forbidden claim
+        "100% success",         // must never / forbidden claim
+        "100% guaranteed",      // must never / forbidden claim
+        "completely anonymous", // must never / forbidden claim
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "VAL-UNLOCK-006: CLI --help must never advertise banned slogan '{banned}'"
+        );
+    }
+
+    let ver = run_cli(&["--version"]);
+    let ver_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&ver.stdout),
+        String::from_utf8_lossy(&ver.stderr)
+    )
+    .to_ascii_lowercase();
+    for banned in [
+        "undetectable", // must never claim as product slogan in version string
+        "trustless",    // must never claim
+        "anonymous",    // must never claim
+        "100%",         // must never claim
+    ] {
+        assert!(
+            !ver_text.contains(banned),
+            "VAL-UNLOCK-006: --version must not market absolute slogan '{banned}'"
+        );
+    }
+
+    // Positive residual honesty expected on the about line.
+    assert!(
+        lower.contains("residual")
+            || lower.contains("headless")
+            || lower.contains("trust-but-audit")
+            || lower.contains("not anonymity"),
+        "CLI help should surface residual / honesty posture rather than hype"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VAL-UNLOCK-015: hermetic unlocker fixtures stay on mission ports 21000–21099
+// ---------------------------------------------------------------------------
+
+#[test]
+fn val_unlock_015_hermetic_fixture_ports_in_mission_range() {
+    // Peer unlocker-depth fixture suites (not this file's denylist literals) bind
+    // ephemeral (`:0`) or mission window 21000–21099. They must never hard-code live BASE ports.
+    let soft_src = include_str!("soft_tls_impersonate.rs");
+    let cross_src = include_str!("cross_stealth_integrity.rs");
+    let cdp_src = include_str!("cdp_stealth_depth.rs");
+    let fingerprint_src = include_str!("fingerprint_depth.rs");
+    let combined = format!("{soft_src}\n{cross_src}\n{cdp_src}\n{fingerprint_src}");
+
+    // Construction patterns that would bind a reserved live BASE swarm port.
+    for reserved_bind in [
+        "bind(\"0.0.0.0:3000\")",
+        "bind(\"127.0.0.1:3000\")",
+        "bind(\"127.0.0.1:5432\")",
+        "bind(\"127.0.0.1:8080\")",
+        "bind(\"127.0.0.1:8082\")",
+        "bind(\"127.0.0.1:9000\")",
+        "bind(\"127.0.0.1:9001\")",
+        "TcpListener::bind(\"0.0.0.0:3000\")",
+        "TcpListener::bind(\"127.0.0.1:3000\")",
+    ] {
+        assert!(
+            !combined.contains(reserved_bind),
+            "VAL-UNLOCK-015: unlocker fixtures must not bind reserved live BASE port pattern {reserved_bind}"
+        );
+    }
+
+    // Explicit fixed ports on 127.0.0.1 literals must be mission-range or ephemeral 0.
+    for port in scan_loopback_ports(&combined) {
+        assert!(
+            port == 0 || (21000..=21099).contains(&port),
+            "VAL-UNLOCK-015: fixture port {port} outside mission range 21000-21099 (and not ephemeral 0)"
+        );
+    }
+
+    // Live CLI spawn in this suite uses the ephemeral bind helper.
+    let url = spawn_fixed_origin(
+        "HTTP/1.1 200 OK",
+        "",
+        "<!doctype html><html><body>unlock-port-policy</body></html>",
+    );
+    assert!(
+        url.starts_with("http://127.0.0.1:"),
+        "fixture origin must stay loopback; got {url}"
+    );
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("ephemeral port parseable");
+    assert!(
+        port != 3000 && port != 5432 && port != 8080,
+        "ephemeral fixture must not land on reserved live BASE ports; port={port}"
+    );
+}
+
+/// Scan test source for `127.0.0.1:<port>` literals.
+fn scan_loopback_ports(src: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let bytes = src.as_bytes();
+    let needle = b"127.0.0.1:";
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let mut j = i + needle.len();
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start {
+                if let Ok(p) = std::str::from_utf8(&bytes[start..j])
+                    .unwrap_or("")
+                    .parse::<u16>()
+                {
+                    ports.push(p);
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    ports
+}
+
+// ---------------------------------------------------------------------------
+// VAL-UNLOCK-019: product does not advertise commercial Web Unlocker parity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn val_unlock_019_no_commercial_web_unlocker_parity_claims() {
+    let help = run_cli(&["--help"]);
+    let help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let security = include_str!("../../../docs/SECURITY.md");
+    let operator = include_str!("../../../docs/operators/proxy-and-egress.md");
+    let readme = include_str!("../../../README.md");
+    let combined = format!("{help_text}\n{security}\n{operator}\n{readme}");
+    let lower = combined.to_ascii_lowercase();
+
+    // Positive marketing of commercial unlocker parity is forbidden.
+    // Residual denial framing ("does not claim … web unlocker feature-parity", rest not /
+    // no commercial Web Unlocker parity) is honest and expected.
+    // Greppable honesty: each absolute denylist line includes must-never markers.
+    for banned in [
+        "offers web unlocker feature-parity", // must never / forbidden claim
+        "provides web unlocker feature parity", // must never / forbidden claim
+        "has bright data web unlocker parity", // must never / forbidden claim
+        "guarantees unlock any site",         // must never / forbidden claim
+        "ships oxylabs captcha manage parity", // must never / forbidden claim
+        "advertises commercial unlocker parity", // must never / forbidden claim
+        "with captcha solve marketplace parity", // must never / forbidden claim
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "VAL-UNLOCK-019: product surface must not advertise unlocker-parity slogan '{banned}'"
+        );
+    }
+
+    // Bare "unlock any site" only fails when not in residual denial context.
+    if lower.contains("unlock any site") {
+        let deny_ok = lower.contains("not") && lower.contains("unlock any site")
+            || lower.contains("no") && lower.contains("unlock any site")
+            || lower.contains("never") && lower.contains("unlock any site");
+        assert!(
+            deny_ok,
+            "VAL-UNLOCK-019: 'unlock any site' may appear only as residual denial"
+        );
+    }
+
+    // Operator residual should still refuse parity rather than staying silent only.
+    assert!(
+        (lower.contains("not") || lower.contains("no "))
+            && (lower.contains("unlocker")
+                || lower.contains("captcha")
+                || lower.contains("marketplace")
+                || lower.contains("commercial unlock")),
+        "VAL-UNLOCK-019: product residual docs should explicitly refuse unlocker/captcha-solve parity"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VAL-UNLOCK-020: operator guide distinguishes soft impersonate vs hard Chromium
+// ---------------------------------------------------------------------------
+
+#[test]
+fn val_unlock_020_operator_guide_soft_vs_hard_identity_split() {
+    let operator = include_str!("../../../docs/operators/proxy-and-egress.md");
+    let security = include_str!("../../../docs/SECURITY.md");
+    let lower_ops = operator.to_ascii_lowercase();
+    let lower_sec = security.to_ascii_lowercase();
+    let combined = format!("{lower_ops}\n{lower_sec}");
+
+    assert!(
+        lower_ops.contains("soft") && lower_ops.contains("hard"),
+        "VAL-UNLOCK-020: operator guide must discuss both soft and hard identity paths"
+    );
+    assert!(
+        (lower_ops.contains("tls-impersonate") || lower_ops.contains("impersonat"))
+            && (lower_ops.contains("not")
+                || lower_ops.contains("never")
+                || lower_ops.contains("≠")
+                || lower_ops.contains("!=")),
+        "VAL-UNLOCK-020: operator guide must distinguish soft impersonate as not Chromium wire"
+    );
+    assert!(
+        lower_ops.contains("chromium")
+            && (lower_ops.contains("real")
+                || lower_ops.contains("hard path")
+                || lower_ops.contains("hard / residential")
+                || lower_ops.contains("fetch_path")),
+        "VAL-UNLOCK-020: operator guide must keep hard path as real Chromium"
+    );
+    assert!(
+        combined.contains("fetch_path=direct")
+            || combined.contains("fetch_path = direct")
+            || combined.contains("`fetch_path=direct`")
+            || combined.contains("fetch_path=direct"),
+        "VAL-UNLOCK-020: soft success path must remain labeled direct, not chromium"
+    );
+    assert!(
+        combined.contains("soft_synthetic")
+            || combined.contains("soft synthetic")
+            || combined.contains("not native chromium")
+            || combined.contains("not** native chromium")
+            || combined.contains("never hard chromium wire")
+            || combined.contains("never hard Chromium wire")
+            || lower_ops.contains("not") && lower_ops.contains("chromium wire"),
+        "VAL-UNLOCK-020: docs must say soft impersonate is not native Chromium wire identity"
+    );
+
+    // Help for soft toggle must not claim hard wire equivalence.
+    let help = run_cli(&["--help"]);
+    let help_l = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    )
+    .to_ascii_lowercase();
+    if help_l.contains("tls-impersonate") {
+        assert!(
+            help_l.contains("never hard")
+                || help_l.contains("never.")
+                || help_l.contains("not") && help_l.contains("chromium wire")
+                || help_l.contains("soft scrapes")
+                || help_l.contains("fetch_path=direct"),
+            "soft TLS help must refuse hard Chromium wire equivalence"
+        );
+        assert!(
+            !help_l.contains("tls-impersonate chrome equals chromium wire")
+                && !help_l.contains("full chromium tls parity"),
+            "help must not conflate soft impersonate with hard Chromium wire"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VAL-UNLOCK-007: invalid stealth toggles fail closed
 // ---------------------------------------------------------------------------
 

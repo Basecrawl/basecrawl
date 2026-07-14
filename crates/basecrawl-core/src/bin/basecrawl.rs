@@ -29,7 +29,9 @@ use std::path::PathBuf;
     about = "Verifiable web crawler (single scrape, POST/body, crawl MVP, map-lite, batch). \
 Cryptographically-anchored trust-but-audit model (not anonymity). \
 Residual: headless (default --headless=new), CDP/Runtime.enable side-channel risk remains, \
-Chromium product pin major 145 (detectors can track pin lag). Overt bot sensors still apply.",
+Chromium product pin major 145 (detectors can track pin lag). \
+Challenge detect-not-solve (no captcha marketplace; not commercial Web Unlocker parity). \
+Soft --tls-impersonate is not native Chromium wire. Overt bot sensors still apply.",
     long_about = None
 )]
 struct Cli {

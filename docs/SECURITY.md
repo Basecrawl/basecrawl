@@ -32,7 +32,20 @@ On the sealed/TEE path, basecrawl aims for **content-confidentiality** (host doe
 
 ## Proxy, composer, and stealth residual
 
-Universal proxy support (HTTP CONNECT / SOCKS5, sticky/session and country username tokens) and the Chromium hard-path composer improve operational success. They do **not** make scrapes anonymous, and they do not defeat every commercial bot system.
+Universal proxy support (HTTP CONNECT / SOCKS5, sticky/session and country username tokens) and the Chromium hard-path composer improve operational success. They do **not** make scrapes anonymous, and they do not defeat every commercial bot system. Proxy is **not anonymity**: exit operators and networks still see destination and traffic shape.
+
+### Challenge detect, not captcha solve
+
+Unlocker-depth improves hard-path identity baseline (CDP injects, fingerprint depth, soft TLS vibe for soft targets only). It does **not** solve captchas and does **not** ship a captcha marketplace (no 2captcha / Anti-Captcha / CapSolver product surface). Challenge or captcha interstitials are **detect + fail-closed** (`challenge_blocked` class), never marketed as primary content success and never auto-solved by an external solver. This product does **not** claim commercial Web Unlocker feature-parity (Bright Data Web Unlocker / Oxylabs captcha-manage style "unlock any site" products). Success is scrape identity and egress honesty only.
+
+### Soft impersonate vs hard Chromium (identity split)
+
+| Path | What it is | What it is not |
+| --- | --- | --- |
+| Soft (`--no-js`, optional `--tls-impersonate chrome`) | In-process rustls fetch; optional Chrome-like ClientHello suite/group offer; complete cert + handshake transcript capture for ScrapeProof | **Not** native Chromium wire/packet identity; soft successes emit `fetch_path=direct` and soft digests label `soft_synthetic_impersonate` |
+| Hard (residential/mobile, `--difficulty hard`, `--force-browser`) | Real headless Chromium TLS/H2 + DOM + composer; required when residential/mobile is claimed | Soft preflight triage may still run first (dual-fetch timing residual); soft never satisfies residential seize |
+
+Never conflate soft JA3-family alignment with hard Chromium wire identity.
 
 | Residual | Notes |
 | --- | --- |
@@ -40,6 +53,7 @@ Universal proxy support (HTTP CONNECT / SOCKS5, sticky/session and country usern
 | Network metadata | Even with sealed DoH on the hard path, traffic shape and destination residual exist outside content confidentiality. |
 | Headless detection residual | Hard path launches Chromium with `--headless=new` (when the pin supports it) and baseline stealth (drop automation flags, early inject). Headless remains the default; residual headless heuristics, GPU-less surfaces, and automation detectors may still classify the client. Absolute cross-detector headless cloaking is out of scope. |
 | CDP / Runtime protocol residual | The Chrome DevTools Protocol path can still call into Runtime APIs for automation work. Even when classic automation flags and early-document injects are mitigated, a **Runtime.enable** (or equivalent CDP Runtime) side channel may remain observable to sophisticated detectors. This residual is documented rather than claimed eliminated. |
+| Challenge / captcha residual | Detect-not-solve only. Interstitials fail closed; no marketplace solve; no commercial unlocker parity claim. |
 | Chromium major pin residual | Measured image pins **Chromium major 145** (`CHROMIUM_VERSION=145.0.7632.46`). Detectors and vendor rules can track lag vs the current public Chrome major. Hard-path UA / Sec-CH-UA / CDP overrides stay major-coherent to this single pin (no 145-vs-148 product drift). A pin bump must update image pin + residual note together. |
 | Plugin / mimeTypes residual | Hard-path inject exposes a multipass Chromium-style PDF plugin inventory and matching `mimeTypes` (not a single-PDF-only stub). This is a **name surface** only; it does not emulate full NPAPI/PDF internals and detectors can still score plugin quirks. |
 | Canvas diversity residual | Seeded canvas pixel noise is **best-effort diversity**, not cryptographic anonymity and not un-fingerprintability. Same seed stays finite/non-crashing; different seeds may diverge. Do not market canvas spoof as anonymity. |

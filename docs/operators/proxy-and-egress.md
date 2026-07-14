@@ -100,15 +100,30 @@ Baseline launch hardening (not a universal cloak):
 - Sticky profile keyed by task/session; wipe across tasks by default
 - Challenge / block interstitials surface as structured `challenge_blocked` rather than silent success
 
-Do not market this as "undetectable" or "defeats all bot vendors." It is an identity baseline under TDX with residual headless, CDP/Runtime, and vendor-heuristic risk.
+Do not market this as "undetectable" or "defeats all bot vendors." It is an identity baseline under TDX with residual headless, CDP/Runtime, and vendor-heuristic risk. Soft rustls ClientHello chrome-impersonate (`--tls-impersonate chrome`) is **not** the hard Chromium wire; it never upgrades soft scrapes to `fetch_path=chromium` or residential without a real dial.
+
+## Soft impersonate vs hard Chromium (operator identity split)
+
+| Identity | Flags / trigger | Wire reality | ScrapeProof honesty |
+| --- | --- | --- | --- |
+| Soft path | Default soft targets, `--no-js`, optional `--tls-impersonate chrome` | In-process **rustls** only. Chrome-like ClientHello suite/group offer is **not** native Chromium wire/packet capture | Soft success keeps `fetch_path=direct`; digests labeled soft_synthetic_impersonate; never claims residential without dialed residential |
+| Hard path | `--proxy-class residential\|mobile`, `--difficulty hard`, `--force-browser` | **Real Chromium** TLS/H2 + DOM + loopback composer | `fetch_path=chromium` only when Chromium actually ran |
+
+Soft JA3-family alignment is for bootstrap/success-rate on soft targets. Residential seize and hard-site identity still require real Chromium. Soft race + hard bash never invent a hybrid residential soft prove.
+
+### Challenge stance (not commercial Web Unlocker)
+
+Challenges and captcha pages are **detect-not-solve** (`challenge_blocked`). There is **no captcha marketplace** integration and **no** commercial Web Unlocker feature-parity claim (not Bright Data Web Unlocker / Oxylabs captcha-manage style "unlock any site"). Treat residual blocks as operational signal, not a defect in silence.
 
 ## Residual risks (operator)
 
 | Residual | Operator stance |
 | --- | --- |
-| Proxy ≠ anonymity | Exit IP, SNI (without ECH), and traffic shape remain visible to the upstream proxy and networks. |
+| Proxy ≠ anonymity | Exit IP, SNI (without ECH), and traffic shape remain visible to the upstream proxy and networks. Proxy is not anonymity. |
 | Headless residual | Headless is default (`--headless=new`). Such traits remain detectable; sticky profiles and residential egress only raise the bar. Do not advertise perfect headless cloaking. |
 | CDP Runtime residual | CDP/Runtime protocol use (including possible Runtime.enable side effects) is a residual channel even when trivial automation flags are patched. Documented in [SECURITY.md](../SECURITY.md). |
+| Challenge detect residual | Detect + fail-closed. Not a captcha solve and not commercial unlocker parity. |
+| Soft TLS residual | Soft impersonate is not Chromium wire; residual GREASE/ALPS/H2 setting fingerprints remain. Hard path only for residential. |
 | Chromium major residual | Pin is major **145** (`145.0.7632.46`). Detectors can track lag vs newer public Chrome; keep hard-path majors coherent when the pin moves. |
 | Plugins / mimeTypes | Multipass PDF plugin names + non-empty `mimeTypes` improve trivial bot ranks only. Not full plugin/PDF API fidelity. |
 | Canvas | Canvas seed noise diversifies render digests; it is not anonymity and never claims un-fingerprintability. See [SECURITY.md](../SECURITY.md). |
