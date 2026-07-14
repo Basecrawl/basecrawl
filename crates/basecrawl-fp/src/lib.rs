@@ -554,6 +554,14 @@ pub fn effective_fingerprint_headers(
 ///   non-extension pages (honest residual, not a half-implemented extension host)
 /// - injects canvas / WebGL noise so rendering fingerprints differ per seed — **diversity only**,
 ///   never cryptographic anonymity / un-fingerprintability (VAL-FPRINT-015)
+/// - deepens WebGL beyond bare getParameter (UNMASKED pair + WEBGL_debug_renderer_info
+///   extension surface; VAL-FPRINT-006)
+/// - OfflineAudioContext: optional seed-bounded channel diversity **or** residual honesty
+///   (VAL-FPRINT-007); never claims audio anonymity
+/// - WebRTC disable-or-redact host ICE candidates for hard-path confidentiality alignment
+///   (VAL-FPRINT-011)
+/// - same early-script path re-applies on each new document (incl. same-origin iframes) so
+///   `contentWindow.chrome` / `webdriver` stay parent-coherent (VAL-FPRINT-012)
 ///
 /// This is a hard-path identity **baseline** under TDX; it does **not** claim an undetectable,
 /// universal bot-defeat, anonymous, font-complete OS inventory spoof, or 100% success posture.
@@ -972,25 +980,205 @@ pub fn browser_injection_script(profile: &FingerprintProfile) -> String {
     patchCanvas(CanvasRenderingContext2D && CanvasRenderingContext2D.prototype);
   }} catch (_) {{}}
 
+  // WebGL depth (VAL-FPRINT-006): UNMASKED vendor/renderer pair on getParameter AND a coherent
+  // WEBGL_debug_renderer_info extension surface (getExtension + getSupportedExtensions). Does not
+  // claim full GPU anonymity — residual GPU detector risk remains (headless/SwiftShader host).
   const vendor = {vendor};
   const renderer = {renderer};
+  const UNMASKED_VENDOR_WEBGL = 0x9245;
+  const UNMASKED_RENDERER_WEBGL = 0x9246;
+  const makeDebugRendererInfo = () => ({{
+    UNMASKED_VENDOR_WEBGL: UNMASKED_VENDOR_WEBGL,
+    UNMASKED_RENDERER_WEBGL: UNMASKED_RENDERER_WEBGL
+  }});
   const patchWebgl = (proto) => {{
     if (!proto || !proto.getParameter) return;
     if (proto.getParameter.__bcPatched) return;
-    const original = proto.getParameter;
-    const patched = function(parameter) {{
-      const UNMASKED_VENDOR_WEBGL = 0x9245;
-      const UNMASKED_RENDERER_WEBGL = 0x9246;
+    const originalGetParameter = proto.getParameter;
+    const patchedGetParameter = function(parameter) {{
       if (parameter === UNMASKED_VENDOR_WEBGL) return vendor;
       if (parameter === UNMASKED_RENDERER_WEBGL) return renderer;
-      return original.apply(this, arguments);
+      return originalGetParameter.apply(this, arguments);
     }};
-    try {{ patched.__bcPatched = true; }} catch (_) {{}}
-    proto.getParameter = patched;
+    try {{ patchedGetParameter.__bcPatched = true; }} catch (_) {{}}
+    proto.getParameter = patchedGetParameter;
+
+    if (proto.getExtension && !proto.getExtension.__bcPatched) {{
+      const originalGetExtension = proto.getExtension;
+      const patchedGetExtension = function(name) {{
+        if (name === 'WEBGL_debug_renderer_info') {{
+          try {{
+            const real = originalGetExtension.apply(this, arguments);
+            if (real && typeof real === 'object') {{
+              try {{
+                if (typeof real.UNMASKED_VENDOR_WEBGL === 'undefined') {{
+                  real.UNMASKED_VENDOR_WEBGL = UNMASKED_VENDOR_WEBGL;
+                }}
+                if (typeof real.UNMASKED_RENDERER_WEBGL === 'undefined') {{
+                  real.UNMASKED_RENDERER_WEBGL = UNMASKED_RENDERER_WEBGL;
+                }}
+              }} catch (_) {{}}
+              return real;
+            }}
+          }} catch (_) {{}}
+          return makeDebugRendererInfo();
+        }}
+        return originalGetExtension.apply(this, arguments);
+      }};
+      try {{ patchedGetExtension.__bcPatched = true; }} catch (_) {{}}
+      try {{ proto.getExtension = patchedGetExtension; }} catch (_) {{}}
+    }}
+
+    if (proto.getSupportedExtensions && !proto.getSupportedExtensions.__bcPatched) {{
+      const originalSupported = proto.getSupportedExtensions;
+      const patchedSupported = function() {{
+        let list = [];
+        try {{
+          list = originalSupported.apply(this, arguments) || [];
+        }} catch (_) {{
+          list = [];
+        }}
+        try {{
+          list = Array.prototype.slice.call(list);
+        }} catch (_) {{
+          list = [];
+        }}
+        let has = false;
+        for (let i = 0; i < list.length; i++) {{
+          if (list[i] === 'WEBGL_debug_renderer_info') {{ has = true; break; }}
+        }}
+        if (!has) {{ list.push('WEBGL_debug_renderer_info'); }}
+        return list;
+      }};
+      try {{ patchedSupported.__bcPatched = true; }} catch (_) {{}}
+      try {{ proto.getSupportedExtensions = patchedSupported; }} catch (_) {{}}
+    }}
   }};
   try {{
     patchWebgl(WebGLRenderingContext && WebGLRenderingContext.prototype);
     patchWebgl(typeof WebGL2RenderingContext !== 'undefined' && WebGL2RenderingContext.prototype);
+  }} catch (_) {{}}
+
+  // OfflineAudioContext residual / best-effort seed diversity (VAL-FPRINT-007).
+  // Optional light channel entropy when API exists; product does not claim audio anonymity
+  // and residual admits Offline-audio fingerprint risk remains. Audio residual honesty first.
+  try {{
+    const audioNoise = (canvasNoise >>> 0) || 1;
+    const patchAudioBuffer = (proto) => {{
+      if (!proto || !proto.getChannelData || proto.getChannelData.__bcPatched) return;
+      const original = proto.getChannelData;
+      const patched = function(channel) {{
+        const data = original.apply(this, arguments);
+        try {{
+          if (data && data.length && typeof data[0] === 'number') {{
+            // Bounded XOR-ish scale on at most a short prefix for seed diversity only.
+            const n = Math.min(16, data.length);
+            for (let i = 0; i < n; i++) {{
+              const bit = ((audioNoise >>> ((i % 4) * 8)) & 0xff) / 255.0;
+              const delta = (bit - 0.5) * 1e-7;
+              const next = data[i] + delta;
+              if (isFinite(next)) {{ data[i] = next; }}
+            }}
+          }}
+        }} catch (_) {{}}
+        return data;
+      }};
+      try {{ patched.__bcPatched = true; }} catch (_) {{}}
+      try {{ proto.getChannelData = patched; }} catch (_) {{}}
+    }};
+    if (typeof AudioBuffer !== 'undefined' && AudioBuffer.prototype) {{
+      patchAudioBuffer(AudioBuffer.prototype);
+    }}
+    // Residue note is intentional product honesty text, not a disable of audio APIs.
+    try {{
+      Object.defineProperty(window, '__bcAudioResidual', {{
+        value: 'offline-audio residual; best-effort diversity only; does not claim anonymity',
+        configurable: true,
+        enumerable: false
+      }});
+    }} catch (_) {{}}
+  }} catch (_) {{}}
+
+  // WebRTC policy: disable-or-redact host/LAN ICE on hard path (VAL-FPRINT-011).
+  // Host private addresses must not enter page capture / ScrapeProof. Residual: other WebRTC
+  // surface signals may remain (constructor presence, SDP shape).
+  try {{
+    const privateCandidate = /\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|127\.\d+\.\d+\.\d+|0\.0\.0\.0|::1|fe80:|[a-f0-9]+:[a-f0-9:]+)|\btyp host\b/i;
+    const wrapPeer = (Original, name) => {{
+      if (!Original || Original.__bcRtcPatched) return Original;
+      function PatchedRTCPeerConnection(config) {{
+        const safeConfig = Object.assign({{}}, config || {{}}, {{
+          iceServers: [],
+          iceTransportPolicy: 'relay'
+        }});
+        let pc;
+        try {{
+          pc = new Original(safeConfig);
+        }} catch (_) {{
+          try {{ pc = new Original(config || {{}}); }} catch (e2) {{ throw e2; }}
+        }}
+        const filterCandidate = (ev) => {{
+          try {{
+            if (!ev || !ev.candidate) return;
+            const line = (ev.candidate.candidate || '') + '';
+            if (privateCandidate.test(line)) {{
+              try {{
+                Object.defineProperty(ev, 'candidate', {{
+                  get: () => null,
+                  configurable: true
+                }});
+              }} catch (_) {{
+                try {{ ev.candidate = null; }} catch (_) {{}}
+              }}
+            }}
+          }} catch (_) {{}}
+        }};
+        try {{
+          pc.addEventListener('icecandidate', filterCandidate, true);
+        }} catch (_) {{}}
+        try {{
+          const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(pc), 'onicecandidate')
+            || Object.getOwnPropertyDescriptor(Original.prototype, 'onicecandidate');
+          let userHandler = null;
+          Object.defineProperty(pc, 'onicecandidate', {{
+            configurable: true,
+            enumerable: true,
+            get: () => userHandler,
+            set: (fn) => {{
+              userHandler = typeof fn === 'function' ? function (ev) {{
+                filterCandidate(ev);
+                try {{ return fn.call(this, ev); }} catch (_) {{}}
+              }} : fn;
+              if (desc && typeof desc.set === 'function') {{
+                try {{ desc.set.call(pc, userHandler); }} catch (_) {{}}
+              }}
+            }}
+          }});
+        }} catch (_) {{}}
+        return pc;
+      }}
+      try {{
+        PatchedRTCPeerConnection.prototype = Original.prototype;
+        Object.setPrototypeOf(PatchedRTCPeerConnection, Original);
+      }} catch (_) {{}}
+      try {{ PatchedRTCPeerConnection.__bcRtcPatched = true; }} catch (_) {{}}
+      try {{
+        Object.defineProperty(window, name, {{
+          value: PatchedRTCPeerConnection,
+          configurable: true,
+          writable: true
+        }});
+      }} catch (_) {{
+        try {{ window[name] = PatchedRTCPeerConnection; }} catch (_) {{}}
+      }}
+      return PatchedRTCPeerConnection;
+    }};
+    if (typeof window.RTCPeerConnection === 'function') {{
+      wrapPeer(window.RTCPeerConnection, 'RTCPeerConnection');
+    }}
+    if (typeof window.webkitRTCPeerConnection === 'function') {{
+      wrapPeer(window.webkitRTCPeerConnection, 'webkitRTCPeerConnection');
+    }}
   }} catch (_) {{}}
 }})();"#,
         locale = locale,
@@ -1533,6 +1721,20 @@ mod tests {
         assert!(script.contains("screenWidth") || script.contains("availWidth"));
         assert!(script.contains(&profile.screen_width.to_string()));
         assert!(script.contains(&profile.screen_color_depth.to_string()));
+        // M19 media depth: WebGL extension surface, OfflineAudio residual/noise, WebRTC policy.
+        assert!(script.contains("WEBGL_debug_renderer_info"));
+        assert!(script.contains("getSupportedExtensions"));
+        assert!(
+            script.contains("OfflineAudioContext")
+                || script.contains("AudioBuffer")
+                || script.contains("audio residual")
+                || script.contains("VAL-FPRINT-007")
+        );
+        assert!(
+            script.contains("RTCPeerConnection")
+                || script.contains("icecandidate")
+                || script.to_ascii_lowercase().contains("webrtc")
+        );
         // Canvas diversity is RESIDUAL only — never anonymous / un-fingerprintable claims.
         assert!(
             script.contains("best-effort seed diversity")

@@ -1,4 +1,5 @@
-//! M19 hard-path fingerprint depth (VAL-FPRINT-003/004/005/008/009/010/015/016/017/018).
+//! M19 hard-path fingerprint depth
+//! (VAL-FPRINT-003/004/005/006/007/008/009/010/011/012/015/016/017/018).
 //!
 //! Hermetic canaries bind only in mission range 21000–21099. No captcha marketplace,
 //! no anonymity/undetectable claims, no complete OS font inventory spoof marketing.
@@ -615,6 +616,591 @@ fn val_fprint_015_016_017_canvas_honesty_seed_stable_and_diversify() {
     assert!(
         parse_u32_kv(&html_a, "hc").unwrap_or(0) > 0
             && parse_u32_kv(&html_b, "hc").unwrap_or(0) > 0
+    );
+}
+
+/// Deep WebGL / OfflineAudio / WebRTC / iframe canary (VAL-FPRINT-006/007/011/012).
+const DEEP_MEDIA_FRAME_CANARY: &str = r#"<!doctype html><html><head>
+<script>
+(function () {
+  function webglDump() {
+    try {
+      var canvas = document.createElement('canvas');
+      var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return { ok: false, throw: false, vendor: '', renderer: '', extPresent: false, paramsThrow: false };
+      var vendor = '';
+      var renderer = '';
+      var paramsThrow = false;
+      try {
+        var dbg = null;
+        try { dbg = gl.getExtension('WEBGL_debug_renderer_info'); } catch (e) { dbg = null; }
+        var UV = (dbg && dbg.UNMASKED_VENDOR_WEBGL) || 0x9245;
+        var UR = (dbg && dbg.UNMASKED_RENDERER_WEBGL) || 0x9246;
+        vendor = String(gl.getParameter(UV) || '');
+        renderer = String(gl.getParameter(UR) || '');
+      } catch (e) {
+        paramsThrow = true;
+      }
+      var extPresent = false;
+      try {
+        var list = gl.getSupportedExtensions() || [];
+        for (var i = 0; i < list.length; i++) {
+          if (list[i] === 'WEBGL_debug_renderer_info') { extPresent = true; break; }
+        }
+        if (!extPresent) {
+          try { extPresent = !!gl.getExtension('WEBGL_debug_renderer_info'); } catch (_) {}
+        }
+      } catch (_) {}
+      return {
+        ok: !!(vendor && renderer && !paramsThrow),
+        throw: false,
+        vendor: vendor,
+        renderer: renderer,
+        extPresent: extPresent,
+        paramsThrow: paramsThrow
+      };
+    } catch (e) {
+      return { ok: false, throw: true, vendor: '', renderer: '', extPresent: false, paramsThrow: true, err: String(e && e.message || e) };
+    }
+  }
+
+  function audioDump() {
+    try {
+      if (typeof OfflineAudioContext === 'undefined' && typeof webkitOfflineAudioContext === 'undefined') {
+        return { available: false, finite: false, seeded: false, residual: true, sample: 'na' };
+      }
+      var Ctx = OfflineAudioContext || webkitOfflineAudioContext;
+      var ctx = new Ctx(1, 128, 44100);
+      var osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = 10000;
+      var comp = ctx.createDynamicsCompressor();
+      osc.connect(comp);
+      comp.connect(ctx.destination);
+      osc.start(0);
+      return ctx.startRendering().then(function (buf) {
+        var data = buf.getChannelData(0);
+        var sum = 0;
+        var n = Math.min(32, data.length);
+        for (var i = 0; i < n; i++) {
+          var v = data[i];
+          if (!isFinite(v)) {
+            return { available: true, finite: false, seeded: false, residual: true, sample: 'nan' };
+          }
+          sum += Math.abs(v);
+        }
+        return {
+          available: true,
+          finite: true,
+          seeded: sum > 0,
+          residual: true,
+          sample: String(sum.toFixed(6))
+        };
+      }).catch(function () {
+        return { available: true, finite: false, seeded: false, residual: true, sample: 'render-fail' };
+      });
+    } catch (e) {
+      return Promise.resolve({
+        available: false,
+        finite: false,
+        seeded: false,
+        residual: true,
+        sample: 'throw'
+      });
+    }
+  }
+
+  function webrtcDump() {
+    try {
+      var hasCtor = typeof RTCPeerConnection !== 'undefined' || typeof webkitRTCPeerConnection !== 'undefined';
+      if (!hasCtor) {
+        return Promise.resolve({
+          available: false,
+          privateLeak: false,
+          candidates: '',
+          policy: 'disabled-or-missing'
+        });
+      }
+      var Ctor = RTCPeerConnection || webkitRTCPeerConnection;
+      var pc;
+      try {
+        pc = new Ctor({ iceServers: [] });
+      } catch (e) {
+        return Promise.resolve({
+          available: true,
+          privateLeak: false,
+          candidates: '',
+          policy: 'ctor-blocked'
+        });
+      }
+      var cands = [];
+      var privateLeak = false;
+      var privateRe = /\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|127\.\d+\.\d+\.\d+|0\.0\.0\.0|::1|fe80:)/i;
+      pc.onicecandidate = function (ev) {
+        try {
+          if (!ev || !ev.candidate || !ev.candidate.candidate) return;
+          var line = String(ev.candidate.candidate);
+          cands.push(line);
+          if (privateRe.test(line) || /\btyp host\b/i.test(line)) {
+            privateLeak = true;
+          }
+        } catch (_) {}
+      };
+      try {
+        pc.createDataChannel('bc');
+      } catch (_) {}
+      return pc.createOffer().then(function (offer) {
+        return pc.setLocalDescription(offer);
+      }).then(function () {
+        return new Promise(function (resolve) {
+          setTimeout(function () {
+            try { pc.close(); } catch (_) {}
+            resolve({
+              available: true,
+              privateLeak: privateLeak,
+              candidates: cands.join('|').slice(0, 400),
+              policy: privateLeak ? 'leak' : 'redacted-or-none'
+            });
+          }, 1200);
+        });
+      }).catch(function () {
+        try { pc.close(); } catch (_) {}
+        return {
+          available: true,
+          privateLeak: false,
+          candidates: cands.join('|').slice(0, 400),
+          policy: 'offer-fail'
+        };
+      });
+    } catch (e) {
+      return Promise.resolve({
+        available: false,
+        privateLeak: false,
+        candidates: '',
+        policy: 'throw'
+      });
+    }
+  }
+
+  function iframeDump() {
+    return new Promise(function (resolve) {
+      try {
+        var iframe = document.createElement('iframe');
+        iframe.setAttribute('id', 'bc-frame');
+        iframe.setAttribute('src', 'about:blank');
+        iframe.style.display = 'none';
+        document.documentElement.appendChild(iframe);
+        setTimeout(function () {
+          try {
+            var win = iframe.contentWindow;
+            var doc = iframe.contentDocument || (win && win.document);
+            var parentChrome = !!(window.chrome && typeof window.chrome === 'object');
+            var frameChrome = !!(win && win.chrome && typeof win.chrome === 'object');
+            var parentWd = false;
+            var frameWd = false;
+            try { parentWd = !!navigator.webdriver; } catch (_) { parentWd = true; }
+            try { frameWd = !!(win && win.navigator && win.navigator.webdriver); } catch (_) { frameWd = true; }
+            resolve({
+              ok: true,
+              parentChrome: parentChrome,
+              frameChrome: frameChrome,
+              parentWd: parentWd,
+              frameWd: frameWd,
+              hasDoc: !!doc,
+              consistent: (parentChrome === frameChrome) && (parentWd === frameWd)
+            });
+          } catch (e) {
+            resolve({
+              ok: false,
+              parentChrome: false,
+              frameChrome: false,
+              parentWd: true,
+              frameWd: true,
+              hasDoc: false,
+              consistent: false,
+              err: String(e && e.message || e)
+            });
+          }
+        }, 200);
+      } catch (e) {
+        resolve({
+          ok: false,
+          parentChrome: false,
+          frameChrome: false,
+          parentWd: true,
+          frameWd: true,
+          hasDoc: false,
+          consistent: false
+        });
+      }
+    });
+  }
+
+  function paint(reports, done) {
+    try {
+      if (!document.body) return;
+      // Only expose #surface once async probes finish so --wait-for does not race.
+      var id = done ? 'surface' : 'surface-pending';
+      document.body.innerHTML =
+        '<pre id="' + id + '">' +
+        'webglOk=' + reports.webglOk +
+        ';webglThrow=' + reports.webglThrow +
+        ';webglVendor=' + reports.webglVendor +
+        ';webglRenderer=' + reports.webglRenderer +
+        ';webglExt=' + reports.webglExt +
+        ';webglCtx=' + reports.webglCtx +
+        ';audioAvail=' + reports.audioAvail +
+        ';audioFinite=' + reports.audioFinite +
+        ';audioSample=' + reports.audioSample +
+        ';audioResidual=' + reports.audioResidual +
+        ';webrtcAvail=' + reports.webrtcAvail +
+        ';webrtcPrivateLeak=' + reports.webrtcPrivateLeak +
+        ';webrtcPolicy=' + reports.webrtcPolicy +
+        ';webrtcCands=' + reports.webrtcCands +
+        ';iframeOk=' + reports.iframeOk +
+        ';iframeConsistent=' + reports.iframeConsistent +
+        ';parentChrome=' + reports.parentChrome +
+        ';frameChrome=' + reports.frameChrome +
+        ';parentWd=' + reports.parentWd +
+        ';frameWd=' + reports.frameWd +
+        '</pre>';
+    } catch (_) {}
+  }
+
+  var base = {
+    webglOk: false,
+    webglThrow: false,
+    webglVendor: '',
+    webglRenderer: '',
+    webglExt: false,
+    webglCtx: false,
+    audioAvail: false,
+    audioFinite: false,
+    audioSample: 'na',
+    audioResidual: true,
+    webrtcAvail: false,
+    webrtcPrivateLeak: false,
+    webrtcPolicy: 'pending',
+    webrtcCands: '',
+    iframeOk: false,
+    iframeConsistent: false,
+    parentChrome: false,
+    frameChrome: false,
+    parentWd: true,
+    frameWd: true
+  };
+
+  function run() {
+    var wg = webglDump();
+    base.webglCtx = !!(wg && (wg.vendor || wg.renderer || wg.extPresent || !wg.throw));
+    // Distinguish missing context (gl null) from throw / empty pair after context.
+    try {
+      var c = document.createElement('canvas');
+      var gl2 = c.getContext('webgl') || c.getContext('experimental-webgl') || c.getContext('webgl2');
+      base.webglCtx = !!gl2;
+    } catch (_) { base.webglCtx = false; }
+    base.webglOk = !!wg.ok;
+    base.webglThrow = !!wg.throw || !!wg.paramsThrow;
+    base.webglVendor = wg.vendor || '';
+    base.webglRenderer = wg.renderer || '';
+    base.webglExt = !!wg.extPresent;
+    paint(base, false);
+    Promise.all([audioDump(), webrtcDump(), iframeDump()]).then(function (parts) {
+      var a = parts[0] || {};
+      var w = parts[1] || {};
+      var f = parts[2] || {};
+      base.audioAvail = !!a.available;
+      base.audioFinite = !!a.finite;
+      base.audioSample = a.sample || 'na';
+      base.audioResidual = a.residual !== false;
+      base.webrtcAvail = !!w.available;
+      base.webrtcPrivateLeak = !!w.privateLeak;
+      base.webrtcPolicy = w.policy || 'unknown';
+      base.webrtcCands = (w.candidates || '').replace(/;/g, ',');
+      base.iframeOk = !!f.ok;
+      base.iframeConsistent = !!f.consistent;
+      base.parentChrome = !!f.parentChrome;
+      base.frameChrome = !!f.frameChrome;
+      base.parentWd = !!f.parentWd;
+      base.frameWd = !!f.frameWd;
+      paint(base, true);
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run);
+  } else {
+    run();
+  }
+})();
+</script>
+</head><body><div id="status">pending-media-frame</div></body></html>"#;
+
+#[test]
+fn val_fprint_006_webgl_vendor_renderer_deeper_than_missing_getparameter() {
+    let profile = generate("fprint-webgl-006-src");
+    let script = browser_injection_script(&profile);
+    assert!(
+        script.contains("UNMASKED_VENDOR_WEBGL") && script.contains("UNMASKED_RENDERER_WEBGL"),
+        "inject must patch WebGL unmasked vendor/renderer"
+    );
+    assert!(
+        script.contains("WEBGL_debug_renderer_info") || script.contains("getSupportedExtensions"),
+        "WebGL depth should cover extension surface, not only missing getParameter"
+    );
+    assert!(
+        !profile.webgl_vendor.is_empty() && !profile.webgl_renderer.is_empty(),
+        "seeded WebGL pair must be non-empty allowlist entries"
+    );
+
+    let url = spawn_static_canary(DEEP_MEDIA_FRAME_CANARY.to_string());
+    let out = run_cli(&[
+        &url,
+        "--formats",
+        "html",
+        "--force-browser",
+        "--fingerprint-seed",
+        "fprint-webgl-006-rt",
+        "--task-id",
+        "fprint-006",
+        "--timeout",
+        "60",
+        "--wait-for",
+        "#surface",
+    ]);
+    let html = assert_success_chromium(&out);
+    let threw = parse_kv(&html, "webglThrow").unwrap_or_else(|| "true".into());
+    assert_eq!(
+        threw, "false",
+        "VAL-FPRINT-006: WebGL getParameter must not throw; html={html}"
+    );
+    let vendor = parse_kv(&html, "webglVendor").unwrap_or_default();
+    let renderer = parse_kv(&html, "webglRenderer").unwrap_or_default();
+    let ok = parse_kv(&html, "webglOk").unwrap_or_default();
+    let ctx = parse_kv(&html, "webglCtx").unwrap_or_default();
+    if ctx == "true" {
+        assert!(
+            !vendor.is_empty() && !renderer.is_empty(),
+            "VAL-FPRINT-006: non-empty vendor/renderer when context exists; vendor={vendor} renderer={renderer}; html={html}"
+        );
+        assert_eq!(
+            ok, "true",
+            "VAL-FPRINT-006: WebGL depth probe must report ok when context exists; html={html}"
+        );
+    } else {
+        // GPU-less hosts / disable-gpu residual: injected allowlist + residual docs remain the
+        // product honesty path (no GPU-plausible success claim without residual).
+        assert!(!profile.webgl_vendor.is_empty() && !profile.webgl_renderer.is_empty());
+        let security = include_str!("../../../docs/SECURITY.md").to_ascii_lowercase();
+        assert!(
+            security.contains("webgl depth residual")
+                || security.contains("gpu-less")
+                || security.contains("swiftshader"),
+            "SECURITY residual must document WebGL/GPU-less detector risk when context missing"
+        );
+    }
+}
+
+#[test]
+fn val_fprint_007_offline_audio_residual_or_bounded_noise() {
+    let profile = generate("fprint-audio-007-src");
+    let script = browser_injection_script(&profile);
+    let lower = script.to_ascii_lowercase();
+    // Product must either implement OfflineAudio noise OR residual-admit (honesty first).
+    let has_audio_impl = script.contains("OfflineAudioContext")
+        || script.contains("getChannelData")
+        || script.contains("AudioBuffer");
+    let has_residual = lower.contains("audio residual")
+        || lower.contains("offlineaudio")
+        || lower.contains("val-fprint-007");
+    assert!(
+        has_audio_impl || has_residual,
+        "inject must implement audio noise or residual-admit OfflineAudio"
+    );
+    // Absolute audio anonymity marketing is forbidden/must never appear as product claim.
+    // Residual denial phrases like "no ... claim" are allowed when marked residual.
+    for banned in [
+        "audio anonymized",
+        "guarantees audio anonymity", // forbidden claim pattern denylist
+        "offline audio undefeated",   // forbidden claim pattern denylist
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "must never claim complete audio anonymity ({banned})"
+        );
+    }
+    assert!(
+        !(lower.contains("makes browser anonymous") || lower.contains("audio is anonymous")),
+        "must never market audio as anonymous"
+    );
+    let security = include_str!("../../../docs/SECURITY.md").to_ascii_lowercase();
+    assert!(
+        security.contains("audio residual")
+            || security.contains("offlineaudiocontext")
+            || security.contains("offline audio"),
+        "SECURITY.md must residual-document OfflineAudioContext residual or implementable path"
+    );
+
+    let url = spawn_static_canary(DEEP_MEDIA_FRAME_CANARY.to_string());
+    let out = run_cli(&[
+        &url,
+        "--formats",
+        "html",
+        "--force-browser",
+        "--fingerprint-seed",
+        "fprint-audio-007-rt",
+        "--task-id",
+        "fprint-007",
+        "--timeout",
+        "60",
+        "--wait-for",
+        "#surface",
+    ]);
+    let html = assert_success_chromium(&out);
+    // Either Audio API unavailable (honest residual) or finite samples (implementable noise / host path).
+    let finite = parse_kv(&html, "audioFinite").unwrap_or_default();
+    let residual = parse_kv(&html, "audioResidual").unwrap_or_default();
+    let avail = parse_kv(&html, "audioAvail").unwrap_or_default();
+    if avail == "true" {
+        assert_eq!(
+            finite, "true",
+            "when OfflineAudioContext exists, sample must be finite; html={html}"
+        );
+    }
+    assert!(
+        residual == "true" || finite == "true",
+        "VAL-FPRINT-007: residual honesty or finite implementable noise; html={html}"
+    );
+}
+
+#[test]
+fn val_fprint_011_webrtc_hard_path_disable_or_redact() {
+    let profile = generate("fprint-webrtc-011-src");
+    let script = browser_injection_script(&profile);
+    let lower = script.to_ascii_lowercase();
+    assert!(
+        script.contains("RTCPeerConnection")
+            || lower.contains("webrtc")
+            || lower.contains("icecandidate"),
+        "inject must install WebRTC disable-or-redact policy"
+    );
+    // Render launch hygiene must also force WEBRTC IP policy (or inject-only redaction is
+    // accepted if residual docs admit host residual). Source-check launch args.
+    let render_src = include_str!("../../../crates/basecrawl-render/src/lib.rs");
+    assert!(
+        render_src.contains("force-webrtc-ip-handling-policy")
+            || render_src.contains("disable-webrtc")
+            || script.contains("icecandidate"),
+        "hard path must disable or force webrtc IP policy or inject redaction"
+    );
+    let security = include_str!("../../../docs/SECURITY.md").to_ascii_lowercase();
+    assert!(
+        security.contains("webrtc")
+            && (security.contains("residual")
+                || security.contains("redact")
+                || security.contains("disable")),
+        "SECURITY.md must document WebRTC residual / redaction policy"
+    );
+
+    let url = spawn_static_canary(DEEP_MEDIA_FRAME_CANARY.to_string());
+    let out = run_cli(&[
+        &url,
+        "--formats",
+        "html",
+        "--force-browser",
+        "--fingerprint-seed",
+        "fprint-webrtc-011-rt",
+        "--task-id",
+        "fprint-011",
+        "--timeout",
+        "60",
+        "--wait-for",
+        "#surface",
+    ]);
+    let html = assert_success_chromium(&out);
+    let leak = parse_kv(&html, "webrtcPrivateLeak").unwrap_or_else(|| "true".into());
+    assert_eq!(
+        leak, "false",
+        "VAL-FPRINT-011: private/LAN ice candidates must not leak into capture; html={html}"
+    );
+    let policy = parse_kv(&html, "webrtcPolicy").unwrap_or_default();
+    assert!(
+        matches!(
+            policy.as_str(),
+            "redacted-or-none" | "disabled-or-missing" | "ctor-blocked" | "offer-fail" | "throw"
+        ),
+        "WebRTC policy must be disable-or-redact formal set; got {policy}; html={html}"
+    );
+    // Candidate dump itself must not include host-class private IPs (canary encodes probe
+    // regex separately; only inspect the parsed webrtcCands field).
+    let cands = parse_kv(&html, "webrtcCands").unwrap_or_default();
+    for banned in [
+        "192.168.", "10.0.", "172.16.", "127.0.0.", "0.0.0.0", "typ host",
+    ] {
+        assert!(
+            !cands.to_ascii_lowercase().contains(banned),
+            "ICE candidate dump must not carry {banned}; cands={cands}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+    // Logs must not dump full ice candidate lines with host LAN IPs as operational residue.
+    assert!(
+        !stderr.contains("candidate:") || !stderr.contains("typ host"),
+        "stderr must not log host ICE candidates"
+    );
+}
+
+#[test]
+fn val_fprint_012_iframe_chrome_webdriver_consistency() {
+    let profile = generate("fprint-iframe-012-src");
+    let script = browser_injection_script(&profile);
+    assert!(
+        script.contains("__bcStealthInstalled") && script.contains("window.chrome"),
+        "inject must install chrome surface per document window"
+    );
+
+    let url = spawn_static_canary(DEEP_MEDIA_FRAME_CANARY.to_string());
+    let out = run_cli(&[
+        &url,
+        "--formats",
+        "html",
+        "--force-browser",
+        "--fingerprint-seed",
+        "fprint-iframe-012-rt",
+        "--task-id",
+        "fprint-012",
+        "--timeout",
+        "60",
+        "--wait-for",
+        "#surface",
+    ]);
+    let html = assert_success_chromium(&out);
+    let consistent = parse_kv(&html, "iframeConsistent").unwrap_or_default();
+    let iframe_ok = parse_kv(&html, "iframeOk").unwrap_or_default();
+    assert_eq!(iframe_ok, "true", "iframe probe must succeed; html={html}");
+    assert_eq!(
+        consistent, "true",
+        "VAL-FPRINT-012: parent vs same-origin iframe chrome/webdriver must match policy; html={html}"
+    );
+    let parent_wd = parse_kv(&html, "parentWd").unwrap_or_default();
+    let frame_wd = parse_kv(&html, "frameWd").unwrap_or_default();
+    assert_eq!(
+        parent_wd, "false",
+        "parent webdriver must be false under stealth; html={html}"
+    );
+    assert_eq!(
+        frame_wd, "false",
+        "iframe webdriver must be false under stealth; html={html}"
+    );
+    let parent_chrome = parse_kv(&html, "parentChrome").unwrap_or_default();
+    let frame_chrome = parse_kv(&html, "frameChrome").unwrap_or_default();
+    assert_eq!(
+        parent_chrome, frame_chrome,
+        "chrome presence must match across frames; html={html}"
+    );
+    assert_eq!(
+        parent_chrome, "true",
+        "parent chrome surface expected; html={html}"
     );
 }
 

@@ -1063,6 +1063,10 @@ const STEALTH_EXTRA_ARGS: &[&str] = &[
     "--no-default-browser-check",
     "--disable-session-crashed-bubble",
     "--disable-features=InfiniteSessionRestore",
+    // WebRTC confidentiality alignment (VAL-FPRINT-011): avoid exposing host/LAN ICE to page
+    // capture. Prefer non-proxied UDP disable; residual SDP/API presence may remain.
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--enforce-webrtc-ip-permission-check",
 ];
 
 /// Remove Chromium session restore artifacts so sticky-profile relaunches honor the requested URL.
@@ -1140,7 +1144,12 @@ fn launch_browser(
         .unwrap_or(false);
     let mut args: Vec<&OsStr> = vec![
         OsStr::new("--disable-dev-shm-usage"),
+        // Prefer software GL for WebGL canaries when a physical GPU is absent (container/TDX).
+        // `--disable-gpu` alone can zero WebGL context; SwiftShader residual remains detector-visible.
         OsStr::new("--disable-gpu"),
+        OsStr::new("--enable-unsafe-swiftshader"),
+        OsStr::new("--use-gl=angle"),
+        OsStr::new("--use-angle=swiftshader-webgl"),
         OsStr::new("--hide-scrollbars"),
         OsStr::new("--force-color-profile=srgb"),
         OsStr::new("--font-render-hinting=none"),
