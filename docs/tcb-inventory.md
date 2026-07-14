@@ -15,7 +15,7 @@ does not by itself prove that Chromium/OS code is free of unpatched 0-days.
 | --- | --- | --- |
 | Application binary (`basecrawl`) | Built from this repository with `Cargo.lock` and `cargo build --release --locked` | Source + lockfile are part of the image build context |
 | Rust build toolchain | `rust:1.96.0-bookworm@sha256:…` (Dockerfile digest pin); `RUST_VERSION=1.96.0` checked at build | No floating `rust:latest`, no runtime `rustup` |
-| Chromium browser builds | Puppeteer runtime image `ghcr.io/puppeteer/puppeteer:24.37.2@sha256:…` plus fixed `CHROMIUM_VERSION=145.0.7632.46` and fixed `CHROME=…/linux-145.0.7632.46/…` path | Chromium + complete OS dependency set come from this **one** digest-pinned image |
+| Chromium browser builds | Puppeteer runtime image `ghcr.io/puppeteer/puppeteer:24.37.2@sha256:…` plus fixed `CHROMIUM_VERSION=145.0.7632.46` (**major 145**) and fixed `CHROME=…/linux-145.0.7632.46/…` path | Chromium + complete OS dependency set come from this **one** digest-pinned image. Residual: public Chrome majors move faster; detectors can track lag vs major 145 until the image pin rotates (see SECURITY residual table). Hard-path product UA/CH-UA stay major-coherent with this pin. |
 | Runtime OS deps for Chromium | Supplied by the same digest-pinned Puppeteer image | Dockerfile never runs `apt`/`apk` install or `playwright install --with-deps` |
 | Guest OS / hypervisor measurement inputs | Phala `dstack-0.5.9-bd369a8c` / `os_image_hash` pinned in `image/allowlist.json` and catalog metadata | Measured via `dstack-mr` MRTD/RTMR0-2 |
 | App compose identity | Digest-pinned Compose image ref + Phala `app-compose.json` hash (`compose_hash`) | RTMR3 is runtime; validators replay the signed event log for `compose-hash` |

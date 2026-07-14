@@ -28,7 +28,7 @@ use url::Url;
 use x509_parser::prelude::parse_x509_certificate;
 /// A browser-plausible User-Agent so origins are not served a bare library fingerprint.
 pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 /// Default request timeout (seconds) when the caller does not specify one.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;

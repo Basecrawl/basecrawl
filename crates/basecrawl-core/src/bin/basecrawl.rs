@@ -27,7 +27,9 @@ use std::path::PathBuf;
     name = "basecrawl",
     version,
     about = "Verifiable web crawler (single scrape, POST/body, crawl MVP, map-lite, batch). \
-Cryptographically-anchored trust-but-audit model (not anonymity).",
+Cryptographically-anchored trust-but-audit model (not anonymity). \
+Residual: headless (default --headless=new), CDP/Runtime.enable side-channel risk remains, \
+Chromium product pin major 145 (detectors can track pin lag). Overt bot sensors still apply.",
     long_about = None
 )]
 struct Cli {
@@ -277,6 +279,8 @@ struct Cli {
     /// Disable the early CDP stealth inject (`Page.addScriptToEvaluateOnNewDocument`).
     /// Hard / residential identity refuses success when inject is disabled (VAL-CDP-008).
     /// Prefer this diagnostic toggle only on soft paths; never claim hard-path identity without inject.
+    /// Residual honesty: even with inject enabled, CDP/Runtime protocol use (Runtime.enable side
+    /// channel) and headless detection may still classify the client (VAL-CDP-003 / VAL-FPRINT-014).
     #[arg(long = "disable-stealth-inject", default_value_t = false)]
     disable_stealth_inject: bool,
 

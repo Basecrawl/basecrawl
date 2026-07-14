@@ -297,6 +297,7 @@ name = "basecrawl-render"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "basecrawl-fp",
  "basecrawl-seal",
  "headless_chrome",
  "png",

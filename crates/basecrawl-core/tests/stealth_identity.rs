@@ -286,9 +286,19 @@ fn val_stealth_003_006_ua_and_ch_ua_are_chromium_coherent() {
     assert!(ch.contains("Google Chrome"));
     assert!(ch.contains("Chromium"));
     assert!(ch.contains(&format!("v=\"{}\"", profile.chrome_major)));
-    assert!(profile.chrome_major == 145 || profile.chrome_major == 148);
+    assert_eq!(profile.chrome_major, PINNED_CHROMIUM_MAJOR);
     assert_eq!(product_chromium_major(), PINNED_CHROMIUM_MAJOR);
     assert!(product_chromium_version().starts_with("145."));
+    assert!(
+        profile
+            .user_agent
+            .contains(&format!("Chrome/{PINNED_CHROMIUM_MAJOR}.")),
+        "hard-path allowlist UA must match product pin major"
+    );
+    assert!(
+        !profile.user_agent.contains("Chrome/148"),
+        "hard path must not emit 148 major drift"
+    );
 }
 
 #[test]

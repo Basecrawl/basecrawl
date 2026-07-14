@@ -1,10 +1,14 @@
-//! M18 hard-path CDP anti-detect depth (VAL-CDP-001/002/004/005/006/008/009/010,
-//! VAL-FPRINT-001/002).
+//! M18 hard-path CDP anti-detect depth (VAL-CDP-001/002/003/004/005/006/007/008/009/010,
+//! VAL-FPRINT-001/002/013/014, VAL-UNLOCK-014).
 //!
 //! Hermetic canaries bind only in mission range 21000–21099. No captcha marketplace,
 //! no live industrial bot vendors, no Oxylabs lock-in. Residual and honesty language only.
 
-use basecrawl_fp::{browser_injection_script, generate};
+use basecrawl_fp::{
+    browser_injection_script, generate, hard_path_versions_are_pin_coherent,
+    product_chromium_major, product_chromium_version, sec_ch_ua_header, PINNED_CHROMIUM_MAJOR,
+    USER_AGENTS,
+};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -693,5 +697,211 @@ fn val_fprint_001_002_window_chrome_and_runtime_policy() {
             || html.contains("runtimePresent=true")
             || html.contains("runtimePresent=false"),
         "runtime presence policy must be explicit in canary dump; html={html}"
+    );
+}
+
+/// UA / Sec-CH-UA / full version canary written as attributes for hard-path pin coherence.
+const UA_PIN_CANARY: &str = r#"<!doctype html><html><head>
+<script>
+(function () {
+  function brands() {
+    try {
+      if (navigator.userAgentData && navigator.userAgentData.brands) {
+        return navigator.userAgentData.brands.map(function (b) {
+          return b.brand + ':' + b.version;
+        }).join('|');
+      }
+    } catch (e) {}
+    return '';
+  }
+  function fullBrands() {
+    try {
+      if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+        // Fire-and-forget high entropy is async; surface low-entropy brands + UA immediately.
+      }
+    } catch (e) {}
+    return brands();
+  }
+  var ua = navigator.userAgent || '';
+  var report = {
+    ua: ua,
+    brands: brands(),
+    fullBrands: fullBrands(),
+    platform: (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || ''
+  };
+  window.__bcUaCanary = report;
+  function paint() {
+    try {
+      if (!document.body) return;
+      document.body.setAttribute('data-ua', report.ua);
+      document.body.setAttribute('data-brands', report.brands);
+      document.body.innerHTML =
+        '<pre id="surface">' +
+        'ua=' + report.ua +
+        ';brands=' + report.brands +
+        ';platform=' + report.platform +
+        '</pre>';
+    } catch (_) {}
+  }
+  document.addEventListener('DOMContentLoaded', paint);
+  paint();
+})();
+</script>
+</head><body><div id="status">pending-ua-probe</div></body></html>"#;
+
+#[test]
+fn val_cdp_007_and_fprint_013_single_chromium_major_pin_coherent() {
+    // Profile + product surfaces must share one pin major (no 145 vs 148 product drift).
+    assert_eq!(product_chromium_major(), PINNED_CHROMIUM_MAJOR);
+    assert!(product_chromium_version().starts_with("145."));
+    for ua in USER_AGENTS {
+        assert!(
+            ua.contains(&format!("Chrome/{PINNED_CHROMIUM_MAJOR}.")),
+            "USER_AGENTS must stay on pin major: {ua}"
+        );
+        assert!(
+            !ua.contains("Chrome/148"),
+            "no 148 drift in allowlist: {ua}"
+        );
+    }
+
+    let profile = generate("cdp-ua-pin-seed");
+    assert!(hard_path_versions_are_pin_coherent(&profile));
+    assert_eq!(profile.chrome_major, PINNED_CHROMIUM_MAJOR);
+    assert!(profile
+        .user_agent
+        .contains(&format!("Chrome/{PINNED_CHROMIUM_MAJOR}.")));
+    let ch = sec_ch_ua_header(&profile);
+    assert!(ch.contains(&format!("v=\"{PINNED_CHROMIUM_MAJOR}\"")));
+    assert!(!ch.contains("v=\"148\""));
+
+    let url = spawn_static_canary(UA_PIN_CANARY);
+    let out = run_cli(&[
+        &url,
+        "--formats",
+        "html",
+        "--force-browser",
+        "--fingerprint-seed",
+        "cdp-ua-pin-seed",
+        "--task-id",
+        "cdp-ua-007",
+        "--timeout",
+        "60",
+        "--wait-for",
+        "#surface",
+    ]);
+    let html = assert_success_surface(&out);
+    assert!(
+        html.contains(&format!("Chrome/{PINNED_CHROMIUM_MAJOR}.")),
+        "post-inject reflected UA major must match product pin; html={html}"
+    );
+    assert!(
+        !html.contains("Chrome/148"),
+        "hard path must not reflect neighbor major 148; html={html}"
+    );
+    // Brand list (when UA-CH is available) must not advertise a different major.
+    if html.contains("Google Chrome:") || html.contains("Chromium:") {
+        assert!(
+            html.contains(&format!("Google Chrome:{PINNED_CHROMIUM_MAJOR}"))
+                || html.contains(&format!("Chromium:{PINNED_CHROMIUM_MAJOR}")),
+            "CH-UA brand major must match pin; html={html}"
+        );
+        assert!(
+            !html.contains("Google Chrome:148") && !html.contains("Chromium:148"),
+            "CH-UA must not advertise 148 on hard path; html={html}"
+        );
+    }
+}
+
+#[test]
+fn val_cdp_003_fprint_014_unlock_014_residual_honesty_in_product_surfaces() {
+    // VAL-CDP-003 / VAL-FPRINT-014 / VAL-UNLOCK-014: residual docs + --help honesty
+    // (Runtime.enable residual, headless residual, Chromium major residual).
+    let help = Command::new(BIN)
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn help");
+    assert!(help.status.success());
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    )
+    .to_ascii_lowercase();
+    assert!(
+        help_text.contains("headless") || help_text.contains("runtime"),
+        "CLI help must surface residual honesty markers; help={help_text}"
+    );
+    assert!(
+        help_text.contains("145") || help_text.contains("chromium"),
+        "CLI help should mention Chromium pin residual; help={help_text}"
+    );
+    // Use multi-word absolute claims only: short tokens may appear inside honest negation
+    // phrases if copywriters reverse polarity ("not X"), so gate on full claim language.
+    for banned in [
+        "passes all headless detectors",
+        "100% guaranteed",
+        "cdp residual fully eliminated",
+        "no cdp leak forever",
+        "trustless scrape",
+        "fully undetectable",
+    ] {
+        assert!(
+            !help_text.contains(banned),
+            "help must not claim absolute anti-detect elimination ({banned})"
+        );
+    }
+
+    // Product residual docs (SECURITY + TCB inventory + operator guide) must be present
+    // and honest about Runtime / headless / Chromium major. Path is workspace-relative.
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    let security = std::fs::read_to_string(root.join("docs/SECURITY.md")).expect("SECURITY.md");
+    let tcb = std::fs::read_to_string(root.join("docs/tcb-inventory.md")).expect("tcb-inventory");
+    let operator = std::fs::read_to_string(root.join("docs/operators/proxy-and-egress.md"))
+        .expect("proxy-ops");
+    let combined = format!("{security}\n{tcb}\n{operator}").to_ascii_lowercase();
+    assert!(
+        combined.contains("runtime.enable") || combined.contains("runtime protocol"),
+        "residual docs must list Runtime.enable / CDP protocol residual (VAL-CDP-003)"
+    );
+    assert!(
+        combined.contains("headless")
+            && (combined.contains("residual") || combined.contains("detect")),
+        "residual docs must admit headless residual (VAL-FPRINT-014)"
+    );
+    assert!(
+        combined.contains("145")
+            && (combined.contains("chromium major")
+                || combined.contains("major 145")
+                || combined.contains("chrome/145")
+                || combined.contains("chromium_version=145")),
+        "residual docs must note Chromium major pin residual (VAL-UNLOCK-014)"
+    );
+    // Positive absolute marketing claims only (honest residual prose must still talk about residuals).
+    for banned in [
+        "we are undetectable",
+        "fully eliminates cdp residual",
+        "trustless scrape authenticity",
+        "100% guaranteed authenticity",
+        "anonymous residential exit",
+    ] {
+        assert!(
+            !combined.contains(banned),
+            "residual docs still contain absolute claim {banned}"
+        );
+    }
+
+    // Vendored launcher prefers new headless mode on hard path.
+    let process_src =
+        std::fs::read_to_string(root.join("vendor/headless_chrome/src/browser/process.rs"))
+            .expect("process.rs");
+    assert!(
+        process_src.contains("--headless=new"),
+        "launch hygiene must prefer --headless=new where pin supports it"
     );
 }

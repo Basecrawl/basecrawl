@@ -426,7 +426,10 @@ impl Process {
         }
 
         if launch_options.headless && !launch_options.devtools {
-            args.extend(["--headless"]);
+            // Prefer Chromium's new headless mode (Chrome 112+) for a less scrapable
+            // automation surface. Product pin (145+) and host Chrome 148 both accept it.
+            // Residual headless heuristics remain (documented in docs/SECURITY.md).
+            args.extend(["--headless=new"]);
         } else if launch_options.devtools {
             args.extend(["--auto-open-devtools-for-tabs"]);
         }

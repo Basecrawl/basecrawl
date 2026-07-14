@@ -60,20 +60,21 @@ pub fn product_chromium_major() -> u32 {
         .unwrap_or(PINNED_CHROMIUM_MAJOR)
 }
 
-/// Chrome User-Agents allowed by the measured image (version cluster stays near the pinned browser).
+/// Chrome User-Agents allowed by the measured image (hard + soft product surface).
 ///
-/// Majors center on the product pin (145) and the adjacent measured host Chrome builds actually
-/// observed in the operator fleet. Soft-path rustls and hard-path Chromium must never claim a
-/// non-Chrome brand.
+/// All entries use the **product-pinned Chromium major** ([`PINNED_CHROMIUM_MAJOR`]) so hard-path
+/// UA / Sec-CH-UA / CDP overrides cannot drift to a neighbor major (no 145 vs 148 product drift;
+/// VAL-CDP-007 / VAL-FPRINT-013). Soft-path rustls and hard-path Chromium must never claim a
+/// non-Chrome brand. Platform strings still vary (Linux / Windows / macOS / Ubuntu).
 pub const USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
 ];
 
 /// Plausible hardwareConcurrency values the seed may legalize (VAL-STEALTH-009).
@@ -307,7 +308,7 @@ pub fn generate(seed_input: &str) -> FingerprintProfile {
     let seed = normalize_seed(seed_input);
     let stream = SeedStream::new(&seed);
 
-    let user_agent = pick(&stream.lane(0), USER_AGENTS).to_string();
+    let user_agent = coerce_user_agent_to_product_pin(pick(&stream.lane(0), USER_AGENTS));
     let (viewport_width, viewport_height) = *pick(&stream.lane(1), VIEWPORTS);
     let timezone = pick(&stream.lane(2), TIMEZONES).to_string();
     let locale = pick(&stream.lane(3), LOCALES).to_string();
@@ -765,7 +766,7 @@ pub fn client_hints_architecture(_profile: &FingerprintProfile) -> &'static str 
 }
 
 fn chrome_versions_for_ua(user_agent: &str) -> (u32, String) {
-    let major = user_agent
+    let parsed_major = user_agent
         .split("Chrome/")
         .nth(1)
         .and_then(|rest| {
@@ -776,14 +777,60 @@ fn chrome_versions_for_ua(user_agent: &str) -> (u32, String) {
         })
         .and_then(|part| part.parse::<u32>().ok())
         .unwrap_or(product_chromium_major());
-    // Prefer the product pin's full version when the UA major matches the pin, so hard-path
-    // Client Hints align with the measured image. Neighboring majors keep a major.0.0.0 fall-back.
-    let full = if major == PINNED_CHROMIUM_MAJOR {
+    // Hard- and soft-path product surface: always emit the single product pin major so CDP UA
+    // override, Sec-CH-UA brands, and fullVersionList cannot 145-vs-148 drift (VAL-CDP-007 /
+    // VAL-FPRINT-013). If a future operator opens the allowlist to a neighbor major intentionally,
+    // pin constants and residual TCB docs must move together.
+    let major = if parsed_major != product_chromium_major() {
+        product_chromium_major()
+    } else {
+        parsed_major
+    };
+    let full = if major == product_chromium_major() {
         product_chromium_version()
     } else {
         format!("{major}.0.0.0")
     };
     (major, full)
+}
+
+/// Rewrite a User-Agent so its Chrome/ major matches the product pin (hard-path coherence).
+///
+/// Keeps the rest of the UA string (platform tokens) intact when only the major digits drift.
+pub fn coerce_user_agent_to_product_pin(user_agent: &str) -> String {
+    let pin_major = product_chromium_major();
+    if let Some(after) = user_agent.split_once("Chrome/") {
+        let rest = after.1;
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if let Ok(parsed) = rest[..end].parse::<u32>() {
+            if parsed != pin_major {
+                return format!("{}Chrome/{}{}", after.0, pin_major, &rest[end..]);
+            }
+        }
+    }
+    user_agent.to_string()
+}
+
+/// True when UA major, chrome_major, and chrome_full_version all match the product pin major.
+pub fn hard_path_versions_are_pin_coherent(profile: &FingerprintProfile) -> bool {
+    let pin = product_chromium_major();
+    let ua_major = profile.user_agent.split("Chrome/").nth(1).and_then(|rest| {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest.get(..end)?.parse::<u32>().ok()
+    });
+    let full_major = profile
+        .chrome_full_version
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u32>().ok());
+    ua_major == Some(pin)
+        && profile.chrome_major == pin
+        && full_major == Some(pin)
+        && profile.chrome_full_version.starts_with(&format!("{pin}."))
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,10 +1262,34 @@ mod tests {
         assert_eq!(PINNED_CHROMIUM_MAJOR, 145);
         assert!(product_chromium_version().starts_with("145."));
         let profile = generate("pin-coherent");
-        assert!(profile.chrome_major == 145 || profile.chrome_major == 148);
+        assert_eq!(profile.chrome_major, PINNED_CHROMIUM_MAJOR);
+        assert!(hard_path_versions_are_pin_coherent(&profile));
         let ch = sec_ch_ua_header(&profile);
         assert!(ch.contains("Google Chrome"));
         assert!(ch.contains(&format!("v=\"{}\"", profile.chrome_major)));
         assert!(!ch.to_lowercase().contains("curl"));
+    }
+
+    #[test]
+    fn hard_path_user_agents_are_single_pin_major() {
+        for ua in USER_AGENTS {
+            assert!(
+                ua.contains(&format!("Chrome/{PINNED_CHROMIUM_MAJOR}.")),
+                "allowlist UA must stay on pin major {PINNED_CHROMIUM_MAJOR}: {ua}"
+            );
+            assert!(
+                !ua.contains("Chrome/148"),
+                "allowlist must not introduce 148 drift: {ua}"
+            );
+            let (major, full) = chrome_versions_for_ua(ua);
+            assert_eq!(major, PINNED_CHROMIUM_MAJOR);
+            assert!(full.starts_with("145."));
+        }
+        // Coercion repairs a neighbor-major UA string if one ever reappears.
+        let repaired = coerce_user_agent_to_product_pin(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        );
+        assert!(repaired.contains("Chrome/145."));
+        assert!(!repaired.contains("Chrome/148."));
     }
 }

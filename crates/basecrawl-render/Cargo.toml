@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+basecrawl-fp = { path = "../basecrawl-fp" }
 basecrawl-seal = { path = "../basecrawl-seal" }
 headless_chrome = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 serde = { workspace = true }

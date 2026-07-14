@@ -38,7 +38,9 @@ Universal proxy support (HTTP CONNECT / SOCKS5, sticky/session and country usern
 | --- | --- |
 | Upstream proxy operator | Sees exit traffic to origins; credentials must stay env-only, never in proofs or logs. |
 | Network metadata | Even with sealed DoH on the hard path, traffic shape and destination residual exist outside content confidentiality. |
-| Headless / automation heuristics | Stealth baseline lowers trivial signals (`webdriver`, obvious automation flags); sites may still classify the client. |
+| Headless detection residual | Hard path launches Chromium with `--headless=new` (when the pin supports it) and baseline stealth (drop automation flags, early inject). Headless remains the default; residual headless heuristics, GPU-less surfaces, and automation detectors may still classify the client. Absolute cross-detector headless cloaking is out of scope. |
+| CDP / Runtime protocol residual | The Chrome DevTools Protocol path can still call into Runtime APIs for automation work. Even when classic automation flags and early-document injects are mitigated, a **Runtime.enable** (or equivalent CDP Runtime) side channel may remain observable to sophisticated detectors. This residual is documented rather than claimed eliminated. |
+| Chromium major pin residual | Measured image pins **Chromium major 145** (`CHROMIUM_VERSION=145.0.7632.46`). Detectors and vendor rules can track lag vs the current public Chrome major. Hard-path UA / Sec-CH-UA / CDP overrides stay major-coherent to this single pin (no 145-vs-148 product drift). A pin bump must update image pin + residual note together. |
 | Class forgery | Product fails closed when residential/mobile is required but upstream is unavailable; never advertise a forged class on success. |
 
 Operator flag reference: [operators/proxy-and-egress.md](operators/proxy-and-egress.md).

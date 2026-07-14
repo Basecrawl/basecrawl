@@ -94,19 +94,22 @@ Bind or start failure under a **required** residential/mobile class fails closed
 
 Baseline launch hardening (not a universal cloak):
 
-- Drop automation-oriented flags; `navigator.webdriver` false at startup
-- Align UA / CH-UA with the **pinned Chromium** major in the CVM image
+- Prefer `--headless=new` on the product pin (Chrome 112+; pin is Chromium **145**)
+- Drop automation-oriented flags; early inject forces `navigator.webdriver` false before content probes
+- Align UA / CH-UA / CDP `userAgentMetadata` with the **single pinned Chromium major** in the CVM image (no neighbor-major drift)
 - Sticky profile keyed by task/session; wipe across tasks by default
 - Challenge / block interstitials surface as structured `challenge_blocked` rather than silent success
 
-Do not market this as "undetectable" or "defeats all bot vendors." It is an identity baseline under TDX with residual headless and vendor-heuristic risk.
+Do not market this as "undetectable" or "defeats all bot vendors." It is an identity baseline under TDX with residual headless, CDP/Runtime, and vendor-heuristic risk.
 
 ## Residual risks (operator)
 
 | Residual | Operator stance |
 | --- | --- |
 | Proxy ≠ anonymity | Exit IP, SNI (without ECH), and traffic shape remain visible to the upstream proxy and networks. |
-| Headless heuristics | Some sites still flag automated browsers; sticky profiles and residential egress only raise the bar. |
+| Headless residual | Headless is default (`--headless=new`). Such traits remain detectable; sticky profiles and residential egress only raise the bar. Do not advertise perfect headless cloaking. |
+| CDP Runtime residual | CDP/Runtime protocol use (including possible Runtime.enable side effects) is a residual channel even when trivial automation flags are patched. Documented in [SECURITY.md](../SECURITY.md). |
+| Chromium major residual | Pin is major **145** (`145.0.7632.46`). Detectors can track lag vs newer public Chrome; keep hard-path majors coherent when the pin moves. |
 | TEE.fail (self-hosted) | Physical DDR5 interposer residual; prefer managed-cloud TDX for high-stakes confidential work. See [SECURITY.md](../SECURITY.md). |
 | Network metadata | Sealed DNS / content confidentiality do not erase all host-owned network observables. |
 | Provider spend | Live residential sessions cost money; use sticky short sessions and rate limits. |

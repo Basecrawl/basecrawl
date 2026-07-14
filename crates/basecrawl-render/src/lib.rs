@@ -1161,6 +1161,9 @@ fn launch_browser(
     } else {
         Vec::new()
     };
+    // Vendored headless_chrome emits `--headless=new` when headless=true (Chrome 112+),
+    // preferred on the product pin (145) and host developer Chrome 148. Residual headless
+    // detectability is documented, not claimed eliminated (VAL-FPRINT-014).
     let mut builder = LaunchOptions::default_builder();
     builder
         .path(Some(chrome))
@@ -1241,6 +1244,8 @@ fn preflight_sealed_document_dns(
 /// Apply UA + Client Hints metadata so hard-path identity is Chromium-coherent (VAL-STEALTH-003/006).
 ///
 /// `userAgentMetadata` must be set for Chromium to emit `Sec-CH-UA` Client Hint headers.
+/// Hard path enforces a single product Chromium major (VAL-CDP-007 / VAL-FPRINT-013): UA string,
+/// brands, and fullVersionList major are rewritten to the pin when a neighbor drifts.
 fn apply_user_agent_override(
     tab: &Arc<Tab>,
     user_agent: &str,
@@ -1249,20 +1254,24 @@ fn apply_user_agent_override(
     chrome_major: Option<u32>,
     chrome_full_version: Option<&str>,
 ) -> Result<(), RenderError> {
-    let major = chrome_major
-        .map(|value| value.to_string())
-        .or_else(|| {
-            user_agent.split("Chrome/").nth(1).and_then(|rest| {
-                let end = rest
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(rest.len());
-                rest.get(..end).map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "145".to_string());
-    let full_version = chrome_full_version
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{major}.0.0.0"));
+    let pin_major = basecrawl_fp::product_chromium_major();
+    let pin_full = basecrawl_fp::product_chromium_version();
+    let coherent_ua = basecrawl_fp::coerce_user_agent_to_product_pin(user_agent);
+    let major_num = match chrome_major {
+        Some(value) if value == pin_major => value,
+        _ => pin_major,
+    };
+    let major = major_num.to_string();
+    let full_version = match chrome_full_version {
+        Some(value)
+            if value.split('.').next().and_then(|p| p.parse::<u32>().ok()) == Some(pin_major) =>
+        {
+            value.to_string()
+        }
+        _ if major_num == pin_major => pin_full,
+        _ => format!("{major}.0.0.0"),
+    };
+    let user_agent = coherent_ua.as_str();
     let ch_platform = match platform.unwrap_or("Linux x86_64") {
         p if p.starts_with("Win") => "Windows",
         p if p.starts_with("Mac") => "macOS",
