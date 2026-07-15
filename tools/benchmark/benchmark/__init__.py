@@ -16,6 +16,20 @@ from .basecrawl_adapter import (
     map_basecrawl_error_kind,
     normalize_proof_file,
 )
+from .firecrawl_adapter import (
+    PROFILE_BASIC as FIRECRAWL_PROFILE_BASIC,
+    PROFILE_ENHANCED as FIRECRAWL_PROFILE_ENHANCED,
+    FirecrawlAdapter,
+    FirecrawlAdapterConfig,
+    classify_challenge_body as firecrawl_classify_challenge_body,
+    classify_firecrawl_failure,
+    normalize_firecrawl_payload,
+)
+from .firecrawl_limit import (
+    FIRECRAWL_MAX_CONCURRENCY,
+    FirecrawlConcurrencyError,
+    firecrawl_slot,
+)
 from .formats import (
     CORE_FORMATS,
     EXCLUDED_CORE_FORMATS,
@@ -77,6 +91,16 @@ __all__ = [
     "classify_challenge",
     "map_basecrawl_error_kind",
     "normalize_proof_file",
+    "FirecrawlAdapter",
+    "FirecrawlAdapterConfig",
+    "FIRECRAWL_PROFILE_BASIC",
+    "FIRECRAWL_PROFILE_ENHANCED",
+    "FIRECRAWL_MAX_CONCURRENCY",
+    "FirecrawlConcurrencyError",
+    "firecrawl_slot",
+    "firecrawl_classify_challenge_body",
+    "classify_firecrawl_failure",
+    "normalize_firecrawl_payload",
     "collect_secret_fragments",
     "redact_text",
     "ResidentialConcurrencyError",

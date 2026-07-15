@@ -2,7 +2,7 @@
 
 Tracked tools under `basecrawl/tools/benchmark/` for fair **basecrawl** vs **Firecrawl** head-to-head (**H2H**) scoring.
 
-Delivers the common **NormalizedResult** schema, multi-dimension **scorer** (0–1 dims + aggregates), **offline re-score**, and the **basecrawl adapter** (soft direct, hard Chromium, optional residential Oxylabs with max 1 concurrent dial). Firecrawl adapter + matrix runner arrive in follow-on features.
+Delivers the common **NormalizedResult** schema, multi-dimension **scorer** (0–1 dims + aggregates), **offline re-score**, the **basecrawl adapter** (soft direct, hard Chromium, optional residential Oxylabs with max 1 concurrent dial), and the **Firecrawl cloud adapter** (formats markdown/html/links, proxy basic|auto|enhanced, skip-if-no-key, concurrency ≤2). Matrix runner arrives in a follow-on feature.
 
 ## Honesty (read first)
 
@@ -82,6 +82,19 @@ python -m benchmark basecrawl --url https://quotes.toscrape.com/js/ --path-mode 
 
 # residential optional (max 1 concurrent; secrets from mode-600 .env only)
 # python -m benchmark basecrawl --url https://example.com/ --path-mode residential
+
+# Firecrawl adapter — hermetic dry-run (requires FIRECRAWL_API_KEY in env/.env for non-skip)
+python -m benchmark firecrawl --url https://example.com/ --proxy basic --dry-run
+
+# Firecrawl adapter — soft live cloud scrape (key from mode-600 .env; never printed)
+# python -m benchmark firecrawl --url https://example.com/ --proxy basic --out /tmp/fc.json
+
+# Firecrawl enhanced ceiling (optional non-scoring; not core parity)
+# python -m benchmark firecrawl --url https://example.com/ --proxy enhanced
+
+# Fair skip proof when key missing (CI path)
+# env -u FIRECRAWL_API_KEY python -m benchmark firecrawl --url https://example.com/ \
+#   --no-stored-credentials --no-dotenv
 ```
 
 Focused tests:
@@ -100,6 +113,23 @@ python -m pytest tests/ -q
 | `residential` | `--force-browser` + `--proxy-class residential` | **1** | Oxylabs via `.env` |
 
 Normalized fields always include `challenge_class`, `status_class`, `fetch_path`, `proxy_class`, and redacted error text. Credential/proxy-auth failures are typed `credential_error` and never content success. ScrapeProof / attestation are **secondary** dimensions only.
+
+## Firecrawl adapter notes
+
+| proxy_mode | scoring_role | Concurrency | Auth |
+| --- | --- | --- | --- |
+| `basic` | scoring | ≤ plan / **max 2** in-process (prefer 1) | `FIRECRAWL_API_KEY` or CLI stored login |
+| `auto` | scoring until response shows enhanced | same | same |
+| `enhanced` | **ceiling** (non-parity) | ≤2 | same |
+
+Behavior:
+
+- **Missing key / unauthenticated** → typed `engine_unavailable` fair skip (exit 0); not a content-failure score for basecrawl-only boards.
+- **401/403 / invalid key** → fail-closed `credential_error` (non-zero).
+- **Insufficient credits / plan limit** → typed `budget_exhausted` without inventing scores.
+- **API key never on argv** (`-k` avoided); injected only via env; secrets redacted from JSON dumps.
+- **Cloud-only** for this matrix by default (self-host needs explicit `--api-url` + surface label). Auto-fallback that lands on `proxyUsed=enhanced` is labeled ceiling, not core parity.
+- Medium/hard optional tiers: `--optional-tier medium|hard` → typed skip classes without dialing.
 
 ## Matrix profiles (summary)
 

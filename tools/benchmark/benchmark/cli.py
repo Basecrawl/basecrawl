@@ -1,4 +1,4 @@
-"""CLI entry for schema validate + offline rescore + basecrawl adapter.
+"""CLI entry for schema validate + offline rescore + engine adapters.
 
 Usage (from repo root or tools/benchmark)::
 
@@ -7,15 +7,19 @@ Usage (from repo root or tools/benchmark)::
     python -m benchmark score --path fixtures/artifacts/soft-basecrawl-example.json
     python -m benchmark basecrawl --url https://example.com/ --path-mode soft
     python -m benchmark basecrawl --url https://example.com/ --dry-run
+    python -m benchmark firecrawl --url https://example.com/ --proxy basic --dry-run
+    python -m benchmark firecrawl --url https://example.com/ --proxy basic
 
 Rescore is offline and never calls Firecrawl or Oxylabs. Live residential
-basecrawl path is max 1 concurrent; secrets stay in mode-600 ``.env``.
+basecrawl path is max 1 concurrent. Firecrawl cloud concurrency ≤ 2.
+Secrets stay in mode-600 ``.env`` and are never printed.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -26,6 +30,12 @@ from .basecrawl_adapter import (
     PROFILE_SOFT,
     BasecrawlAdapter,
     BasecrawlAdapterConfig,
+)
+from .firecrawl_adapter import (
+    PROFILE_BASIC as FC_PROFILE_BASIC,
+    PROFILE_ENHANCED as FC_PROFILE_ENHANCED,
+    FirecrawlAdapter,
+    FirecrawlAdapterConfig,
 )
 from .formats import CORE_FORMATS, EXCLUDED_CORE_FORMATS, request_core_formats
 from .redact import looks_like_secret_leak, redact_text
@@ -145,6 +155,66 @@ def build_parser() -> argparse.ArgumentParser:
         "--js-target",
         action="store_true",
         help="Mark result as JS-render target for scoring dimension",
+    )
+
+    fc = sub.add_parser(
+        "firecrawl",
+        help=(
+            "Run Firecrawl adapter into common schema "
+            "(proxy basic|auto|enhanced; skip if no key)"
+        ),
+    )
+    fc.add_argument("--url", required=True, help="Target URL to scrape")
+    fc.add_argument(
+        "--proxy",
+        choices=("basic", "auto", "enhanced"),
+        default="basic",
+        help="Firecrawl --proxy mode (enhanced = non-scoring ceiling)",
+    )
+    fc.add_argument(
+        "--profile-id",
+        default=None,
+        help="Matrix profile id (default: P2 basic or P4 enhanced)",
+    )
+    fc.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Hermetic dry-run: no network; emits normalized artifact when key present",
+    )
+    fc.add_argument("--binary", default=None, help="Path to firecrawl CLI binary")
+    fc.add_argument("--timeout", type=float, default=60.0, help="Scrape timeout seconds")
+    fc.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Max concurrent Firecrawl scrapes for multi-URL (hard cap 2)",
+    )
+    fc.add_argument("--out", default=None, help="Write normalized JSON to this path")
+    fc.add_argument(
+        "--js-target",
+        action="store_true",
+        help="Mark result as JS-render target for scoring dimension",
+    )
+    fc.add_argument(
+        "--no-stored-credentials",
+        action="store_true",
+        help="Ignore Firecrawl CLI stored credentials; require FIRECRAWL_API_KEY",
+    )
+    fc.add_argument(
+        "--no-dotenv",
+        action="store_true",
+        help="Do not load basecrawl/.env for the key lookup",
+    )
+    fc.add_argument(
+        "--optional-tier",
+        choices=("medium", "hard"),
+        default=None,
+        help="Emit typed optional skip for medium/hard without dialing",
+    )
+    fc.add_argument(
+        "--api-url",
+        default=None,
+        help="Optional Firecrawl API URL override (self-host label when set)",
     )
 
     info = sub.add_parser("info", help="Print core formats, dimensions, and weights")
@@ -338,6 +408,73 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if result.error_class == "credential_error" and path_mode in {"residential"}:
             return 1
         if result.error_class == "engine_unavailable":
+            return 1
+        return 0
+
+    if args.command == "firecrawl":
+        proxy_mode = args.proxy
+        profile_id = args.profile_id
+        if not profile_id:
+            profile_id = (
+                FC_PROFILE_ENHANCED if proxy_mode == "enhanced" else FC_PROFILE_BASIC
+            )
+        # Concurrency hard-capped at 2 (account limit).
+        concurrency = max(1, min(int(args.concurrency or 1), 2))
+        env_overlay = {}
+        # Strip keys for hermetic skip proof when --no-dotenv and no ambient key desired.
+        load_dotenv = not bool(args.no_dotenv)
+        allow_stored = not bool(args.no_stored_credentials)
+        if args.no_dotenv and "FIRECRAWL_API_KEY" in os.environ and allow_stored is False:
+            # Keep ambient process key if present unless user cleared it externally.
+            # Child path monpatches use --no-dotenv + env strip via process env.
+            pass
+        surface = "self-host" if args.api_url else "cloud"
+        cfg = FirecrawlAdapterConfig(
+            binary=args.binary,
+            profile_id=profile_id,
+            timeout_s=float(args.timeout),
+            proxy_mode=proxy_mode,
+            dry_run=bool(args.dry_run),
+            js_target=bool(args.js_target),
+            concurrency=concurrency,
+            load_dotenv=load_dotenv,
+            allow_stored_credentials=allow_stored,
+            optional_tier=args.optional_tier,
+            api_url=args.api_url,
+            surface=surface,
+            env=env_overlay or None,
+        )
+        adapter = FirecrawlAdapter(cfg)
+        result = adapter.scrape(args.url)
+        payload = result.to_dict()
+        serialized = redact_text(json.dumps(payload, indent=2, sort_keys=True))
+        if looks_like_secret_leak(serialized):
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "refusing to emit adapter payload: secret leak detected after redaction",
+                        "url": args.url,
+                        "error_class": "policy_skip",
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 3
+        payload = json.loads(serialized)
+        if args.out:
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(serialized + "\n", encoding="utf-8")
+        print(serialized)
+        # Fair skip without key is pipeline-friendly (exit 0).
+        if result.error_class == "engine_unavailable":
+            return 0
+        # Credential errors when a key path was attempted → non-zero fail closed.
+        if result.error_class == "credential_error":
+            return 1
+        if result.error_class == "budget_exhausted":
             return 1
         return 0
 
