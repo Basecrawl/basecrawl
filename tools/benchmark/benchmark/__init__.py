@@ -54,6 +54,7 @@ from .rescore import rescore_artifacts, rescore_directory
 from .residential_limit import ResidentialConcurrencyError, residential_slot
 from .schema import (
     CHALLENGE_CLASSES,
+    CHALLENGE_FALSE_SUCCESS_CLASSES,
     CORE_DIMENSIONS,
     ERROR_CLASSES,
     SECONDARY_DIMENSIONS,
@@ -64,6 +65,7 @@ from .schema import (
     validate_normalized_result,
 )
 from .scorer import (
+    CONTENT_SUCCESS_SANDWICH_MAX,
     AggregateScores,
     DimensionScores,
     ScoredRow,
@@ -79,6 +81,7 @@ __all__ = [
     "normalize_format_token",
     "request_core_formats",
     "CHALLENGE_CLASSES",
+    "CHALLENGE_FALSE_SUCCESS_CLASSES",
     "CORE_DIMENSIONS",
     "ERROR_CLASSES",
     "SECONDARY_DIMENSIONS",
@@ -87,6 +90,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "load_normalized_result",
     "validate_normalized_result",
+    "CONTENT_SUCCESS_SANDWICH_MAX",
     "AggregateScores",
     "DimensionScores",
     "ScoredRow",

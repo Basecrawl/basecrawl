@@ -139,13 +139,11 @@ def test_hard_path_adapter_sets_chromium_fetch_path_on_proof(tmp_path: Path):
 
 
 def test_challenge_classification_beyond_http_status():
-    assert (
-        classify_challenge(
-            http_status=200,
-            html="<html>Checking your browser before you access the site</html>",
-        )
-        == "interstitial"
-    )
+    # CF "Checking your browser" → managed_challenge (or legacy interstitial).
+    assert classify_challenge(
+        http_status=200,
+        html="<html>Checking your browser before you access the site</html>",
+    ) in {"managed_challenge", "interstitial"}
     assert (
         classify_challenge(
             http_status=403,

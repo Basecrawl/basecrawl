@@ -1,0 +1,44 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://taostats.io/",
+  "engine": "firecrawl",
+  "profile_id": "P4-firecrawl-enhanced-ceiling",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html", "links"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "turnstile",
+  "content_success": true,
+  "latency_ms": 5239,
+  "cost_estimate": {
+    "firecrawl_credits": 5,
+    "firecrawl_usd_estimate": 0.00495,
+    "basecrawl_cpu_ms_placeholder": null,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "hermetic fixture from 2026-07-15 enhanced probe; scoring_role=ceiling non-parity; sandwich unchanged"
+  },
+  "error_class": "none",
+  "scoring_role": "ceiling",
+  "markdown_body": "# taostats · Official Block Explorer & Gateway to Bittensor\n\nChecking your Browser…\n\nVerification expired. Please try again.\n\nchallenge-platform turnstile residual still present on enhanced path:\nhttps://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/enhancedjob01/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto\nhttps://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/enhancedjob02/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto\n\n## Market Cap\n\n$0.00\n\nEmpty SPA table shell; no clean unlock via enhanced.\n",
+  "html_body": "<html><body><div>Checking your Browser…</div><div class=\"cf-turnstile\" data-sitekey=\"0x4AAAAAAA\"></div><script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script><p>cdn-cgi/challenge-platform path still active</p><h1>taostats</h1></body></html>",
+  "links": [
+    "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/enhancedjob01/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto",
+    "https://taostats.io/"
+  ],
+  "fetch_path": "cloud",
+  "proxy_class": "enhanced",
+  "expected_min_links": 3,
+  "js_target": false,
+  "proof_present": false,
+  "attestation_present": false,
+  "identity_notes": "Firecrawl enhanced (or auto→enhanced) is a non-scoring parity ceiling; not blended into core soft/basic leaderboard; CF sandwich is not a content win",
+  "metadata": {
+    "fixture": true,
+    "probe_source": "hard-shield-target-probe.md",
+    "firecrawl_proxy": "enhanced",
+    "api_status": "success",
+    "non_scoring_ceiling": true,
+    "parity_claim": false,
+    "sandwich": true
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://taostats.io/",
+  "engine": "firecrawl",
+  "profile_id": "P2-soft-firecrawl-basic",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html", "links"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "managed_challenge",
+  "content_success": true,
+  "latency_ms": 1041,
+  "cost_estimate": {
+    "firecrawl_credits": 1,
+    "firecrawl_usd_estimate": 0.00099,
+    "basecrawl_cpu_ms_placeholder": null,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "hermetic fixture from 2026-07-15 taostats probe; API success but challenge sandwich"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "# taostats · Official Block Explorer & Gateway to Bittensor\n\nChecking your Browser…\n\nPlease wait while we verify you are human.\n\n[Verification failed](https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/deadbeef01/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto)\n\nhttps://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/deadbeef02/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto\n\n## Market Cap\n\n$0.00\n\n## Subnets\n\n| Netuid | Name | Price |\n| --- | --- | --- |\n|  |  |  |\n\nFooter chrome and marketing placeholders only; dynamic tables not unlocked.\n",
+  "html_body": "<html><head><title>taostats</title></head><body><div id=\"cf-challenge-running\">Checking your Browser…</div><div class=\"cf-turnstile\" data-sitekey=\"0x4AAAAAAA\"></div><iframe src=\"https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/deadbeef03/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto\"></iframe><main><h1>taostats</h1><p>Market Cap placeholder. Empty subnet table rows.</p></main></body></html>",
+  "links": [
+    "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/deadbeef01/sitekey/0x4AAAAAAA/light/fbE/new/normal?lang=auto",
+    "https://taostats.io/"
+  ],
+  "fetch_path": "cloud",
+  "proxy_class": "basic",
+  "expected_min_links": 3,
+  "js_target": false,
+  "proof_present": false,
+  "attestation_present": false,
+  "identity_notes": "HTTP 200 + vendor API success must not count as content unlock for CF sandwich",
+  "metadata": {
+    "fixture": true,
+    "probe_source": "hard-shield-target-probe.md",
+    "firecrawl_proxy": "basic",
+    "api_status": "success",
+    "sandwich": true
+  }
+}

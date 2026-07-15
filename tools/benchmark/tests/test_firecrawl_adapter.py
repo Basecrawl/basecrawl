@@ -490,13 +490,11 @@ def test_cost_estimate_fields_present_on_success(tmp_path: Path):
 
 
 def test_challenge_classification_beyond_http():
-    assert (
-        classify_challenge_body(
-            http_status=200,
-            html="<html>Checking your browser before you access</html>",
-        )
-        == "interstitial"
-    )
+    # CF "Checking your browser" → managed_challenge (or legacy interstitial).
+    assert classify_challenge_body(
+        http_status=200,
+        html="<html>Checking your browser before you access</html>",
+    ) in {"managed_challenge", "interstitial"}
     assert (
         classify_challenge_body(
             http_status=403,

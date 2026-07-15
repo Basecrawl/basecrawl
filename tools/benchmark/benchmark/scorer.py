@@ -38,6 +38,41 @@ LATENCY_GOOD_MS = 2_000.0
 LATENCY_BAD_MS = 60_000.0
 FLOAT_TOLERANCE = 1e-9
 
+# VAL-HARD-004: documented float ceiling for CF challenge sandwich content_success.
+# Sandwich bodies must score ≤ this bound (≈0) even when HTTP 200 / vendor API success.
+CONTENT_SUCCESS_SANDWICH_MAX = 0.05
+
+# Challenge classes that never unlock primary content under hard/soft scoring.
+_CHALLENGE_FALSE_SUCCESS_CLASSES = frozenset(
+    {
+        "interstitial",
+        "managed_challenge",
+        "turnstile",
+        "captcha_surface",
+        "login_wall",
+        "challenge_blocked",
+        "unknown_soft_block",
+    }
+)
+
+# Strong CF challenge-platform / Turnstile sandwich markers (hard penalty → 0 content).
+_CF_SANDWICH_MARKERS = (
+    "checking your browser",
+    "just a moment",
+    "challenge-platform",
+    "cdn-cgi/challenge-platform",
+    "cf-browser-verification",
+    "cf-challenge",
+    "cf-turnstile",
+    "cf-turnstile-response",
+    "challenges.cloudflare.com",
+    "turnstile/v0",
+    "verification failed",
+    "verification expired",
+    "attention required",
+    "verify you are human",
+    "managed challenge",
+)
 
 # Heuristic markers for interstitial / false-success bodies.
 _INTERSTITIAL_MARKERS = (
@@ -46,14 +81,20 @@ _INTERSTITIAL_MARKERS = (
     "enable javascript to continue",
     "checking your browser",
     "just a moment",
+    "challenge-platform",
+    "cdn-cgi/challenge-platform",
     "cf-browser-verification",
     "cf-challenge",
+    "cf-turnstile",
+    "challenges.cloudflare.com",
     "attention required",
     "access denied",
     "captcha",
     "hcaptcha",
     "recaptcha",
     "verify you are human",
+    "verification failed",
+    "verification expired",
     "bot detection",
     "cloudflare",
     "ddos-guard",
@@ -180,8 +221,13 @@ def clamp01(x: float) -> float:
     return float(x)
 
 
-def score_content_success(result: NormalizedResult, markdown: str) -> float:
-    """Binary-ish content success with substance guardrails."""
+def score_content_success(result: NormalizedResult, markdown: str, html: str = "") -> float:
+    """Binary-ish content success with substance guardrails.
+
+    VAL-HARD-004/005/006: CF challenge-platform / Turnstile / "Checking your
+    Browser" sandwiches score ≈0 even when HTTP 200 or vendor API success set
+    ``content_success=true`` on the adapter flag.
+    """
     if result.error_class in {
         "credential_error",
         "budget_exhausted",
@@ -189,6 +235,7 @@ def score_content_success(result: NormalizedResult, markdown: str) -> float:
         "policy_skip",
         "timeout",
         "transport",
+        "challenge_blocked",
     }:
         return 0.0
     if result.challenge_class in {
@@ -199,31 +246,32 @@ def score_content_success(result: NormalizedResult, markdown: str) -> float:
         "hard_optional_skipped",
     }:
         return 0.0
+    # Challenge residual classes never count as content unlock (hard or soft).
+    if result.challenge_class in _CHALLENGE_FALSE_SUCCESS_CLASSES:
+        return 0.0
+    body = f"{markdown}\n{html}".strip()
+    body_only = markdown.strip()
+    # Always zero CF sandwich markers, even when adapter flag claims success.
+    if _looks_cf_sandwich(body) or _looks_cf_sandwich(body_only):
+        return 0.0
+    if _looks_interstitial(body) or _looks_interstitial(body_only):
+        return 0.0
     if not result.content_success:
         return 0.0
-    body = markdown.strip()
-    if len(body) < 32:
-        return 0.25 if body else 0.0
-    if _looks_interstitial(body):
-        return 0.15
+    if len(body_only) < 32:
+        return 0.25 if body_only else 0.0
     return 1.0
 
 
 def score_interstitial_false_success(result: NormalizedResult, markdown: str, html: str) -> float:
-    """High score = not an interstitial false success (VAL-BENCH-022)."""
-    if result.challenge_class in {
-        "interstitial",
-        "captcha_surface",
-        "login_wall",
-        "challenge_blocked",
-        "unknown_soft_block",
-    }:
+    """High score = not an interstitial false success (VAL-BENCH-022, VAL-HARD-011)."""
+    if result.challenge_class in _CHALLENGE_FALSE_SUCCESS_CLASSES:
         return 0.0
     text = f"{markdown}\n{html}".lower()
     if not text.strip():
         # Empty stream: default to mid-low only when content_success claimed.
         return 0.2 if result.content_success else 0.8
-    if _looks_interstitial(text):
+    if _looks_cf_sandwich(text) or _looks_interstitial(text):
         return 0.0
     if result.content_success and len(markdown.strip()) < 32:
         return 0.35
@@ -452,7 +500,7 @@ def score_result(
     links = result.resolve_links(base_dir)
 
     dims = DimensionScores(
-        content_success=score_content_success(result, markdown),
+        content_success=score_content_success(result, markdown, html),
         interstitial_false_success=score_interstitial_false_success(result, markdown, html),
         markdown_quality=score_markdown_quality(result, markdown),
         links_quality=score_links_quality(result, links),
@@ -469,6 +517,15 @@ def score_result(
         )
     if result.scoring_role == "ceiling":
         notes.append("non-scoring ceiling / non-parity row; separate from core leaderboard")
+    if dims.content_success <= CONTENT_SUCCESS_SANDWICH_MAX and (
+        result.challenge_class in _CHALLENGE_FALSE_SUCCESS_CLASSES
+        or _looks_cf_sandwich(f"{markdown}\n{html}")
+        or _looks_interstitial(f"{markdown}\n{html}")
+    ):
+        notes.append(
+            "challenge sandwich residual: content_success≈0 despite HTTP/API success; "
+            "not a content unlock win"
+        )
     for err in dims.validate_range():
         notes.append(f"dimension range error: {err}")
 
@@ -532,3 +589,9 @@ def aggregate_scores(
 def _looks_interstitial(text: str) -> bool:
     low = text.lower()
     return any(m in low for m in _INTERSTITIAL_MARKERS)
+
+
+def _looks_cf_sandwich(text: str) -> bool:
+    """True for Cloudflare challenge-platform / Turnstile residual sandwiches."""
+    low = text.lower()
+    return any(m in low for m in _CF_SANDWICH_MARKERS)

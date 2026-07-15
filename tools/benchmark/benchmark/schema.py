@@ -19,11 +19,14 @@ SCHEMA_VERSION = "1.0.0"
 ENGINES = frozenset({"basecrawl", "firecrawl"})
 SCORING_ROLES = frozenset({"scoring", "ceiling", "research"})
 
-# Beyond bare HTTP status (VAL-BENCH-021).
+# Beyond bare HTTP status (VAL-BENCH-021, VAL-HARD-010).
+# managed_challenge / turnstile cover CF challenge-platform sandwiches (M23).
 CHALLENGE_CLASSES = frozenset(
     {
         "none",
         "challenge_blocked",
+        "managed_challenge",
+        "turnstile",
         "interstitial",
         "captcha_surface",
         "login_wall",
@@ -36,6 +39,19 @@ CHALLENGE_CLASSES = frozenset(
         "network_error",
         "timeout",
         "unknown",
+    }
+)
+
+# Challenge classes that mean the body is NOT unlocked primary content.
+CHALLENGE_FALSE_SUCCESS_CLASSES = frozenset(
+    {
+        "interstitial",
+        "managed_challenge",
+        "turnstile",
+        "captcha_surface",
+        "login_wall",
+        "challenge_blocked",
+        "unknown_soft_block",
     }
 )
 

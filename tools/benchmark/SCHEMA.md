@@ -55,7 +55,13 @@ Both engines should leave the other side null with notes rather than invent forc
 
 ## `challenge_class` values
 
-`none`, `challenge_blocked`, `interstitial`, `captcha_surface`, `login_wall`, `unknown_soft_block`, `engine_unavailable`, `credential_error`, `budget_exhausted`, `medium_optional_skipped`, `hard_optional_skipped`, `network_error`, `timeout`, `unknown`
+`none`, `challenge_blocked`, `managed_challenge`, `turnstile`, `interstitial`, `captcha_surface`, `login_wall`, `unknown_soft_block`, `engine_unavailable`, `credential_error`, `budget_exhausted`, `medium_optional_skipped`, `hard_optional_skipped`, `network_error`, `timeout`, `unknown`
+
+**Hard-shield note (M23):** Cloudflare challenge-platform / Turnstile sandwiches
+(`Checking your Browser…`, `cdn-cgi/challenge-platform`, `cf-turnstile`) classify as
+`managed_challenge` or `turnstile`. Adapters may still emit HTTP 200 / vendor API success;
+the scorer forces `content_success ≈ 0` and penalizes `interstitial_false_success` for these
+classes. Firecrawl `enhanced` rows keep `scoring_role=ceiling` (non-parity).
 
 ## `error_class` values
 

@@ -6,8 +6,8 @@ Deterministic offline scorer over [SCHEMA.md](SCHEMA.md) artifacts. Re-score nev
 
 | Dimension | Core? | Description |
 | --- | --- | --- |
-| `content_success` | yes | Adapter success + substance; failures/skips → 0; interstitial dampened |
-| `interstitial_false_success` | yes | High when **not** an empty/JS-enable/CF/login false success (separate from content) |
+| `content_success` | yes | Adapter success + substance; failures/skips → 0; **CF challenge sandwich → 0** (even HTTP 200 / vendor API success; max 0.05 float) |
+| `interstitial_false_success` | yes | High when **not** an empty/JS-enable/CF/login false success (separate from content; hard scoreboard keeps this dim) |
 | `markdown_quality` | yes | Structure (headings/lists/paragraphs) + substance; non-empty alone ≠ 1.0 |
 | `links_quality` | yes | Link list vs `expected_min_links`; empty on link-rich pages is low |
 | `js_render` | yes | Active when `js_target=true`; neutral (~0.75) otherwise |
@@ -28,6 +28,24 @@ cost_estimate                0.05
 ```
 
 `core_total` = weighted sum of the seven core dims only. `proof_identity` is reported as `secondary_total` and **cannot** replace failed content wins.
+
+## Challenge sandwich hard rule (VAL-HARD-004/005/006/011/014)
+
+Markers such as `Checking your Browser`, `challenge-platform`, Turnstile / `cf-turnstile`,
+`Verification failed` (without unlocked primary content) force:
+
+- `content_success = 0.0` (≤ `CONTENT_SUCCESS_SANDWICH_MAX` = 0.05)
+- `interstitial_false_success = 0.0`
+
+regardless of `http_status=200` or Firecrawl/basecrawl adapter `content_success=true`.
+
+Challenge classes `managed_challenge`, `turnstile`, `interstitial`, `captcha_surface`,
+`login_wall`, `challenge_blocked`, `unknown_soft_block` also force content zero.
+
+Firecrawl **enhanced** sandwich rows: still content ≈0, and stay `scoring_role=ceiling`
+(non-parity; excluded from default core aggregates).
+
+Offline re-score of saved sandwich fixtures never re-scrapes live vendors.
 
 ## Aggregates
 

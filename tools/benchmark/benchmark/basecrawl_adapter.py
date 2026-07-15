@@ -49,10 +49,16 @@ DEFAULT_FORMATS = ("markdown", "html", "links")
 _CHALLENGE_BODY_MARKERS = (
     "checking your browser",
     "just a moment",
+    "challenge-platform",
+    "cdn-cgi/challenge-platform",
+    "challenges.cloudflare.com",
     "cf-browser-verification",
     "cf-challenge",
+    "cf-turnstile",
     "attention required",
     "verify you are human",
+    "verification failed",
+    "verification expired",
     "hcaptcha",
     "recaptcha",
     "please enable javascript",
@@ -774,25 +780,56 @@ def classify_challenge(
     fetch_path: str = "",
     error_kind: Optional[str] = None,
 ) -> str:
-    """Classify anti-bot / interstitial beyond bare HTTP (VAL-BENCH-021)."""
-    if error_kind == "challenge_blocked":
+    """Classify anti-bot / interstitial beyond bare HTTP (VAL-BENCH-021, VAL-HARD-010).
+
+    CF challenge-platform / Turnstile sandwiches → managed_challenge or turnstile so
+    the scorer zeros content_success even on HTTP 200.
+    """
+    if error_kind in {"challenge_blocked", "challenge_block"}:
         return "challenge_blocked"
     text = f"{markdown}\n{html}".lower()
     if http_status in {401, 403} and any(m in text for m in ("captcha", "cf-", "challenge")):
         return "challenge_blocked"
+    if any(
+        m in text
+        for m in (
+            "cf-turnstile",
+            "challenges.cloudflare.com",
+            "turnstile/v0",
+            "/turnstile/",
+        )
+    ) and any(
+        m in text
+        for m in (
+            "challenge-platform",
+            "cdn-cgi/challenge-platform",
+            "checking your browser",
+            "just a moment",
+            "verification failed",
+            "verification expired",
+            "cf-turnstile",
+            "turnstile",
+        )
+    ):
+        return "turnstile"
     if any(m in text for m in ("hcaptcha", "recaptcha", "captcha-box", "g-recaptcha")):
         return "captcha_surface"
     if any(
         m in text
         for m in (
+            "challenge-platform",
+            "cdn-cgi/challenge-platform",
             "checking your browser",
             "just a moment",
             "cf-browser-verification",
             "cf-challenge",
             "attention required",
+            "verification failed",
+            "verification expired",
+            "managed challenge",
         )
     ):
-        return "interstitial"
+        return "managed_challenge"
     if any(m in text for m in ("sign in to continue", "login required", "log in to continue")):
         return "login_wall"
     if "please enable javascript" in text or "enable javascript to continue" in text:

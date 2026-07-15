@@ -85,10 +85,16 @@ _BUDGET_MARKERS = (
 _CHALLENGE_BODY_MARKERS = (
     "checking your browser",
     "just a moment",
+    "challenge-platform",
+    "cdn-cgi/challenge-platform",
+    "challenges.cloudflare.com",
     "cf-browser-verification",
     "cf-challenge",
+    "cf-turnstile",
     "attention required",
     "verify you are human",
+    "verification failed",
+    "verification expired",
     "hcaptcha",
     "recaptcha",
     "please enable javascript",
@@ -929,21 +935,54 @@ def classify_challenge_body(
     markdown: str = "",
     html: str = "",
 ) -> str:
-    """Classify anti-bot / interstitial beyond bare HTTP."""
+    """Classify anti-bot / interstitial beyond bare HTTP.
+
+    CF challenge-platform / Turnstile sandwiches are labeled managed_challenge
+    or turnstile so hard scoring can zero content_success (VAL-HARD-002/004/006).
+    """
     text = f"{markdown}\n{html}".lower()
+    # Turnstile residual before generic captcha (taostats probe often embeds both).
+    if any(
+        m in text
+        for m in (
+            "cf-turnstile",
+            "challenges.cloudflare.com",
+            "turnstile/v0",
+            "/turnstile/",
+            "data-sitekey",
+        )
+    ) and any(
+        m in text
+        for m in (
+            "challenge-platform",
+            "cdn-cgi/challenge-platform",
+            "checking your browser",
+            "just a moment",
+            "verification failed",
+            "verification expired",
+            "cf-turnstile",
+            "turnstile",
+        )
+    ):
+        return "turnstile"
     if any(m in text for m in ("hcaptcha", "recaptcha", "captcha-box", "g-recaptcha")):
         return "captcha_surface"
     if any(
         m in text
         for m in (
+            "challenge-platform",
+            "cdn-cgi/challenge-platform",
             "checking your browser",
             "just a moment",
             "cf-browser-verification",
             "cf-challenge",
             "attention required",
+            "verification failed",
+            "verification expired",
+            "managed challenge",
         )
     ):
-        return "interstitial"
+        return "managed_challenge"
     if any(m in text for m in ("sign in to continue", "login required", "log in to continue")):
         return "login_wall"
     if "please enable javascript" in text or "enable javascript to continue" in text:
