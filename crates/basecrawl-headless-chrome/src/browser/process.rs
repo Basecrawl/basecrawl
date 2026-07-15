@@ -80,6 +80,29 @@ impl Drop for TemporaryProcess {
     }
 }
 
+/// Default Chrome security sandbox policy for process launch.
+///
+/// Non-root hosts keep the sandbox enabled. Processes that are running as root
+/// (common in containers / CI / TEE guests) must pass `--no-sandbox` or Chrome
+/// refuses to start. Detect that at default construction time so `Browser::default()`
+/// and hermetic integration tests stay usable without weakening non-root launches.
+fn default_sandbox_enabled() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid is a pure libc read of the calling process credentials.
+        // Declared locally so we do not need an extra dependency just for euid.
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        // SAFETY: geteuid has no preconditions beyond a normal process context.
+        unsafe { geteuid() != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Represents the way in which Chrome is run. By default it will search for a Chrome
 /// binary on the system, use an available port for debugging, and start in headless mode.
 #[derive(Clone, Debug, Builder, PartialEq, Eq)]
@@ -89,7 +112,8 @@ pub struct LaunchOptions<'a> {
     pub headless: bool,
 
     /// Determines whether to run the browser with a sandbox.
-    #[builder(default = "true")]
+    /// Defaults to true for non-root processes; false when euid is 0 (root).
+    #[builder(default = "default_sandbox_enabled()")]
     pub sandbox: bool,
 
     /// Automatically open devtools for tabs. Forces headless to be false
@@ -182,7 +206,7 @@ impl Default for LaunchOptions<'_> {
         LaunchOptions {
             headless: true,
             devtools: false,
-            sandbox: true,
+            sandbox: default_sandbox_enabled(),
             enable_gpu: false,
             enable_logging: false,
             idle_browser_timeout: Duration::from_secs(30),
