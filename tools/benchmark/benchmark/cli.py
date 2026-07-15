@@ -1,13 +1,15 @@
-"""CLI entry for schema validate + offline rescore.
+"""CLI entry for schema validate + offline rescore + basecrawl adapter.
 
 Usage (from repo root or tools/benchmark)::
 
     python -m benchmark rescore --artifacts fixtures/artifacts
     python -m benchmark validate --path fixtures/artifacts/soft-basecrawl-example.json
     python -m benchmark score --path fixtures/artifacts/soft-basecrawl-example.json
+    python -m benchmark basecrawl --url https://example.com/ --path-mode soft
+    python -m benchmark basecrawl --url https://example.com/ --dry-run
 
-Live scrape adapters are separate features; this CLI never dials network
-vendors for rescore mode.
+Rescore is offline and never calls Firecrawl or Oxylabs. Live residential
+basecrawl path is max 1 concurrent; secrets stay in mode-600 ``.env``.
 """
 
 from __future__ import annotations
@@ -19,7 +21,14 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__
+from .basecrawl_adapter import (
+    PROFILE_HARD,
+    PROFILE_SOFT,
+    BasecrawlAdapter,
+    BasecrawlAdapterConfig,
+)
 from .formats import CORE_FORMATS, EXCLUDED_CORE_FORMATS, request_core_formats
+from .redact import looks_like_secret_leak, redact_text
 from .rescore import digests_equal, rescore_artifacts, rescore_directory, write_scoreboard
 from .schema import (
     CORE_DIMENSIONS,
@@ -35,8 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="benchmark",
         description=(
-            "basecrawl competitive scrape benchmark — common schema + scorer. "
-            "Rescore is offline and never calls Firecrawl or Oxylabs."
+            "basecrawl competitive scrape benchmark — common schema + scorer + "
+            "basecrawl adapter. Rescore is offline and never calls Firecrawl or Oxylabs."
         ),
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -93,6 +102,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-stable",
         action="store_true",
         help="Run rescore twice and exit non-zero if digests differ",
+    )
+
+    bc = sub.add_parser(
+        "basecrawl",
+        help="Run basecrawl adapter into common schema (soft/hard/residential)",
+    )
+    bc.add_argument("--url", required=True, help="Target URL to scrape")
+    bc.add_argument(
+        "--path-mode",
+        choices=("soft", "hard", "residential"),
+        default="soft",
+        help="soft=direct/--no-js; hard=--force-browser; residential=Oxylabs max1",
+    )
+    bc.add_argument(
+        "--profile-id",
+        default=None,
+        help="Matrix profile id (default: P1 soft or P3 hard/residential)",
+    )
+    bc.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Hermetic dry-run: no network; soft path does not require live proxy",
+    )
+    bc.add_argument("--binary", default=None, help="Path to basecrawl binary")
+    bc.add_argument("--timeout", type=float, default=45.0, help="Scrape timeout seconds")
+    bc.add_argument(
+        "--proxy",
+        default=None,
+        help="Optional proxy URL (prefer env/.env; never commit secrets)",
+    )
+    bc.add_argument(
+        "--proxy-class",
+        default=None,
+        choices=("direct", "datacenter", "residential", "mobile"),
+    )
+    bc.add_argument("--proxy-session", default=None)
+    bc.add_argument("--proxy-country", default=None)
+    bc.add_argument("--force-browser", action="store_true")
+    bc.add_argument("--out", default=None, help="Write normalized JSON to this path")
+    bc.add_argument(
+        "--js-target",
+        action="store_true",
+        help="Mark result as JS-render target for scoring dimension",
     )
 
     info = sub.add_parser("info", help="Print core formats, dimensions, and weights")
@@ -234,6 +286,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         else:
             print(json.dumps(board, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "basecrawl":
+        path_mode = args.path_mode
+        profile_id = args.profile_id
+        if not profile_id:
+            profile_id = PROFILE_SOFT if path_mode == "soft" else PROFILE_HARD
+        cfg = BasecrawlAdapterConfig(
+            binary=args.binary,
+            profile_id=profile_id,
+            timeout_s=float(args.timeout),
+            path_mode=path_mode,
+            force_browser=bool(args.force_browser) or path_mode in {"hard", "residential"},
+            proxy_url=args.proxy,
+            proxy_class=args.proxy_class
+            or ("residential" if path_mode == "residential" else None),
+            proxy_session=args.proxy_session,
+            proxy_country=args.proxy_country,
+            dry_run=bool(args.dry_run),
+            js_target=bool(args.js_target),
+            no_js=(path_mode == "soft" and not args.force_browser),
+        )
+        adapter = BasecrawlAdapter(cfg)
+        result = adapter.scrape(args.url)
+        payload = result.to_dict()
+        # Secret hygiene on dump
+        serialized = redact_text(json.dumps(payload, indent=2, sort_keys=True))
+        if looks_like_secret_leak(serialized):
+            # Fail closed: do not print leaked material
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "refusing to emit adapter payload: secret leak detected after redaction",
+                        "url": args.url,
+                        "error_class": "policy_skip",
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 3
+        payload = json.loads(serialized)
+        if args.out:
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(serialized + "\n", encoding="utf-8")
+        print(serialized)
+        # Non-zero when credential_error and credentials were expected (residential/hard with proxy).
+        if result.error_class == "credential_error" and path_mode in {"residential"}:
+            return 1
+        if result.error_class == "engine_unavailable":
+            return 1
         return 0
 
     parser.error(f"unknown command {args.command}")

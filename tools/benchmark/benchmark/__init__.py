@@ -1,4 +1,4 @@
-"""basecrawl competitive scrape benchmark harness (schema + scorer).
+"""basecrawl competitive scrape benchmark harness (schema + scorer + adapters).
 
 Tracked under ``tools/benchmark/``. Live scoreboards land only under
 gitignored ``.docs-evidence/benchmark/``. Core fairness formats are
@@ -6,6 +6,16 @@ gitignored ``.docs-evidence/benchmark/``. Core fairness formats are
 Firecrawl interact are excluded from core scoring.
 """
 
+from .basecrawl_adapter import (
+    PROFILE_HARD,
+    PROFILE_RESIDENTIAL,
+    PROFILE_SOFT,
+    BasecrawlAdapter,
+    BasecrawlAdapterConfig,
+    classify_challenge,
+    map_basecrawl_error_kind,
+    normalize_proof_file,
+)
 from .formats import (
     CORE_FORMATS,
     EXCLUDED_CORE_FORMATS,
@@ -14,6 +24,9 @@ from .formats import (
     normalize_format_token,
     request_core_formats,
 )
+from .redact import collect_secret_fragments, redact_text
+from .rescore import rescore_artifacts, rescore_directory
+from .residential_limit import ResidentialConcurrencyError, residential_slot
 from .schema import (
     CHALLENGE_CLASSES,
     CORE_DIMENSIONS,
@@ -32,7 +45,6 @@ from .scorer import (
     score_result,
     score_results,
 )
-from .rescore import rescore_artifacts, rescore_directory
 
 __all__ = [
     "CORE_FORMATS",
@@ -57,6 +69,18 @@ __all__ = [
     "score_results",
     "rescore_artifacts",
     "rescore_directory",
+    "BasecrawlAdapter",
+    "BasecrawlAdapterConfig",
+    "PROFILE_SOFT",
+    "PROFILE_HARD",
+    "PROFILE_RESIDENTIAL",
+    "classify_challenge",
+    "map_basecrawl_error_kind",
+    "normalize_proof_file",
+    "collect_secret_fragments",
+    "redact_text",
+    "ResidentialConcurrencyError",
+    "residential_slot",
 ]
 
 __version__ = "0.1.0"

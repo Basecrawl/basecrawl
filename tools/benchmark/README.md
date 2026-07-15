@@ -2,7 +2,7 @@
 
 Tracked tools under `basecrawl/tools/benchmark/` for fair **basecrawl** vs **Firecrawl** head-to-head (**H2H**) scoring.
 
-**This leaf** delivers the common **NormalizedResult** schema, multi-dimension **scorer** (0–1 dims + aggregates), and **offline re-score** from saved artifacts. Engine adapters and live matrix runner arrive in follow-on features.
+Delivers the common **NormalizedResult** schema, multi-dimension **scorer** (0–1 dims + aggregates), **offline re-score**, and the **basecrawl adapter** (soft direct, hard Chromium, optional residential Oxylabs with max 1 concurrent dial). Firecrawl adapter + matrix runner arrive in follow-on features.
 
 ## Honesty (read first)
 
@@ -70,6 +70,18 @@ python -m benchmark rescore --artifacts fixtures/artifacts --check-stable
 mkdir -p ../../.docs-evidence/benchmark
 python -m benchmark rescore --artifacts fixtures/artifacts \
   --out ../../.docs-evidence/benchmark --basename scoreboard-fixture-rescore
+
+# basecrawl adapter — hermetic soft dry-run (no Oxylabs required)
+python -m benchmark basecrawl --url https://example.com/ --path-mode soft --dry-run
+
+# basecrawl adapter — soft live scrape (direct/--no-js; uses release binary if present)
+python -m benchmark basecrawl --url https://example.com/ --path-mode soft --out /tmp/soft.json
+
+# basecrawl adapter — hard Chromium path
+python -m benchmark basecrawl --url https://quotes.toscrape.com/js/ --path-mode hard --js-target
+
+# residential optional (max 1 concurrent; secrets from mode-600 .env only)
+# python -m benchmark basecrawl --url https://example.com/ --path-mode residential
 ```
 
 Focused tests:
@@ -78,6 +90,16 @@ Focused tests:
 cd tools/benchmark
 python -m pytest tests/ -q
 ```
+
+## basecrawl adapter notes
+
+| path_mode | CLI flags | Concurrent residential | Live `.env` |
+| --- | --- | --- | --- |
+| `soft` | `--no-js` (default) | n/a | not required |
+| `hard` | `--force-browser` | n/a unless residential class | not required |
+| `residential` | `--force-browser` + `--proxy-class residential` | **1** | Oxylabs via `.env` |
+
+Normalized fields always include `challenge_class`, `status_class`, `fetch_path`, `proxy_class`, and redacted error text. Credential/proxy-auth failures are typed `credential_error` and never content success. ScrapeProof / attestation are **secondary** dimensions only.
 
 ## Matrix profiles (summary)
 
