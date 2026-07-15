@@ -105,6 +105,21 @@ pub enum Error {
     #[error("required proxy class '{required}' unavailable: {detail}")]
     ProxyClassUnavailable { required: String, detail: String },
 
+    /// Upstream HTTP CONNECT / SOCKS auth or product ACL rejected the tunnel before origin TLS.
+    /// Distinct from origin challenge_blocked (VAL-OXY-003): CONNECT 403/407 is dial residual.
+    #[error("proxy CONNECT rejected ({class}): {detail}")]
+    ProxyConnect {
+        /// Upstream CONNECT status when known (407 auth, 403 product ACL, etc.).
+        status: Option<u16>,
+        /// Stable class: `proxy_auth_error` | `proxy_acl_error` | `proxy_connect_error`.
+        class: String,
+        detail: String,
+    },
+
+    /// Live residential concurrency hard-cap exceeded (max 1 concurrent session family).
+    #[error("residential dial concurrency limit exceeded: {detail}")]
+    ResidentialConcurrency { detail: String },
+
     /// Hard / residential identity path refused a dual-stack or soft-only fallback
     /// (VAL-STEALTH-001/017). Configuration or `--no-js` conflicted with the required class.
     #[error("hard path policy error: {0}")]
@@ -197,6 +212,14 @@ impl Error {
             Error::InvalidActions(_) => "invalid_actions",
             Error::InvalidProxy(_) => "invalid_proxy",
             Error::ProxyClassUnavailable { .. } => "proxy_class_unavailable",
+            Error::ProxyConnect { class, .. } => match class.as_str() {
+                // Auth rejects stay a dedicated credential surface; product CONNECT ACL and
+                // other CONNECT refuses stay transport_error so operator tooling never confuses
+                // them with origin challenge_blocked (VAL-OXY-003).
+                "proxy_auth_error" | "credential_error" => "proxy_auth_error",
+                _ => "transport_error",
+            },
+            Error::ResidentialConcurrency { .. } => "residential_concurrency",
             Error::HardPath(_) => "hard_path_policy",
             Error::TlsImpersonate(_) => "tls_impersonate_unsupported",
             Error::ChallengeBlocked { .. } => "challenge_blocked",
@@ -312,6 +335,21 @@ impl Error {
                     Value::String(required.clone()),
                 );
             }
+            Error::ProxyConnect { status, class, .. } => {
+                if let Some(code) = status {
+                    obj.insert("status_code".into(), Value::Number((*code).into()));
+                }
+                obj.insert("failure_class".into(), Value::String(class.clone()));
+                // Never origin challenge taxonomy for CONNECT rejects.
+                obj.insert(
+                    "proxy_stage".into(),
+                    Value::String("connect_handshake".into()),
+                );
+            }
+            Error::ResidentialConcurrency { .. } => {
+                obj.insert("failure_class".into(), Value::String("max1".into()));
+                obj.insert("max_concurrent".into(), Value::Number(1_u64.into()));
+            }
             Error::TlsImpersonate(detail) => {
                 obj.insert("capability".into(), Value::String("tls_impersonate".into()));
                 obj.insert("reason".into(), Value::String(detail.clone()));
@@ -374,6 +412,8 @@ impl Error {
             // failed:") so host-visible messages stay stable under redaction. Strip any
             // residual URL-shaped text from the full Display string, not only the bare detail.
             Error::Transport(_)
+            | Error::ProxyConnect { .. }
+            | Error::ResidentialConcurrency { .. }
             | Error::Fetch(_)
             | Error::Render(_)
             | Error::DnsIsolation(_)

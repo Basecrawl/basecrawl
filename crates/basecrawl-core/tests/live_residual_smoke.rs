@@ -181,9 +181,10 @@ fn load_live_creds() -> Option<LiveCreds> {
     let user = env_first(&["OXYLABS_PROXY_USER"]);
     let pass = env_first(&["OXYLABS_PROXY_PASS"]);
     if let (Some(host), Some(user), Some(pass)) = (host, user, pass) {
+        let (host, port) = split_host_port_field(&host, 7777);
         return Some(LiveCreds {
             host,
-            port: 7777,
+            port,
             user,
             pass,
         });
@@ -217,15 +218,28 @@ fn load_live_creds() -> Option<LiveCreds> {
             map_first(&map, &["OXYLABS_PROXY_USER"]),
             map_first(&map, &["OXYLABS_PROXY_PASS"]),
         ) {
+            let (host, port) = split_host_port_field(&host, 7777);
             return Some(LiveCreds {
                 host,
-                port: 7777,
+                port,
                 user,
                 pass,
             });
         }
     }
     None
+}
+
+fn split_host_port_field(host: &str, default_port: u16) -> (String, u16) {
+    let host = host.trim();
+    if let Some((h, p)) = host.rsplit_once(':') {
+        if !h.is_empty() && !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = p.parse::<u16>() {
+                return (h.to_string(), port);
+            }
+        }
+    }
+    (host.to_string(), default_port)
 }
 
 /// Marketplace captcha-solve keys that must never be required for residual live smoke.
@@ -697,9 +711,18 @@ fn val_unlock_009_live_residual_smoke_identity_egress_only() {
             success = Some(out);
             break;
         }
+        if stderr.contains("proxy_acl_error")
+            || stderr.contains("proxy_auth_error")
+            || stderr.contains("CONNECT 403")
+            || stderr.contains("CONNECT 407")
+        {
+            last = Some(out);
+            break;
+        }
         let transient = stderr.contains("proxy CONNECT failed with HTTP status 502")
             || stderr.contains("proxy CONNECT failed with HTTP status 503")
             || stderr.contains("proxy CONNECT failed with HTTP status 504")
+            || stderr.contains("proxy_connect_error")
             || stderr.contains("\"kind\":\"transport_error\"");
         last = Some(out);
         if !transient {

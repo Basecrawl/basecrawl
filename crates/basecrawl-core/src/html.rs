@@ -14,6 +14,52 @@ use url::Url;
 
 use crate::error::Error;
 
+/// When the DoH-preserving composer surfaces an upstream CONNECT/SOCKS refuse through sealed
+/// SOCKS (`DnsIsolation` detail), map it back onto typed proxy residual classes.
+fn reclassify_composer_proxy_detail(detail: &str) -> Option<Error> {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("proxy_auth_error")
+        || lower.contains("authentication failed")
+        || lower.contains("proxy authentication required")
+        || lower.contains("connect 407")
+        || lower.contains("connect 401")
+    {
+        return Some(Error::ProxyConnect {
+            status: if lower.contains("401") {
+                Some(401)
+            } else {
+                Some(407)
+            },
+            class: "proxy_auth_error".to_string(),
+            detail: detail.to_string(),
+        });
+    }
+    if lower.contains("proxy_acl_error")
+        || lower.contains("connect 403")
+        || lower.contains("not allowed by ruleset")
+        || lower.contains("destination or product acl")
+    {
+        return Some(Error::ProxyConnect {
+            status: Some(403),
+            class: "proxy_acl_error".to_string(),
+            detail: detail.to_string(),
+        });
+    }
+    if lower.contains("residential concurrency") {
+        return Some(Error::ResidentialConcurrency {
+            detail: detail.to_string(),
+        });
+    }
+    if lower.contains("proxy_connect_error") || lower.contains("composer upstream dial failed") {
+        return Some(Error::ProxyConnect {
+            status: None,
+            class: "proxy_connect_error".to_string(),
+            detail: detail.to_string(),
+        });
+    }
+    None
+}
+
 /// Post-render DOM plus bounded browser-resource accounting.
 pub type RenderedPage = basecrawl_render::Rendered;
 
@@ -51,7 +97,16 @@ pub fn render_page_until(
             "scrape deadline exceeded while waiting for crawl delay".to_string(),
         )),
         Err(RenderError::ResourceBudgetExceeded) => Err(Error::ResourceBudgetExceeded),
-        Err(RenderError::DnsIsolation(detail)) => Err(Error::DnsIsolation(detail)),
+        Err(RenderError::DnsIsolation(detail)) => {
+            // Composer upstream CONNECT residual bubbles through sealed SOCKS as dns_isolation
+            // detail. Re-type proxy CONNECT auth/ACL so host-visible kind is not confused with
+            // origin challenge_blocked (VAL-OXY-003).
+            if let Some(err) = reclassify_composer_proxy_detail(&detail) {
+                Err(err)
+            } else {
+                Err(Error::DnsIsolation(detail))
+            }
+        }
         Err(RenderError::DocumentPolicyDenied(detail)) => {
             Err(Error::from_document_policy_denial(detail))
         }

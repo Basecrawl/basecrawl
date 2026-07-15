@@ -187,9 +187,10 @@ fn load_live_creds() -> Option<LiveCreds> {
     let user = env_first(&["OXYLABS_PROXY_USER"]);
     let pass = env_first(&["OXYLABS_PROXY_PASS"]);
     if let (Some(host), Some(user), Some(pass)) = (host, user, pass) {
+        let (host, port) = split_host_port_field(&host, 7777);
         return Some(LiveCreds {
             host,
-            port: 7777,
+            port,
             user,
             pass,
         });
@@ -223,15 +224,29 @@ fn load_live_creds() -> Option<LiveCreds> {
             map_first(&map, &["OXYLABS_PROXY_USER"]),
             map_first(&map, &["OXYLABS_PROXY_PASS"]),
         ) {
+            let (host, port) = split_host_port_field(&host, 7777);
             return Some(LiveCreds {
                 host,
-                port: 7777,
+                port,
                 user,
                 pass,
             });
         }
     }
     None
+}
+
+/// Tolerate `OXYLABS_PROXY_HOST=host:port` (common operator paste) without DNS-label failure.
+fn split_host_port_field(host: &str, default_port: u16) -> (String, u16) {
+    let host = host.trim();
+    if let Some((h, p)) = host.rsplit_once(':') {
+        if !h.is_empty() && !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = p.parse::<u16>() {
+                return (h.to_string(), port);
+            }
+        }
+    }
+    (host.to_string(), default_port)
 }
 
 /// Strip ambient proxy pollution and never inherit a parent gate unless explicitly set.
@@ -303,7 +318,16 @@ fn run_live(
         let transient = stderr.contains("proxy CONNECT failed with HTTP status 502")
             || stderr.contains("proxy CONNECT failed with HTTP status 503")
             || stderr.contains("proxy CONNECT failed with HTTP status 504")
+            || stderr.contains("proxy_connect_error")
             || stderr.contains("\"kind\":\"transport_error\"");
+        // Do NOT retry 403 ACL / 407 auth residuals — permanent product/auth, not gateway flake.
+        if stderr.contains("proxy_acl_error")
+            || stderr.contains("proxy_auth_error")
+            || stderr.contains("CONNECT 403")
+            || stderr.contains("CONNECT 407")
+        {
+            return last;
+        }
         if !transient {
             return last;
         }
@@ -564,9 +588,18 @@ fn val_proxy_031_live_residential_smoke_returns_200_and_non_local_exit() {
             break;
         }
         let stderr = String::from_utf8_lossy(&attempt_out.stderr).into_owned();
+        if stderr.contains("proxy_acl_error")
+            || stderr.contains("proxy_auth_error")
+            || stderr.contains("CONNECT 403")
+            || stderr.contains("CONNECT 407")
+        {
+            last_out = Some(attempt_out);
+            break;
+        }
         let transient = stderr.contains("proxy CONNECT failed with HTTP status 502")
             || stderr.contains("proxy CONNECT failed with HTTP status 503")
             || stderr.contains("proxy CONNECT failed with HTTP status 504")
+            || stderr.contains("proxy_connect_error")
             || stderr.contains("\"kind\":\"transport_error\"");
         last_out = Some(attempt_out);
         if !transient {

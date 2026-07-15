@@ -388,6 +388,26 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     };
     let proxy = proxy::resolve_proxy_plan(&proxy_plan, &url)?;
     let dialed_proxy_class = proxy::truthful_proxy_class(proxy.as_ref(), options.proxy_class)?;
+    // Live residual / commercial residential hard-cap = 1 concurrent dial family (VAL-OXY-005).
+    // Only arms when BASECRAWL_LIVE_PROXY is truthy so hermetic mock residential matrices can still
+    // run wider under the normal mission port range. Soft/datacenter never acquire the slot.
+    let live_proxy_gate = std::env::var("BASECRAWL_LIVE_PROXY")
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    let _residential_slot = if live_proxy_gate
+        && proxy.is_some()
+        && matches!(
+            options.proxy_class.or(Some(dialed_proxy_class)),
+            Some(basecrawl_proof::ProxyClass::Residential)
+                | Some(basecrawl_proof::ProxyClass::Mobile)
+        ) {
+        Some(proxy::acquire_residential_dial_slot("basecrawl-scrape")?)
+    } else {
+        None
+    };
     // Hard / residential identity policy (VAL-STEALTH-001/002/010/017):
     // residential|mobile or hard difficulty force the Chromium path; soft targets may stay rustls.
     let needs_browser_formats = formats

@@ -40,10 +40,14 @@ When country/session are set without a full template, dial identity appends:
 {user}-cc-{country}-sessid-{session}
 ```
 
+Supported placeholders for `--proxy-username-template`: `{user}` / `{username}`, `{country}` / `{cc}`, `{session}` / `{sessid}`.
+
+Prebuilt env usernames already carrying `-cc-US` (or `-sessid-…`) are **stripped to the customer base** before re-applying country/session tokens, so operators do not accidentally double-decorate to `…-cc-US-cc-US`.
+
 Example embedding (provider-specific host, product syntax stays generic):
 
 ```bash
-export BASECRAWL_HTTPS_PROXY='http://customer-USER:PASS@proxy.example:7777'
+export BASECRAWL_HTTPS_PROXY='*********************************************
 basecrawl \
   --proxy-session my-session-1 \
   --proxy-country US \
@@ -51,6 +55,10 @@ basecrawl \
   --formats markdown,metadata \
   https://example.com/
 ```
+
+`BASECRAWL_HTTP_PROXY` / `BASECRAWL_HTTPS_PROXY` construction accepts standard
+`http://user:pass@host:port` userinfo. Live residential max concurrency is **1**
+when `BASECRAWL_LIVE_PROXY=1` arms commercial dials.
 
 ### Class honesty
 
@@ -118,6 +126,18 @@ Challenges and captcha pages are **detect-not-solve** (`challenge_blocked`). The
 ### Gated live residual smoke (identity/egress only)
 
 Optional live residential residual smoke (`BASECRAWL_LIVE_PROXY=1`, max **1** concurrent dial family) exercises modern hard-path identity and truthful egress labels only. Secrets load from gitignored `.env` / process env (mode `600`). With the gate **off**, live residual cases **skip cleanly**; hermetic residual honesty stays primary. Live residual outcomes **never** claim commercial unlocker parity and **never** require captcha marketplace keys (2captcha / CapSolver / Anti-Captcha, etc.).
+
+### CONNECT residual vs origin challenge
+
+Upstream HTTP CONNECT failures are **dial residuals**, not origin bot-challenge classification:
+
+| CONNECT status | Product kind / failure_class | Not |
+| --- | --- | --- |
+| 407 / 401 | `proxy_auth_error` | `challenge_blocked` |
+| 403 | `transport_error` / `proxy_acl_error` (destination or product ACL) | Cloudflare / origin challenge |
+| other non-200 | `transport_error` / `proxy_connect_error` | content_success with residential claim |
+
+Hard-shield note (2026-07-15): a taostats residential probe that failed with CONNECT 403 while geo endpoints returned CONNECT 200 is a **product/destination ACL residual**, not evidence that taostats Cloudflare defeated residential scrapes. Origin challenge markers are evaluated only after CONNECT establishes and an origin body is in hand. Mission diary: gitignored `.docs-evidence/hard-shield/oxylabs-connect-403-residual.md`.
 
 ## Residual risks (operator)
 

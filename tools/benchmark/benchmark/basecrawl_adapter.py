@@ -71,12 +71,17 @@ _CREDENTIAL_MARKERS = (
     "auth failed",
     "invalid credentials",
     "proxy_auth",
+    "proxy_auth_error",
+    "proxy_acl_error",
     "unauthorized",
     "proxy class",
     "proxy_class_unavailable",
+    "residential_concurrency",
     "login failed",
     "incorrect password",
     "access denied by proxy",
+    "connect 403",
+    "product acl",
 )
 
 

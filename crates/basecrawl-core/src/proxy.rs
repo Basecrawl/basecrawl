@@ -13,10 +13,74 @@ use basecrawl_seal::{OriginDialer, SealError, SealedSocksProxy};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use url::Url;
 use zeroize::Zeroizing;
+
+/// Max concurrent live residential dial family (product spend / session pool).
+/// Enforced for residential|mobile class dials when acquired; hermetic mocks may share wider
+/// concurrency so long as each scrapes its own carrier, but live packs must stay at 1
+/// (VAL-OXY-005). Soft/direct paths never acquire this slot.
+pub const MAX_LIVE_RESIDENTIAL_CONCURRENT: usize = 1;
+
+/// Process-wide max-1 residential dial family guard. Tests reset via
+/// [`reset_residential_concurrency_for_tests`].
+fn residential_slot_state() -> &'static Mutex<Option<&'static str>> {
+    static SLOT: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// RAII guard holding the residential concurrent-dial slot (max 1).
+///
+/// Drop releases the slot. Nested fails closed with [`Error::ResidentialConcurrency`].
+#[derive(Debug)]
+pub struct ResidentialDialGuard {
+    _private: (),
+}
+
+impl Drop for ResidentialDialGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = residential_slot_state().lock() {
+            *g = None;
+        }
+    }
+}
+
+/// Acquire the live residential dial slot. Refuses N>1 concurrent holders (VAL-OXY-005).
+///
+/// Call this around a residential/mobile dial family when the operator gates live commercial
+/// spend (or when product surfaces want the same hard cap). Hermetic soft-path unit tests do not
+/// need it unless they simulate the live residual harness.
+pub fn acquire_residential_dial_slot(owner: &'static str) -> Result<ResidentialDialGuard, Error> {
+    let mut g = residential_slot_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(held) = *g {
+        return Err(Error::ResidentialConcurrency {
+            detail: format!(
+                "refusing concurrent residential dial (holder={held}, requested={owner}); max={MAX_LIVE_RESIDENTIAL_CONCURRENT}"
+            ),
+        });
+    }
+    *g = Some(owner);
+    Ok(ResidentialDialGuard { _private: () })
+}
+
+/// Test-only: clear a stuck residential slot after panic/injection (never use in production).
+pub fn reset_residential_concurrency_for_tests() {
+    if let Ok(mut g) = residential_slot_state().lock() {
+        *g = None;
+    }
+}
+
+/// True while a residential dial slot is held in this process.
+pub fn residential_dial_slot_held() -> bool {
+    residential_slot_state()
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
 
 /// Upstream proxy protocol family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,14 +121,77 @@ pub struct UsernameTemplateOptions {
     pub template: Option<String>,
 }
 
+/// Strip already-rendered `-cc-` / `-sessid-` material so template re-apply does not double
+/// decorate usernames (`customer-x-cc-US` + country US ≠ `…-cc-US-cc-US`).
+///
+/// Pure customer base is preserved; suffix tokens after the first `-cc-` or `-sessid-` delimiter
+/// are treated as prior template material (VAL-OXY-001/002).
+pub fn strip_username_template_tokens(username: &str) -> String {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut cut = trimmed.len();
+    if let Some(idx) = trimmed.find("-cc-") {
+        cut = cut.min(idx);
+    }
+    if let Some(idx) = trimmed.find("-sessid-") {
+        cut = cut.min(idx);
+    }
+    // Also tolerate matching tokens embedded with different case.
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(idx) = lower.find("-cc-") {
+        cut = cut.min(idx);
+    }
+    if let Some(idx) = lower.find("-sessid-") {
+        cut = cut.min(idx);
+    }
+    trimmed[..cut].trim_end_matches('-').to_string()
+}
+
+/// Parse a -cc- / -sessid- decorated username for host-visible diagnostics (no password).
+pub fn parse_username_template_tokens(username: &str) -> (Option<String>, Option<String>) {
+    let country = username.split("-cc-").nth(1).and_then(|rest| {
+        let end = rest
+            .find("-sessid-")
+            .or_else(|| rest.find("-cc-"))
+            .unwrap_or(rest.len());
+        let token = rest[..end].trim_matches('-');
+        let token = token.split('-').next().unwrap_or(token);
+        if token.is_empty() {
+            None
+        } else {
+            Some(token.to_string())
+        }
+    });
+    let session = username
+        .split("-sessid-")
+        .nth(1)
+        .map(|rest| {
+            rest.split('-')
+                .take_while(|p| !p.eq_ignore_ascii_case("cc") && !p.eq_ignore_ascii_case("sessid"))
+                .collect::<Vec<_>>()
+                .join("-")
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty());
+    (country, session)
+}
+
 /// Resolve optional variables against a base username and produce the dial-time username.
 ///
 /// Returns `None` when neither a base username nor a non-empty rendered template is available.
+/// Default composition when country/session are set without a full template:
+/// `{user}-cc-{country}-sessid-{session}` (provider-agnostic; Oxylabs-compatible).
 pub fn render_username(
     base_username: Option<&str>,
     options: &UsernameTemplateOptions,
 ) -> Result<Option<String>, Error> {
-    let base = base_username.unwrap_or("").trim();
+    let raw_base = base_username.unwrap_or("").trim();
+    // Strip prior decoration so env URLs that already embed `-cc-US` can still accept
+    // `--proxy-country` / `--proxy-session` without double tokens (hard-shield residual fix).
+    let base = strip_username_template_tokens(raw_base);
     let country = options
         .country
         .as_deref()
@@ -85,8 +212,8 @@ pub fn render_username(
         if tpl.contains('{') {
             // Require known placeholders only — prevent accidental credential injection shapes.
             let mut out = tpl.to_string();
-            out = out.replace("{user}", base);
-            out = out.replace("{username}", base);
+            out = out.replace("{user}", &base);
+            out = out.replace("{username}", &base);
             out = out.replace("{country}", country.unwrap_or(""));
             out = out.replace("{cc}", country.unwrap_or(""));
             out = out.replace("{session}", session.unwrap_or(""));
@@ -107,10 +234,12 @@ pub fn render_username(
     }
 
     if country.is_none() && session.is_none() {
-        if base.is_empty() {
+        // Preserve original username when no template knobs requested (operator may ship
+        // pre-decorated env userinfo like `customer-x-cc-US`).
+        if raw_base.is_empty() {
             return Ok(None);
         }
-        return Ok(Some(base.to_string()));
+        return Ok(Some(raw_base.to_string()));
     }
 
     if base.is_empty() {
@@ -120,7 +249,7 @@ pub fn render_username(
         ));
     }
 
-    let mut out = base.to_string();
+    let mut out = base;
     if let Some(cc) = country {
         // Provider-agnostic country token (compatible with Oxylabs-style `-cc-US` and hermetic mock).
         out.push_str("-cc-");
@@ -427,6 +556,9 @@ fn resolve_proxy_endpoint(host: &str, port: u16, timeout: Duration) -> Result<So
     // IP literals and localhost short-circuit without host DNS (keeps hermetic loopback mocks
     // working without DoH). Remote proxy hostnames use system resolution here because the dial
     // target is the commercial/mock *proxy* itself, not the origin (origin remains CONNECT/SOCKS).
+    // Tolerate accidental `host:port` concatenation in OXYLABS_PROXY_HOST-style fields so the
+    // dialer never treats `pr.example:7777` as a DNS label (hard-shield residual).
+    let (host, port) = split_host_port_if_embedded(host, port);
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
@@ -438,7 +570,8 @@ fn resolve_proxy_endpoint(host: &str, port: u16, timeout: Duration) -> Result<So
     }
     let start = Instant::now();
     loop {
-        let result = std::net::ToSocketAddrs::to_socket_addrs(&(host, port));
+        use std::net::ToSocketAddrs;
+        let result = (host.as_str(), port).to_socket_addrs();
         match result {
             Ok(mut iter) => {
                 if let Some(addr) = iter.next() {
@@ -493,14 +626,40 @@ fn http_connect(
     if status == 200 {
         return Ok(stream);
     }
-    if status == 407 {
-        return Err(Error::Transport(
-            "proxy authentication required or rejected (CONNECT 407)".to_string(),
-        ));
+    Err(classify_connect_status(status))
+}
+
+/// Map upstream CONNECT status into typed proxy failures (VAL-OXY-003).
+///
+/// * 407 / 401 → `proxy_auth_error` (credentials / sub-user reject)
+/// * 403 → `proxy_acl_error` (product/destination ACL residual, **not** origin challenge)
+/// * other non-200 → `proxy_connect_error` under transport_error kind
+///
+/// Never returns [`Error::ChallengeBlocked`]: origin antibot classification only applies after a
+/// successful tunnel + origin response body is in hand.
+pub fn classify_connect_status(status: u16) -> Error {
+    match status {
+        407 | 401 => Error::ProxyConnect {
+            status: Some(status),
+            class: "proxy_auth_error".to_string(),
+            detail: format!(
+                "proxy authentication required or rejected (CONNECT {status}); \
+not an origin challenge"
+            ),
+        },
+        403 => Error::ProxyConnect {
+            status: Some(status),
+            class: "proxy_acl_error".to_string(),
+            detail: "proxy CONNECT refused destination or product ACL (CONNECT 403); \
+dial/product residual, not Cloudflare/origin challenge classification"
+                .to_string(),
+        },
+        other => Error::ProxyConnect {
+            status: Some(other),
+            class: "proxy_connect_error".to_string(),
+            detail: format!("proxy CONNECT failed with HTTP status {other}"),
+        },
     }
-    Err(Error::Transport(format!(
-        "proxy CONNECT failed with HTTP status {status}"
-    )))
 }
 
 fn basic_proxy_authorization(proxy: &ProxyConfig) -> Option<String> {
@@ -641,9 +800,18 @@ fn socks5_connect(
         ));
     }
     if head[1] != 0x00 {
+        // Ruleset / auth-like rules refuse map to proxy ACL class, not origin challenge.
+        if head[1] == 0x02 {
+            return Err(Error::ProxyConnect {
+                status: None,
+                class: "proxy_acl_error".to_string(),
+                detail: "SOCKS5 connection not allowed by ruleset (proxy ACL residual; \
+not an origin challenge)"
+                    .to_string(),
+            });
+        }
         let msg = match head[1] {
             0x01 => "general SOCKS server failure",
-            0x02 => "connection not allowed by ruleset",
             0x03 => "network unreachable",
             0x04 => "host unreachable",
             0x05 => "connection refused",
@@ -652,7 +820,11 @@ fn socks5_connect(
             0x08 => "address type not supported",
             _ => "SOCKS5 CONNECT failed",
         };
-        return Err(Error::Transport(msg.to_string()));
+        return Err(Error::ProxyConnect {
+            status: None,
+            class: "proxy_connect_error".to_string(),
+            detail: msg.to_string(),
+        });
     }
     // Drain bound address from the reply so the byte stream starts at origin traffic.
     match head[3] {
@@ -701,9 +873,12 @@ fn socks5_userpass_auth(
     let mut status = [0u8; 2];
     read_exact_deadline(stream, &mut status, deadline)?;
     if status[0] != 0x01 || status[1] != 0x00 {
-        return Err(Error::Transport(
-            "SOCKS5 username/password authentication failed".to_string(),
-        ));
+        return Err(Error::ProxyConnect {
+            status: None,
+            class: "proxy_auth_error".to_string(),
+            detail: "SOCKS5 username/password authentication failed (not an origin challenge)"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -767,6 +942,33 @@ fn classify_proxy_io(error: std::io::Error) -> Error {
     }
 }
 
+/// When `host` already contains `name:port`, prefer that port over the separate argument so
+/// env mistakes like `OXYLABS_PROXY_HOST=pr.oxylabs.io:7777` still dial cleanly.
+fn split_host_port_if_embedded(host: &str, port: u16) -> (String, u16) {
+    let host = host.trim();
+    // IPv6 literals like `[::1]:7777`
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some((inside, after)) = rest.split_once(']') {
+            if let Some(p) = after.strip_prefix(':') {
+                if let Ok(parsed) = p.parse::<u16>() {
+                    return (inside.to_string(), parsed);
+                }
+            }
+            return (inside.to_string(), port);
+        }
+    }
+    if let Some((h, p)) = host.rsplit_once(':') {
+        // Only treat as host:port when the right side is purely digits and left is non-empty
+        // non-IPv6 (no other colon). Avoid mangling raw IPv6 without brackets.
+        if !h.is_empty() && !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(parsed) = p.parse::<u16>() {
+                return (h.to_string(), parsed);
+            }
+        }
+    }
+    (host.to_string(), port)
+}
+
 /// Soft-path [`ProxyConfig`] adapted as a sealed-SOCKS [`OriginDialer`].
 ///
 /// Used by the Chromium DoH-preserving composer so sticky session / country username templates
@@ -794,9 +996,29 @@ impl OriginDialer for ComposerOriginDialer {
         let port = addr.port();
         self.proxy
             .connect_to_target(&host, port, deadline)
-            .map_err(|err| SealError::Dns {
-                detail: format!("composer upstream dial failed: {err}"),
-            })
+            .map_err(map_proxy_error_to_seal)
+    }
+}
+
+/// Map soft-path proxy errors into sealed composer dial failures without loss of stage labels.
+///
+/// Keep CONNECT auth/ACL residual language intact (no `challenge` wording) so a hard-path
+/// Chromium failure through the composer is still classified as dial residual, not origin
+/// Cloudflare classification (VAL-OXY-003).
+fn map_proxy_error_to_seal(err: Error) -> SealError {
+    match err {
+        Error::ProxyConnect { class, detail, .. } => SealError::Dns {
+            detail: format!("composer upstream dial failed ({class}): {detail}"),
+        },
+        Error::ResidentialConcurrency { detail } => SealError::Dns {
+            detail: format!("composer residential concurrency refused: {detail}"),
+        },
+        Error::ProxyClassUnavailable { required, detail } => SealError::Dns {
+            detail: format!("composer proxy class unavailable ({required}): {detail}"),
+        },
+        other => SealError::Dns {
+            detail: format!("composer upstream dial failed: {other}"),
+        },
     }
 }
 
@@ -913,6 +1135,26 @@ mod tests {
     }
 
     #[test]
+    fn username_template_does_not_double_decorate_prebuilt_cc_user() {
+        // Env commonly stores customer-x-cc-US already; --proxy-country US + session must not
+        // produce customer-x-cc-US-cc-US-sessid-…
+        let rendered = render_username(
+            Some("customer-USER-cc-US"),
+            &UsernameTemplateOptions {
+                country: Some("US".into()),
+                session: Some("S1".into()),
+                template: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rendered.as_deref(), Some("customer-USER-cc-US-sessid-S1"));
+        assert_eq!(
+            rendered.as_ref().map(|s| s.matches("-cc-").count()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn username_template_placeholders() {
         let rendered = render_username(
             Some("cust"),
@@ -924,6 +1166,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rendered.as_deref(), Some("user-cust-cc-DE-sessid-abc"));
+    }
+
+    #[test]
+    fn connect_403_is_proxy_acl_not_challenge() {
+        let err = classify_connect_status(403);
+        assert_eq!(err.kind(), "transport_error");
+        let json = err.to_json();
+        assert_eq!(json["error"]["failure_class"], "proxy_acl_error");
+        assert_eq!(json["error"]["status_code"], 403);
+        assert_eq!(json["error"]["proxy_stage"], "connect_handshake");
+        let s = err.to_json_string();
+        assert!(!s.contains("challenge_blocked"));
+        assert!(!s.contains("challenge_block"));
+    }
+
+    #[test]
+    fn connect_407_is_proxy_auth_error() {
+        let err = classify_connect_status(407);
+        assert_eq!(err.kind(), "proxy_auth_error");
+        assert_eq!(err.to_json()["error"]["failure_class"], "proxy_auth_error");
+    }
+
+    #[test]
+    fn residential_slot_max_one() {
+        reset_residential_concurrency_for_tests();
+        let g = acquire_residential_dial_slot("t1").expect("first slot");
+        assert!(residential_dial_slot_held());
+        let second = acquire_residential_dial_slot("t2");
+        assert!(second.is_err());
+        assert_eq!(second.unwrap_err().kind(), "residential_concurrency");
+        drop(g);
+        assert!(!residential_dial_slot_held());
+        let g2 = acquire_residential_dial_slot("t3").expect("after release");
+        drop(g2);
+        reset_residential_concurrency_for_tests();
     }
 
     #[test]
