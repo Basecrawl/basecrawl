@@ -20,7 +20,7 @@ artifact rows with the `profile_id` values above.
 | Scenario | What it runs | URLs | CI default? | Operator optional |
 | --- | --- | --- | --- | --- |
 | **P1** soft dual | basecrawl soft + firecrawl basic, **same** soft URL list + fair formats | `https://example.com/`, `https://books.toscrape.com/` (overrideable) | **yes** | no |
-| **P2** JS render | both engines against JS probe; `js_target=true` | `https://quotes.toscrape.com/js/` | **yes** (dry OK) | live dial optional |
+| **P2** JS render | both engines against JS probe; `js_target=true`; live basecrawl uses Chromium hard path (not hard-optional skip) | `https://quotes.toscrape.com/js/` | **yes** (required scoring; dry-safe + live when keys available) | hard *profile* remains optional separately |
 | **P3** medium/residential | basecrawl hard/residential + firecrawl medium optional | soft probes or operator URLs | **no** | **yes** (`--include-medium` / `--include-residential`) |
 | **P4** FC enhanced | firecrawl `--proxy enhanced` | soft probes | **no** | **yes** (`--include-enhanced`) |
 | **hard** | basecrawl hard optional | soft probe | **no** | **yes** (`--include-hard`) |

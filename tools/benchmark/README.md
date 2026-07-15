@@ -85,8 +85,10 @@ python -m benchmark matrix --scorer-only \
 python -m benchmark matrix --profiles P1,P2 --dry-run \
   --out ../../.docs-evidence/benchmark --basename scoreboard-matrix-dry
 
-# Soft dual live (keys in mode-600 .env; Firecrawl skip if key missing)
-# python -m benchmark matrix --profiles P1 --live --out ../../.docs-evidence/benchmark
+# Soft dual + JS live H2H (keys in mode-600 .env; Firecrawl skip if key missing;
+# hard optional profile typed-skips unless --include-hard)
+# python -m benchmark matrix --profiles P1,P2,hard --live \
+#   --out ../../.docs-evidence/benchmark --basename scoreboard-live-h2h
 
 # Optional hard + enhanced ceiling (operator)
 # python -m benchmark matrix --profiles P1,hard,P4 --live \

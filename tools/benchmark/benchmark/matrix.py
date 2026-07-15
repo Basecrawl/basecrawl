@@ -432,17 +432,28 @@ class MatrixRunner:
             load_dotenv=self.config.load_dotenv,
             enforce_residential_limit=True,
         )
-        # Optional hard without include → already typed skip upstream.
+        # Optional residential without include → typed skip (soft/JS never use this).
         if (
             path_mode == "residential"
             and not self.config.include_residential
             and not dry
         ):
-            return self._typed_skip_result(spec, "basecrawl", url, challenge="hard_optional_skipped")
-        if path_mode == "hard" and not dry and not (
-            self.config.include_hard or self.config.include_optional
+            return self._typed_skip_result(
+                spec, "basecrawl", url, challenge="hard_optional_skipped"
+            )
+        # Operator-optional hard profiles require --include-hard / --include-optional.
+        # P2 JS (ci_default, path_kind=js) is *required scoring*: Chromium hard path
+        # is the intentional live JS probe, not an optional hard-skip door.
+        if (
+            path_mode == "hard"
+            and not dry
+            and not (self.config.include_hard or self.config.include_optional)
+            and spec.path_kind != "js"
+            and (spec.operator_optional or spec.path_kind == "hard")
         ):
-            return self._typed_skip_result(spec, "basecrawl", url, challenge="hard_optional_skipped")
+            return self._typed_skip_result(
+                spec, "basecrawl", url, challenge="hard_optional_skipped"
+            )
 
         result = BasecrawlAdapter(adapter_cfg).scrape(url)
         # Enforce soft not labeled residential on success rows.

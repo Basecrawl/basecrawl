@@ -160,6 +160,95 @@ def test_p2_js_profile_marks_js_target(tmp_path: Path):
     assert sample["profile_id"] in DOCUMENTED_PROFILE_IDS
 
 
+def test_p2_live_flag_does_not_typed_skip_basecrawl_js(monkeypatch, tmp_path: Path):
+    """P2 is required scoring: live Chromium JS must dial, not hard_optional_skip.
+
+    VAL-BENCH-018 + live H2H leaf: soft+JS profiles require scoring; hard optional only.
+    """
+    from benchmark import matrix as matrix_mod
+    from benchmark.schema import CostEstimate, NormalizedResult, SCHEMA_VERSION
+
+    calls = []
+
+    def fake_scrape(self, url):  # noqa: ANN001
+        calls.append((self.config.path_mode, self.config.force_browser, url, self.config.js_target))
+        return NormalizedResult(
+            schema_version=SCHEMA_VERSION,
+            engine="basecrawl",
+            profile_id=self.config.profile_id,
+            url=url,
+            scoring_role="scoring",
+            content_success=True,
+            challenge_class="none",
+            status_class="2xx",
+            error_class="none",
+            fetch_path="chromium",
+            proxy_class="direct",
+            js_target=True,
+            formats_requested=["markdown", "html", "links"],
+            formats_produced=["markdown", "html", "links"],
+            markdown_body="Albert Einstein quote text from JS",
+            links=["https://quotes.toscrape.com/"],
+            http_status=200,
+            latency_ms=1200.0,
+            cost_estimate=CostEstimate(notes="test"),
+            proof_present=False,
+            attestation_present=False,
+            metadata={"fake": True},
+        )
+
+    monkeypatch.setattr(matrix_mod.BasecrawlAdapter, "scrape", fake_scrape)
+
+    def fake_fc(self, url):  # noqa: ANN001
+        return NormalizedResult(
+            schema_version=SCHEMA_VERSION,
+            engine="firecrawl",
+            profile_id="P2-soft-firecrawl-basic",
+            url=url,
+            scoring_role="scoring",
+            content_success=True,
+            challenge_class="none",
+            status_class="2xx",
+            error_class="none",
+            fetch_path="cloud",
+            proxy_class="basic",
+            js_target=True,
+            formats_requested=["markdown", "html", "links"],
+            formats_produced=["markdown"],
+            markdown_body="quote",
+            links=[],
+            http_status=200,
+            latency_ms=800.0,
+            cost_estimate=CostEstimate(firecrawl_credits=1.0, notes="test"),
+            proof_present=False,
+            attestation_present=False,
+            metadata={"fake": True},
+        )
+
+    monkeypatch.setattr(matrix_mod.FirecrawlAdapter, "scrape", fake_fc)
+
+    board = run_matrix(
+        MatrixRunConfig(
+            profiles=["P2"],
+            dry_run=False,
+            live=True,
+            include_hard=False,  # must NOT gate P2
+            output_dir=tmp_path,
+            basename="scoreboard-p2-live-nonskip",
+            load_dotenv=False,
+        )
+    )
+    art_paths = board["matrix"]["written_artifacts"]
+    arts = [json.loads(Path(p).read_text(encoding="utf-8")) for p in art_paths]
+    bc = [a for a in arts if a["engine"] == "basecrawl"]
+    assert bc, "expected basecrawl P2 row"
+    assert all(a.get("challenge_class") != "hard_optional_skipped" for a in bc)
+    assert all(a.get("js_target") is True for a in bc)
+    assert all(a.get("content_success") is True for a in bc)
+    assert calls, "basecrawl adapter should dial for live P2 JS"
+    assert calls[0][0] == "hard" and calls[0][1] is True
+
+
 def test_optional_hard_and_p3_typed_skip_without_gate(tmp_path: Path):
     board = run_matrix(
         MatrixRunConfig(
