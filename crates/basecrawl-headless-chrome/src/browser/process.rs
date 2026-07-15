@@ -180,7 +180,7 @@ pub struct LaunchOptions<'a> {
 
     /// The options to use for fetching a version of chrome when `path` is None.
     ///
-    /// By default, we'll use a revision guaranteed to work with our API and will
+    /// By default, we'll use a revision known to work with our API and will
     /// download and install that revision of chrome the first time a Process is created.
     #[cfg_attr(feature = "fetch", builder(default))]
     #[cfg(feature = "fetch")]
