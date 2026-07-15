@@ -1152,7 +1152,9 @@ fn hard_shield_operator_docs_miner_key_and_residual_honesty() {
 
     // How-to miner / operator CapSolver key path (expectedBehavior: how-to miner key).
     assert!(
-        (lower.contains("how-to") || lower.contains("miner / operator") || lower.contains("miner and operator"))
+        (lower.contains("how-to")
+            || lower.contains("miner / operator")
+            || lower.contains("miner and operator"))
             && lower.contains("capsolver")
             && (lower.contains("capsolver_api_key") || lower.contains("`capsolver_api_key`")),
         "operator docs must include CapSolver miner/operator key how-to"
@@ -1173,7 +1175,10 @@ fn hard_shield_operator_docs_miner_key_and_residual_honesty() {
         "docs must document Oxylabs residential fixture / residential class"
     );
     assert!(
-        lower.contains("max") && (lower.contains("1 concurrent") || lower.contains("**1** concurrent") || lower.contains("max 1")),
+        lower.contains("max")
+            && (lower.contains("1 concurrent")
+                || lower.contains("**1** concurrent")
+                || lower.contains("max 1")),
         "docs must state max 1 concurrent live residential dial"
     );
 

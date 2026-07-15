@@ -95,27 +95,36 @@ fn run_cli_env(args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
         .expect("spawn basecrawl")
 }
 
-/// Retry a hard-path CLI scrape once when deadline flakes under multi-agent host load.
+/// Retry a hard-path CLI scrape when deadline flakes under multi-agent host load.
 ///
 /// Pre-existing M21 suite notes observed sticky SingletonLock / cold Chromium launch contention
 /// that sporadically surfaces as `browser operation deadline exceeded` with a green product.
 /// Callers still assert real success content; this only reduces nondeterministic validator
 /// noise. Non-deadline failures are never retried.
+///
+/// Under sustained multi-agent Chrome pressure a single retry is often insufficient; probe up
+/// to three total attempts with progressive backoff, clearing sticky profile dirs each time.
 fn run_cli_hard_with_deadline_retry(args: &[&str]) -> Output {
-    let first = run_cli(args);
-    if first.status.success() {
-        return first;
+    let mut last = run_cli(args);
+    if last.status.success() {
+        return last;
     }
-    let stderr = String::from_utf8_lossy(&first.stderr);
-    if !stderr.contains("browser operation deadline exceeded")
-        && !stderr.contains("browser setup deadline exceeded")
-    {
-        return first;
+    for attempt in 1u32..=2 {
+        let stderr = String::from_utf8_lossy(&last.stderr);
+        if !stderr.contains("browser operation deadline exceeded")
+            && !stderr.contains("browser setup deadline exceeded")
+        {
+            return last;
+        }
+        // Fresh sticky-profile keyspace for sticky task ids that re-attach after a killed Chrome.
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("basecrawl-sticky-profiles"));
+        thread::sleep(Duration::from_millis(400 * u64::from(attempt)));
+        last = run_cli(args);
+        if last.status.success() {
+            return last;
+        }
     }
-    // Fresh sticky-profile keyspace for sticky task ids that re-attach after a killed Chrome.
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("basecrawl-sticky-profiles"));
-    thread::sleep(Duration::from_millis(200));
-    run_cli(args)
+    last
 }
 
 fn proof_from_output(out: &Output) -> Value {
