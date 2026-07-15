@@ -1135,3 +1135,97 @@ fn soft_chrome_profile_does_not_change_hard_chromium_requirement() {
         200
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Hard-shield operator docs (M23): CapSolver miner how-to + residual honesty
+// Guards product README / SECURITY / operators surfaces for hard-shield docs.
+// Mission diary remains under gitignored .docs-evidence/ only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hard_shield_operator_docs_miner_key_and_residual_honesty() {
+    let security = include_str!("../../../docs/SECURITY.md");
+    let operator = include_str!("../../../docs/operators/proxy-and-egress.md");
+    let readme = include_str!("../../../README.md");
+    let combined = format!("{security}\n{operator}\n{readme}");
+    let lower = combined.to_ascii_lowercase();
+
+    // How-to miner / operator CapSolver key path (expectedBehavior: how-to miner key).
+    assert!(
+        (lower.contains("how-to") || lower.contains("miner / operator") || lower.contains("miner and operator"))
+            && lower.contains("capsolver")
+            && (lower.contains("capsolver_api_key") || lower.contains("`capsolver_api_key`")),
+        "operator docs must include CapSolver miner/operator key how-to"
+    );
+    assert!(
+        lower.contains("chmod 600") || lower.contains("mode `600`") || lower.contains("mode 600"),
+        "CapSolver key how-to must require mode-600 / chmod 600 env file"
+    );
+    assert!(
+        lower.contains("basecrawl_captcha_solver") || lower.contains("--captcha-solver"),
+        "docs must show provider select surface for CapSolver"
+    );
+
+    // Oxylabs residential residual + max-1 concurrency.
+    assert!(
+        lower.contains("oxylabs")
+            && (lower.contains("residential") || lower.contains("proxy-class residential")),
+        "docs must document Oxylabs residential fixture / residential class"
+    );
+    assert!(
+        lower.contains("max") && (lower.contains("1 concurrent") || lower.contains("**1** concurrent") || lower.contains("max 1")),
+        "docs must state max 1 concurrent live residential dial"
+    );
+
+    // CF / Turnstile / Akamai residual language (feature residual risks).
+    assert!(
+        (lower.contains("cloudflare") || lower.contains("turnstile") || lower.contains("cf "))
+            && (lower.contains("detect-not-solve")
+                || lower.contains("detect + fail-closed")
+                || lower.contains("detect and fail-closed")
+                || lower.contains("challenge_blocked")),
+        "docs must state CF/Turnstile detect-not-solve residual"
+    );
+    assert!(
+        lower.contains("akamai"),
+        "docs must document Akamai residual (hard-shield honesty)"
+    );
+    assert!(
+        lower.contains("taostats")
+            || lower.contains("managed challenge")
+            || lower.contains("turnstile residual"),
+        "docs must keep hard CF residual examples (taostats / managed challenge) for classification honesty"
+    );
+
+    // No commercial unlocker parity claim; banned affirmative slogans.
+    assert!(
+        lower.contains("not") && lower.contains("unlocker")
+            || lower.contains("not commercial web unlocker")
+            || lower.contains("no commercial web unlocker"),
+        "docs must deny commercial Web Unlocker parity"
+    );
+    for banned in [
+        "we are undetectable",                // must never / forbidden claim
+        "fully undetectable residential",     // must never / forbidden claim
+        "trustless scrape authenticity",      // must never / forbidden claim
+        "100% guaranteed authenticity",       // must never / forbidden claim
+        "100% unlocker parity",               // must never / forbidden claim
+        "anonymous residential exit forever", // must never / forbidden claim
+        "offers web unlocker feature-parity", // must never / forbidden claim
+        "guarantees unlock any site",         // must never / forbidden claim
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "hard-shield operator docs must never market absolute claim '{banned}'"
+        );
+    }
+
+    // Product docs stay free of mission assertion ledgers (base-docs honesty).
+    assert!(
+        !operator.contains("VAL-HARD-015")
+            && !operator.contains("VAL-SOLVE-")
+            && !security.contains("VAL-HARD-")
+            && !readme.contains("/root/.factory/missions"),
+        "tracked product docs must not carry mission assertion diary IDs or missionPath ledger"
+    );
+}

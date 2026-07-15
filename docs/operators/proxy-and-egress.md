@@ -44,10 +44,11 @@ Supported placeholders for `--proxy-username-template`: `{user}` / `{username}`,
 
 Prebuilt env usernames already carrying `-cc-US` (or `-sessid-…`) are **stripped to the customer base** before re-applying country/session tokens, so operators do not accidentally double-decorate to `…-cc-US-cc-US`.
 
-Example embedding (provider-specific host, product syntax stays generic):
+Example embedding (provider-specific host, product syntax stays generic; secrets stay env-only):
 
 ```bash
-export BASECRAWL_HTTPS_PROXY='*********************************************
+# Use a real http://user:pass@host:port URL only in a mode-600 gitignored .env; never paste passwords into shells or docs.
+export BASECRAWL_HTTPS_PROXY   # load from .env with set -a; . ./.env; set +a
 basecrawl \
   --proxy-session my-session-1 \
   --proxy-country US \
@@ -57,7 +58,7 @@ basecrawl \
 ```
 
 `BASECRAWL_HTTP_PROXY` / `BASECRAWL_HTTPS_PROXY` construction accepts standard
-`http://user:pass@host:port` userinfo. Live residential max concurrency is **1**
+`http(s)://user:pass@host:port` userinfo. Live residential max concurrency is **1**
 when `BASECRAWL_LIVE_PROXY=1` arms commercial dials.
 
 ### Class honesty
@@ -123,28 +124,98 @@ Soft JA3-family alignment is for bootstrap/success-rate on soft targets. Residen
 
 Default challenges and captcha pages are **detect-not-solve** (`challenge_blocked`). Soft CI and soft open-web profiles **never** require a captcha marketplace key. There is **no** commercial Web Unlocker feature-parity claim (not Bright Data Web Unlocker / Oxylabs captcha-manage style "unlock any site"). Treat residual blocks as operational signal, not a defect in silence.
 
-### Optional CapSolver (operator/miner key; fail-closed)
+Hard-path examples such as Cloudflare managed / Turnstile on public marketing or research targets (for example `https://taostats.io/`) should classify as **managed challenge / turnstile residual** (or a sibling `challenge_blocked` class), not as maxed content success on interstitial HTML alone.
 
-Operators and miners may optionally inject a CapSolver client key for supported Turnstile/CF classes:
+### Optional CapSolver (operator and miner key; fail-closed)
+
+Operators and miners may optionally inject a CapSolver client key for supported Turnstile/CF classes. Soft dual-engine paths and default CI stay green **without** any solver key.
 
 | Surface | Value |
 | --- | --- |
-| Env (preferred) | `CAPSOLVER_API_KEY` (also `BASECRAWL_CAPSOLVER_API_KEY`) in gitignored `basecrawl/.env` mode `600` |
+| Env (preferred) | `CAPSOLVER_API_KEY` or `BASECRAWL_CAPSOLVER_API_KEY` in gitignored `basecrawl/.env`, mode `600` |
 | Provider select | `BASECRAWL_CAPTCHA_SOLVER=capsolver` and/or CLI `--captcha-solver capsolver` |
 | Timeout | `--captcha-solve-timeout SECONDS` (default 90) |
 | Supported classes | Turnstile → CapSolver `AntiTurnstileTaskProxyLess` (`createTask` + `getTaskResult`) |
+| Unsupported classes | Typed residual; fail closed; never invent content success |
+
+#### How-to: miner / operator CapSolver key
+
+1. Create a CapSolver client key in your CapSolver dashboard (never paste it into chat, tickets, or ScrapeProof).
+2. Write it only into a **gitignored** env file on the miner host (example path `basecrawl/.env`), then lock down permissions:
+
+```bash
+# miner host: secrets only; never commit this file
+umask 077
+cat >> basecrawl/.env <<'EOF'
+CAPSOLVER_API_KEY=YOUR_CAPSOLVER_CLIENT_KEY
+BASECRAWL_CAPTCHA_SOLVER=capsolver
+EOF
+chmod 600 basecrawl/.env
+```
+
+3. Load the env into the miner process (dotnet-style process supervisor, systemd `EnvironmentFile`, or `set -a; . ./basecrawl/.env; set +a` for one-off shells). Prefer env injection over CLI argv so the key never lands in shell history or process listings with long argv.
+4. Arm the hard path for challenge pages (residential or forced browser). Example:
+
+```bash
+set -a; . ./basecrawl/.env; set +a
+basecrawl \
+  --captcha-solver capsolver \
+  --force-browser \
+  --formats markdown,html,metadata \
+  --timeout 90 \
+  https://example.com/
+```
+
+5. Optional residential stickiness (provider URL stays env-only; class is honest):
+
+```bash
+export BASECRAWL_HTTPS_PROXY='http://USER:PASS@proxy.example:7777'
+basecrawl \
+  --captcha-solver capsolver \
+  --proxy-class residential \
+  --proxy-country US \
+  --proxy-session miner-sess-1 \
+  --formats markdown,metadata \
+  https://example.com/
+```
 
 **Without a key:** product stays detect-not-solve (`challenge_blocked`); no CapSolver network calls; soft CI green.
 
 **With a key:** createTask/getTaskResult may run for supported classes. HTTP 401 / invalid key / unpaid / timeout / empty token → typed fail-closed (`solver_auth_error` / `solver_timeout` / `solver_error`); **never** forge `content_success`. A returned token must still be applied through the hard-path challenge completion flow before any content_success claim.
 
-**Never** log, print, or commit the CapSolver API key (not in ScrapeProof, scoreboards, or host-visible stderr). Prefer env injection over CLI argv so keys never enter shell history.
+**Never** log, print, or commit the CapSolver API key (not in ScrapeProof, scoreboards, or host-visible stderr). Readiness `getBalance` probes that return HTTP 401 indicate key/account problems: remain fail-closed and fix the key format/account offline; never unlock content from a failed balance probe.
 
-**Honesty residual:** optional CapSolver does **not** equal commercial Web Unlocker parity, "100%" unlock, or "undetectable" browsing. Soft dual-engine / default CI remain free of solver keys (VAL-HARD-015). Readiness `getBalance` probes that return HTTP 401 indicate key/account problems — remain fail-closed and fix the key format/account offline; never unlock content from a failed balance probe.
+**Honesty residual:** optional CapSolver does **not** equal commercial Web Unlocker parity, not a complete unlock SLA, and not "undetectable" browsing. Multi-vendor marketplaces (2captcha / Anti-Captcha / CapMonster) are **not** integrated. Soft dual-engine / default CI remain free of solver keys.
+
+### Oxylabs residential (live fixture, not hard dependency)
+
+Oxylabs residential is the **live** residential fixture for sticky upper-bound smoke, not an Oxylabs-only product.
+
+| Topic | Operator rule |
+| --- | --- |
+| Endpoint fixture | `pr.oxylabs.io:7777` (or any standards-compliant CONNECT/SOCKS URL of the same shape) |
+| Auth | user:pass only in mode-`600` gitignored `.env` (`BASECRAWL_HTTP_PROXY` / `BASECRAWL_HTTPS_PROXY`) |
+| Country + sticky | `--proxy-country US` + `--proxy-session <id>` or supply provider username tokens (`-cc-US`, `-sessid-…`) |
+| Class | `--proxy-class residential` (forces Chromium hard identity) |
+| Live gate | `BASECRAWL_LIVE_PROXY=1` for provider costs; **max 1 concurrent** residential dial family |
+| Fail closed | Required residential without dialable upstream → typed dial residual, never residential success on direct outbound |
+
+Template construction is provider-agnostic. Prebuilt env userinfo that already includes `-cc-US` is stripped to the customer base before re-applying country/session tokens so operators do not double-decorate.
+
+### CF / Turnstile / Akamai residual (hard-shield honesty)
+
+| Shield family | What basecrawl does | Residual |
+| --- | --- | --- |
+| Cloudflare managed / Turnstile | Detect interstitial markers; optional CapSolver Turnstile path when configured | Default **detect-not-solve**. Challenge sandwich HTML is not content unlock. Public targets under this family (for example taostats) must not score maxed content on pure "Just a moment…" / Turnstile glue. |
+| Cloudflare marketing pages | Low-volume probe only | Marketing HTML may look soft while product bots remain proprietary residual. |
+| Akamai Bot Manager family | Classify residual; marketing pages only as medium research probes | No Akamai-solve marketplace; no claim of hide-from-Akamai success; residual risk remains on hard commercial endpoints. |
+| DataDome / PerimeterX families | Documented medium research probes only | Same honesty ceiling: identity + egress only, not commercial unlocker parity. |
+
+Hard-path scenarios are identity, dial honesty, and classification honesty. They are **not** a warranty that every bot manager is defeated.
 
 ### Gated live residual smoke (identity/egress only)
 
-Optional live residential residual smoke (`BASECRAWL_LIVE_PROXY=1`, max **1** concurrent dial family) exercises modern hard-path identity and truthful egress labels only. Secrets load from gitignored `.env` / process env (mode `600`). With the gate **off**, live residual cases **skip cleanly**; hermetic residual honesty stays primary. Live residual outcomes **never** claim commercial unlocker parity and **never** require captcha marketplace keys (2captcha / CapSolver / Anti-Captcha, etc.).
+Optional live residential residual smoke (`BASECRAWL_LIVE_PROXY=1`, max **1** concurrent dial family) exercises modern hard-path identity and truthful egress labels only. Secrets load from gitignored `.env` / process env (mode `600`). With the gate **off**, live residual cases **skip cleanly**; hermetic residual honesty stays primary. Live residual outcomes **never** claim commercial unlocker parity and **never** require a CapSolver key for the default residual gate.
 
 ### CONNECT residual vs origin challenge
 
@@ -156,7 +227,7 @@ Upstream HTTP CONNECT failures are **dial residuals**, not origin bot-challenge 
 | 403 | `transport_error` / `proxy_acl_error` (destination or product ACL) | Cloudflare / origin challenge |
 | other non-200 | `transport_error` / `proxy_connect_error` | content_success with residential claim |
 
-Hard-shield note (2026-07-15): a taostats residential probe that failed with CONNECT 403 while geo endpoints returned CONNECT 200 is a **product/destination ACL residual**, not evidence that taostats Cloudflare defeated residential scrapes. Origin challenge markers are evaluated only after CONNECT establishes and an origin body is in hand. Mission diary: gitignored `.docs-evidence/hard-shield/oxylabs-connect-403-residual.md`.
+A residential CONNECT 403 on a hard target while geo endpoints return CONNECT 200 is a **product/destination ACL residual**, not evidence that origin Cloudflare alone defeated residential scrapes. Origin challenge markers apply only after CONNECT establishes and an origin body is in hand. Mission diary (untracked): `.docs-evidence/hard-shield/`.
 
 ## Residual risks (operator)
 
@@ -166,6 +237,8 @@ Hard-shield note (2026-07-15): a taostats residential probe that failed with CON
 | Headless residual | Headless is default (`--headless=new`). Such traits remain detectable; sticky profiles and residential egress only raise the bar. Do not advertise perfect headless cloaking. |
 | CDP Runtime residual | CDP/Runtime protocol use (including possible Runtime.enable side effects) is a residual channel even when trivial automation flags are patched. Documented in [SECURITY.md](../SECURITY.md). |
 | Challenge detect residual | Default detect + fail-closed. Optional CapSolver may createTask/poll Turnstile with a miner key but is not commercial unlocker parity and never forges unlocked content on auth/timeout. |
+| CF / Turnstile residual | Managed challenge / Turnstile interstitials stay residual without a solved+applied token; also residual after some solved tokens if vendor re-challenges. |
+| Akamai residual | Akamai Bot Manager heuristics, bot lists, and edge captchas remain residual. Product documents medium marketing probes only; no Akamai unlock SLA. |
 | Soft TLS residual | Soft impersonate is not Chromium wire; residual GREASE/ALPS/H2 setting fingerprints remain. Hard path only for residential. |
 | Chromium major residual | Pin is major **145** (`145.0.7632.46`). Detectors can track lag vs newer public Chrome; keep hard-path majors coherent when the pin moves. |
 | Plugins / mimeTypes | Multipass PDF plugin names + non-empty `mimeTypes` improve trivial bot ranks only. Not full plugin/PDF API fidelity. |
@@ -175,13 +248,13 @@ Hard-shield note (2026-07-15): a taostats residential probe that failed with CON
 | TEE.fail (self-hosted) | Physical DDR5 interposer residual; prefer managed-cloud TDX for high-stakes confidential work. See [SECURITY.md](../SECURITY.md). |
 | Network metadata | Sealed DNS / content confidentiality do not erase all host-owned network observables. |
 | Dual-fetch timing residual | Hard Chromium runs still start with a soft rustls document preflight (challenge triage / redirects) before the browser identity capture. Residual multi-handshake timing may be detector-visible. Soft preflight content is never labeled as residential Chromium success; see [SECURITY.md](../SECURITY.md). |
-| Provider spend | Live residential sessions cost money; use sticky short sessions and rate limits. |
+| Provider spend | Live residential sessions cost money; use sticky short sessions and rate limits. Max **1** concurrent live residential dial under the live gate. |
 
 ## Quick examples
 
 ```bash
-# Soft path + datacenter-class CONNECT (no secrets in CLI history: use env)
-export BASECRAWL_HTTPS_PROXY='http://user:pass@proxy.example:3128'
+# Soft path + datacenter-class CONNECT (load secrets from mode-600 .env; never CLI history)
+set -a; . ./basecrawl/.env; set +a   # provides BASECRAWL_HTTPS_PROXY when needed
 basecrawl --proxy-class datacenter --no-js \
   --formats markdown,metadata https://example.com/
 
@@ -190,6 +263,10 @@ basecrawl --force-browser --formats html,markdown https://example.com/
 
 # Residential class fails closed if proxy cannot dial (honest error on stderr)
 basecrawl --proxy-class residential --formats markdown https://example.com/
+
+# Optional CapSolver (miner .env already loaded; still detect-not-solve without key)
+basecrawl --captcha-solver capsolver --force-browser \
+  --formats markdown,html https://example.com/
 ```
 
 For structured JSON extract gating, product breadth (`--mode crawl|map|batch`, POST/body), and residual extract honesty, see [product-breadth-and-extract.md](product-breadth-and-extract.md).
