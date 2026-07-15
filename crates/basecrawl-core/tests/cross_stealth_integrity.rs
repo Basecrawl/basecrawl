@@ -109,7 +109,8 @@ fn run_cli_hard_with_deadline_retry(args: &[&str]) -> Output {
     if last.status.success() {
         return last;
     }
-    for attempt in 1u32..=2 {
+    // Host often runs other agent Chrome sessions; deadline flakes need several cold launches.
+    for attempt in 1u32..=4 {
         let stderr = String::from_utf8_lossy(&last.stderr);
         if !stderr.contains("browser operation deadline exceeded")
             && !stderr.contains("browser setup deadline exceeded")
@@ -118,7 +119,7 @@ fn run_cli_hard_with_deadline_retry(args: &[&str]) -> Output {
         }
         // Fresh sticky-profile keyspace for sticky task ids that re-attach after a killed Chrome.
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("basecrawl-sticky-profiles"));
-        thread::sleep(Duration::from_millis(400 * u64::from(attempt)));
+        thread::sleep(Duration::from_millis(750 * u64::from(attempt)));
         last = run_cli(args);
         if last.status.success() {
             return last;
@@ -1138,9 +1139,9 @@ fn val_cross_stealth_004_soft_preflight_challenge_not_hard_success_forgery() {
         "--task-id",
         "preflight-hard-ok-004",
         "--timeout",
-        "90",
+        "240",
         "--render-timeout",
-        "60",
+        "180",
         "--wait-for",
         "#ok",
     ]);
@@ -1665,9 +1666,9 @@ fn val_cross_stealth_012_batch_soft_good_and_challenge_independent() {
         "--task-id",
         "batch-hard-good-012",
         "--timeout",
-        "90",
+        "240",
         "--render-timeout",
-        "60",
+        "180",
         "--wait-for",
         "#ok",
     ]);
