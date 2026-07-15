@@ -12,7 +12,10 @@ Delivers the common **NormalizedResult** schema, multi-dimension **scorer** (0â€
 - Hard / residential / challenge class rows may **typed-skip** when not gated; skips are not soft wins.
 - No claim of commercial Web Unlocker parity.
 - Soft basecrawl success is **never** labeled residential unlock.
-- Secrets (`FIRECRAWL_API_KEY`, Oxylabs credentials) live only in mode-**600** gitignored `.env`. Never print them; never commit them. Scoreboards redaction is mandatory.
+- Soft SSR shell may score partial chrome; it is **not** a full hard unlock of SPA/live tables.
+- CapSolver is **optional** (detect-not-solve without a key; never forged unlock).
+- CONNECT/proxy ACL errors are not origin Cloudflare verdicts.
+- Secrets (`FIRECRAWL_API_KEY`, Oxylabs, CapSolver) live only in mode-**600** gitignored `.env`. Never print them; never commit them. Scoreboards redaction is mandatory.
 
 ## Layout
 
@@ -32,6 +35,7 @@ Evidence outputs (live or operator re-score boards) belong under gitignored:
 
 ```text
 basecrawl/.docs-evidence/benchmark/
+basecrawl/.docs-evidence/benchmark/hard/   # M23 hard-shield H2H scoreboards
 ```
 
 Also ignored: `basecrawl/.firecrawl/` (CLI cache) and `.env`.
@@ -131,6 +135,16 @@ python -m benchmark firecrawl --url https://example.com/ --proxy basic --dry-run
 # Fair skip proof when key missing (CI path)
 # env -u FIRECRAWL_API_KEY python -m benchmark firecrawl --url https://example.com/ \
 #   --no-stored-credentials --no-dotenv
+
+# Hard-shield H2H (M23): taostats required + multi-vendor shields; modules under tools/benchmark
+python -m benchmark hard-matrix --info
+python -m benchmark hard-matrix --dry-run \
+  --out ../../.docs-evidence/benchmark/hard --basename scoreboard-hard-h2h-dry
+python -m benchmark hard-matrix --scorer-only --artifacts fixtures/artifacts \
+  --out ../../.docs-evidence/benchmark/hard --basename scoreboard-hard-scorer
+# Live operator: low RPS; residential max 1; CapSolver optional; secrets never printed
+# python -m benchmark hard-matrix --live --include-residential --include-solver \
+#   --pacing-s 2 --out ../../.docs-evidence/benchmark/hard
 ```
 
 Focused tests:

@@ -63,6 +63,13 @@ Both engines should leave the other side null with notes rather than invent forc
 the scorer forces `content_success ≈ 0` and penalizes `interstitial_false_success` for these
 classes. Firecrawl `enhanced` rows keep `scoring_role=ceiling` (non-parity).
 
+Hard H2H matrix (`python -m benchmark hard-matrix`) always includes `https://taostats.io/`,
+labels `metadata.path_combo` (`hard-chromium` / `hard-residential` / `hard-residential+solver` /
+`soft-ssr-shell` / `firecrawl-basic` / `firecrawl-enhanced-ceiling`), and writes scoreboards under
+`.docs-evidence/benchmark/hard/`. Soft shell rows set `metadata.shell_only=true` and
+`metadata.dynamic_content_unlocked=false` so SSR chrome is not scored as full hard unlock.
+Every hard row must carry `challenge_class` (not bare status-only).
+
 ## `error_class` values
 
 `none`, `transport`, `timeout`, `credential_error`, `budget_exhausted`, `engine_unavailable`, `challenge_blocked`, `policy_skip`, `parse_error`, `unknown`

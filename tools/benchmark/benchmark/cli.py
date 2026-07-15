@@ -38,6 +38,15 @@ from .firecrawl_adapter import (
     FirecrawlAdapterConfig,
 )
 from .formats import CORE_FORMATS, EXCLUDED_CORE_FORMATS, request_core_formats
+from .hard_matrix import (
+    DEFAULT_HARD_FORMATS,
+    HARD_CANARY_PORT_RANGE,
+    TAOSTATS_URL,
+    HardMatrixConfig,
+    HardMatrixRunner,
+    hard_matrix_summary,
+    run_hard_matrix,
+)
 from .matrix import (
     DEFAULT_CI_PROFILES,
     DEFAULT_JS_URL,
@@ -312,6 +321,120 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verbose runner notes (secrets still redacted)",
     )
 
+    hm = sub.add_parser(
+        "hard-matrix",
+        help=(
+            "Hard-shield H2H matrix (taostats required + multi-vendor shields). "
+            "Scoreboard under .docs-evidence/benchmark/hard/; residential max 1; "
+            "path combos labeled hard-chromium / hard-residential / solver / FC."
+        ),
+    )
+    hm.add_argument(
+        "--combos",
+        default="",
+        help=(
+            "Comma-separated path combo ids: hard-chromium,hard-residential,"
+            "hard-residential+solver,soft-ssr-shell,firecrawl-basic,"
+            "firecrawl-enhanced-ceiling"
+        ),
+    )
+    hm.add_argument(
+        "--targets",
+        default="",
+        help="Comma-separated target urls/names (taostats always retained)",
+    )
+    hm.add_argument(
+        "--scorer-only",
+        action="store_true",
+        help="Re-score saved hard fixtures only (no adapter dials)",
+    )
+    hm.add_argument(
+        "--artifacts",
+        default=None,
+        help="Artifact dir for --scorer-only",
+    )
+    hm.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Hermetic adapter dry-run (default unless --live)",
+    )
+    hm.add_argument(
+        "--live",
+        action="store_true",
+        help="Allow live dials (low RPS; residential max 1; needs keys)",
+    )
+    hm.add_argument(
+        "--out",
+        default=None,
+        help="Scoreboard dir (default: basecrawl/.docs-evidence/benchmark/hard/)",
+    )
+    hm.add_argument("--basename", default="scoreboard-hard-h2h")
+    hm.add_argument(
+        "--include-residential",
+        action="store_true",
+        help="Include hard-residential path combo (Oxylabs max 1)",
+    )
+    hm.add_argument(
+        "--include-solver",
+        action="store_true",
+        help="Include CapSolver-armed hard path (optional; detect-not-solve without key)",
+    )
+    hm.add_argument(
+        "--include-enhanced",
+        action="store_true",
+        default=False,
+        help="Include Firecrawl enhanced ceiling combo (default on when combos empty)",
+    )
+    hm.add_argument(
+        "--no-enhanced",
+        action="store_true",
+        help="Disable Firecrawl enhanced ceiling when using default combos",
+    )
+    hm.add_argument(
+        "--no-soft-shell",
+        action="store_true",
+        help="Skip soft SSR shell path combo",
+    )
+    hm.add_argument(
+        "--no-firecrawl-basic",
+        action="store_true",
+        help="Skip Firecrawl basic path combo",
+    )
+    hm.add_argument(
+        "--max-targets",
+        type=int,
+        default=None,
+        help="Low-volume cap on optional targets (required taostats always kept)",
+    )
+    hm.add_argument(
+        "--pacing-s",
+        type=float,
+        default=1.5,
+        help="Inter-request pacing seconds for live hard matrix (low RPS)",
+    )
+    hm.add_argument(
+        "--canary-port",
+        type=int,
+        default=21095,
+        help=f"Hermetic hard canary port within {HARD_CANARY_PORT_RANGE[0]}-{HARD_CANARY_PORT_RANGE[1]}",
+    )
+    hm.add_argument(
+        "--no-dotenv",
+        action="store_true",
+        help="Do not load basecrawl/.env for keys/proxies",
+    )
+    hm.add_argument(
+        "--info",
+        action="store_true",
+        help="Print hard matrix documentation (targets × shields, path combos) as JSON",
+    )
+    hm.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Verbose notes (secrets redacted)",
+    )
+
     info = sub.add_parser("info", help="Print core formats, dimensions, and weights")
     # info has no required args; keep signature simple
     _ = info
@@ -397,6 +520,83 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     {
                         "ok": False,
                         "error": "refusing to emit matrix summary: secret leak detected",
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 3
+        print(text)
+        return 0
+
+    if args.command == "hard-matrix":
+        if args.info:
+            print(json.dumps(hard_matrix_summary(), indent=2, sort_keys=True))
+            return 0
+        combos = [c.strip() for c in str(args.combos or "").split(",") if c.strip()]
+        targets = [t.strip() for t in str(args.targets or "").split(",") if t.strip()]
+        dry_run = bool(args.dry_run) or not bool(args.live)
+        include_enhanced = True
+        if bool(args.no_enhanced):
+            include_enhanced = False
+        if bool(args.include_enhanced):
+            include_enhanced = True
+        cfg = HardMatrixConfig(
+            combos=combos,
+            targets=targets,
+            scorer_only=bool(args.scorer_only),
+            dry_run=dry_run,
+            live=bool(args.live),
+            include_residential=bool(args.include_residential),
+            include_solver=bool(args.include_solver),
+            include_soft_shell=not bool(args.no_soft_shell),
+            include_enhanced=include_enhanced,
+            include_firecrawl_basic=not bool(args.no_firecrawl_basic),
+            max_targets=args.max_targets,
+            pacing_s=float(args.pacing_s),
+            artifacts_dir=args.artifacts,
+            output_dir=args.out,
+            basename=args.basename,
+            load_dotenv=not bool(args.no_dotenv),
+            prefer_docs_evidence=args.out is None,
+            canary_bind_port=int(args.canary_port),
+            formats=list(DEFAULT_HARD_FORMATS),
+            verbose=bool(args.verbose),
+        )
+        try:
+            board = HardMatrixRunner(cfg).run()
+        except (ValueError, FileNotFoundError, AssertionError) as exc:
+            print(
+                json.dumps({"ok": False, "error": str(exc)}, indent=2),
+                file=sys.stderr,
+            )
+            return 1
+        written = board.get("written") or {}
+        summary = {
+            "ok": True,
+            "mode": board.get("mode"),
+            "live_network": board.get("live_network", False),
+            "digest": board.get("digest"),
+            "n_rows": (board.get("aggregate") or {}).get("n_rows"),
+            "required_url": TAOSTATS_URL,
+            "hard_matrix": {
+                "targets": (board.get("hard_matrix") or {}).get("targets"),
+                "path_combos": (board.get("hard_matrix") or {}).get("path_combos"),
+                "residential_max_concurrent": 1,
+                "canary_port_range": list(HARD_CANARY_PORT_RANGE),
+            },
+            "path_combo_labels": board.get("path_combo_labels"),
+            "json": written.get("json"),
+            "markdown": written.get("markdown"),
+            "out": written.get("dir"),
+        }
+        text = redact_text(json.dumps(summary, indent=2, sort_keys=True))
+        if looks_like_secret_leak(text):
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "refusing to emit hard-matrix summary: secret leak detected",
                     },
                     indent=2,
                 ),

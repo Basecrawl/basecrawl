@@ -54,3 +54,51 @@ CI-default behavior:
 
 LLM extract / interact / agent formats and any enhanced ceiling row unless `--include-ceiling`
 is explicitly set for research digests.
+
+---
+
+## Hard-shield H2H matrix (M23)
+
+Tracked under `benchmark/hard_matrix.py`. Scoreboards land only under gitignored
+`.docs-evidence/benchmark/hard/`. Reuses the same adapters + scorer (VAL-HARD-013).
+
+### Required probe
+
+| url | shield_family | notes |
+| --- | --- | --- |
+| **`https://taostats.io/`** | `cloudflare_turnstile` | **Required** on every hard H2H run (VAL-HARD-001) |
+
+### Multi-vendor shield targets (low RPS public marketing / research)
+
+| url | name | shield_family | difficulty |
+| --- | --- | --- | --- |
+| `https://taostats.io/` | taostats | cloudflare_turnstile | hard |
+| `https://nowsecure.nl/` | nowsecure | cloudflare_managed | hard |
+| `https://www.cloudflare.com/` | cloudflare-marketing | cloudflare_marketing | medium |
+| `https://www.datadome.co/` | datadome-marketing | datadome | medium |
+| `https://www.perimeterx.com/` | perimeterx-marketing | perimeterx_human | medium |
+| `https://www.akamai.com/` | akamai-marketing | akamai | medium |
+
+### Path combos (explicit labels — VAL-CROSS-HARD-007)
+
+| path_combo | engine | notes |
+| --- | --- | --- |
+| `hard-chromium` | basecrawl | `--force-browser` direct |
+| `hard-residential` | basecrawl | residential, **max 1** concurrent |
+| `hard-residential+solver` | basecrawl | residential + optional CapSolver |
+| `soft-ssr-shell` | basecrawl | soft shell; **not** full hard unlock (VAL-HARD-007) |
+| `firecrawl-basic` | firecrawl | basic comparison |
+| `firecrawl-enhanced-ceiling` | firecrawl | enhanced **ceiling**, non-parity |
+
+Every hard row carries `challenge_class` beyond bare HTTP (VAL-HARD-010). Hermetic
+canaries bind only in ports **21000–21099** (VAL-HARD-016).
+
+```bash
+python -m benchmark hard-matrix --info
+python -m benchmark hard-matrix --dry-run --out ../../.docs-evidence/benchmark/hard
+python -m benchmark hard-matrix --scorer-only --artifacts fixtures/artifacts \
+  --out ../../.docs-evidence/benchmark/hard --basename scoreboard-hard-scorer
+# live operator (low RPS; residential only with --include-residential; max 1)
+# python -m benchmark hard-matrix --live --include-residential --include-solver \
+#   --pacing-s 2 --out ../../.docs-evidence/benchmark/hard
+```

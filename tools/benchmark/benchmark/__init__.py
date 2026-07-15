@@ -38,6 +38,16 @@ from .formats import (
     normalize_format_token,
     request_core_formats,
 )
+from .hard_matrix import (
+    HARD_CANARY_PORT_RANGE,
+    HARD_TARGETS,
+    PATH_COMBOS,
+    TAOSTATS_URL,
+    HardMatrixConfig,
+    HardMatrixRunner,
+    hard_matrix_summary,
+    run_hard_matrix,
+)
 from .matrix import (
     DEFAULT_CI_PROFILES,
     DEFAULT_JS_URL,
@@ -129,6 +139,14 @@ __all__ = [
     "MatrixRunner",
     "matrix_summary",
     "run_matrix",
+    "TAOSTATS_URL",
+    "HARD_TARGETS",
+    "PATH_COMBOS",
+    "HARD_CANARY_PORT_RANGE",
+    "HardMatrixConfig",
+    "HardMatrixRunner",
+    "hard_matrix_summary",
+    "run_hard_matrix",
 ]
 
 __version__ = "0.1.0"
