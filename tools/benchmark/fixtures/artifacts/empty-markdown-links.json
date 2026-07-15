@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://quotes.toscrape.com/",
+  "engine": "basecrawl",
+  "profile_id": "P1-soft-basecrawl",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "links"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "none",
+  "content_success": true,
+  "latency_ms": 400,
+  "cost_estimate": {
+    "firecrawl_credits": null,
+    "firecrawl_usd_estimate": null,
+    "basecrawl_cpu_ms_placeholder": 400,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "empty body edge case"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "xx",
+  "links": [],
+  "fetch_path": "direct",
+  "proxy_class": "direct",
+  "expected_min_links": 5,
+  "js_target": false,
+  "proof_present": false,
+  "attestation_present": false,
+  "identity_notes": "",
+  "metadata": {
+    "fixture": true
+  }
+}

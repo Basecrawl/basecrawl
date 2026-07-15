@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://example-challenge.test/login",
+  "engine": "basecrawl",
+  "profile_id": "P3-basecrawl-hard-optional",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "interstitial",
+  "content_success": true,
+  "latency_ms": 180,
+  "cost_estimate": {
+    "firecrawl_credits": null,
+    "firecrawl_usd_estimate": null,
+    "basecrawl_cpu_ms_placeholder": 180,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "fixture only; no live dial"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "Just a moment...\n\nChecking your browser before accessing the site.\n\nPlease enable JavaScript to continue.\n\nCloudflare cf-browser-verification\n",
+  "html_body": "<html><body>Just a moment... Checking your browser. Please enable JavaScript to continue. captcha</body></html>",
+  "links": [],
+  "fetch_path": "chromium",
+  "proxy_class": "direct",
+  "expected_min_links": 3,
+  "js_target": false,
+  "proof_present": true,
+  "attestation_present": false,
+  "identity_notes": "proof present must not salvage core content on interstitial",
+  "metadata": {
+    "fixture": true
+  }
+}

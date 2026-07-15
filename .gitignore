@@ -24,3 +24,6 @@
 # Editor / OS
 .DS_Store
 *.swp
+
+# Firecrawl CLI local cache
+.firecrawl/

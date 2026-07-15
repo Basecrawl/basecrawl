@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://example.com/",
+  "engine": "basecrawl",
+  "profile_id": "P1-soft-basecrawl",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html", "links", "metadata"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "none",
+  "content_success": true,
+  "latency_ms": 420,
+  "cost_estimate": {
+    "firecrawl_credits": null,
+    "firecrawl_usd_estimate": null,
+    "basecrawl_cpu_ms_placeholder": 420,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "soft direct path; no residential proxy charged"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "# Example Domain\n\nThis domain is for use in illustrative examples in documents. You may use this domain in literature without prior coordination or asking for permission.\n\n## More information\n\n- [More information...](https://www.iana.org/domains/example)\n",
+  "html_body": "<html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><p>This domain is for use in illustrative examples in documents.</p><a href=\"https://www.iana.org/domains/example\">More information...</a></body></html>",
+  "links": ["https://www.iana.org/domains/example"],
+  "fetch_path": "direct",
+  "proxy_class": "direct",
+  "expected_min_links": 1,
+  "js_target": false,
+  "proof_present": true,
+  "attestation_present": false,
+  "identity_notes": "ScrapeProof present without live TEE quote in this fixture",
+  "metadata": {
+    "fixture": true
+  }
+}

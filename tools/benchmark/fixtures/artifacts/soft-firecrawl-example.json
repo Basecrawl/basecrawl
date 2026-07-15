@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://example.com/",
+  "engine": "firecrawl",
+  "profile_id": "P2-soft-firecrawl-basic",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html", "links"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "none",
+  "content_success": true,
+  "latency_ms": 890,
+  "cost_estimate": {
+    "firecrawl_credits": 1,
+    "firecrawl_usd_estimate": 0.00099,
+    "basecrawl_cpu_ms_placeholder": null,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "proxy=basic estimate; 1 credit soft scrape"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "# Example Domain\n\nThis domain is for use in illustrative examples in documents. You may use this domain in literature without prior coordination or asking for permission.\n\n## Links\n\n- [More information...](https://www.iana.org/domains/example)\n",
+  "html_body": "<html><body><h1>Example Domain</h1><p>This domain is for use in illustrative examples in documents.</p></body></html>",
+  "links": ["https://www.iana.org/domains/example"],
+  "fetch_path": "cloud",
+  "proxy_class": "basic",
+  "expected_min_links": 1,
+  "js_target": false,
+  "proof_present": false,
+  "attestation_present": false,
+  "identity_notes": "",
+  "metadata": {
+    "fixture": true,
+    "firecrawl_proxy": "basic"
+  }
+}

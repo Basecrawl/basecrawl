@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://quotes.toscrape.com/js/",
+  "engine": "basecrawl",
+  "profile_id": "P1-soft-basecrawl",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html", "links"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "none",
+  "content_success": true,
+  "latency_ms": 310,
+  "cost_estimate": {
+    "firecrawl_credits": null,
+    "firecrawl_usd_estimate": null,
+    "basecrawl_cpu_ms_placeholder": 310,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "soft no-js shell can miss dynamic quotes"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "# Quotes to Scrape\n\nLoading…\n",
+  "html_body": "<html><body><div id=\"quotes\">Loading…</div></body></html>",
+  "links": ["https://quotes.toscrape.com/"],
+  "fetch_path": "direct",
+  "proxy_class": "direct",
+  "expected_min_links": 1,
+  "js_target": true,
+  "proof_present": false,
+  "attestation_present": false,
+  "identity_notes": "",
+  "metadata": {
+    "fixture": true
+  }
+}

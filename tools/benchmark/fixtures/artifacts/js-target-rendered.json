@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0.0",
+  "url": "https://quotes.toscrape.com/js/",
+  "engine": "firecrawl",
+  "profile_id": "P2-soft-firecrawl-basic",
+  "formats_requested": ["markdown", "html", "links"],
+  "formats_produced": ["markdown", "html", "links"],
+  "http_status": 200,
+  "status_class": "2xx",
+  "challenge_class": "none",
+  "content_success": true,
+  "latency_ms": 2100,
+  "cost_estimate": {
+    "firecrawl_credits": 1,
+    "firecrawl_usd_estimate": 0.00099,
+    "basecrawl_cpu_ms_placeholder": null,
+    "basecrawl_proxy_usd_estimate": null,
+    "notes": "JS-rendered quotes content fixture"
+  },
+  "error_class": "none",
+  "scoring_role": "scoring",
+  "markdown_body": "# Quotes to Scrape\n\n## Quote\n\n“The world as we have created it is a process of our thinking.”\n\n— Albert Einstein\n\n### Tags\n\n- change\n- deep-thoughts\n\n## Quote\n\n“It is our choices that show what we truly are.”\n",
+  "html_body": "<html><body><div class=\"quote\"><span class=\"text\">The world as we have created it is a process of our thinking.</span><small class=\"author\">Albert Einstein</small></div></body></html>",
+  "links": [
+    "https://quotes.toscrape.com/",
+    "https://quotes.toscrape.com/tag/change/",
+    "/login"
+  ],
+  "fetch_path": "cloud",
+  "proxy_class": "basic",
+  "expected_min_links": 2,
+  "js_target": true,
+  "proof_present": false,
+  "attestation_present": false,
+  "identity_notes": "",
+  "metadata": {
+    "fixture": true
+  }
+}
