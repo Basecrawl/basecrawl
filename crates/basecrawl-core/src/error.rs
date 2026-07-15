@@ -136,6 +136,15 @@ pub enum Error {
     #[error("blocked by bot challenge (HTTP {status_code}): {detail}")]
     ChallengeBlocked { status_code: u16, detail: String },
 
+    /// Optional CapSolver path produced a typed failure (auth/timeout/provider/transport).
+    /// Fail closed — never content_success and never embeds the API key (VAL-SOLVE-007/009/010).
+    #[error("captcha solver error ({kind}): {detail}")]
+    Solver {
+        kind: String,
+        detail: String,
+        status_code: Option<u16>,
+    },
+
     #[error("robots policy denied the requested path")]
     RobotsDenied(Value),
 
@@ -223,6 +232,14 @@ impl Error {
             Error::HardPath(_) => "hard_path_policy",
             Error::TlsImpersonate(_) => "tls_impersonate_unsupported",
             Error::ChallengeBlocked { .. } => "challenge_blocked",
+            Error::Solver { kind, .. } => match kind.as_str() {
+                "solver_auth_error" => "solver_auth_error",
+                "solver_timeout" => "solver_timeout",
+                "solver_unsupported" => "solver_unsupported",
+                "solver_transport_error" => "solver_transport_error",
+                "solver_apply_pending" => "solver_apply_pending",
+                _ => "solver_error",
+            },
             Error::RobotsDenied(_) => "robots_denied",
             Error::Timeout(_) => "timeout",
             Error::Transport(_) => "transport_error",
@@ -361,6 +378,23 @@ impl Error {
                     Value::String("challenge_block".into()),
                 );
             }
+            Error::Solver {
+                kind, status_code, ..
+            } => {
+                if let Some(code) = status_code {
+                    obj.insert("status_code".into(), Value::Number((*code).into()));
+                }
+                obj.insert("failure_class".into(), Value::String(kind.clone()));
+                obj.insert(
+                    "capability".into(),
+                    Value::String("optional_captcha_solver".into()),
+                );
+                // Honesty: optional solver paths never imply commercial unlocker parity.
+                obj.insert(
+                    "residual".into(),
+                    Value::String("optional_solver_fail_closed_not_unlocker_parity".into()),
+                );
+            }
             _ => {}
         }
         json!({ "error": Value::Object(obj) })
@@ -426,9 +460,8 @@ impl Error {
             | Error::EnclaveSignature(_)
             | Error::Io(_)
             | Error::InvalidActions(_)
-            | Error::InvalidViewport(_) => {
-                std::borrow::Cow::Owned(strip_url_shaped(&self.to_string()))
-            }
+            | Error::InvalidViewport(_)
+            | Error::Solver { .. } => std::borrow::Cow::Owned(strip_url_shaped(&self.to_string())),
             other => std::borrow::Cow::Owned(other.to_string()),
         }
     }

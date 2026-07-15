@@ -152,7 +152,7 @@ Extract honesty: `--formats json` with `--json-schema` / `--json-prompt` fails c
 
 Proof surface (schema version 1) includes `request`, `tls`, `response`, `result`, `egress`, `attestation`, and `sdk_signature`. With `--attest` / `--sign-proof` the proof binds request/cert/transcript/response/result hashes and the Ed25519 public key into TDX `report_data`, then signs the envelope with the enclave key.
 
-Supporting capabilities: seeded fingerprints, universal proxy + Chromium composer, stealth hard-path baseline, soft TLS chrome-impersonate for soft targets only, in-enclave DoH privacy for DNS, landmark RTT echo, sealed task decrypt / result seal, and digest-pinned CVM images. Residual risk (proxy is not anonymity, headless/CDP residual, challenge detect-not-solve with no captcha marketplace and no commercial Web Unlocker parity, soft TLS ≠ Chromium wire, TEE.fail) is in [SECURITY.md](docs/SECURITY.md) and [proxy & egress](docs/operators/proxy-and-egress.md).
+Supporting capabilities: seeded fingerprints, universal proxy + Chromium composer, stealth hard-path baseline, soft TLS chrome-impersonate for soft targets only, in-enclave DoH privacy for DNS, landmark RTT echo, sealed task decrypt / result seal, digest-pinned CVM images, and optional CapSolver (`CAPSOLVER_API_KEY` + `--captcha-solver capsolver`; soft CI never requires a key). Residual risk (proxy is not anonymity, headless/CDP residual, challenge detect-not-solve default / optional CapSolver not commercial Web Unlocker parity, soft TLS ≠ Chromium wire, TEE.fail) is in [SECURITY.md](docs/SECURITY.md) and [proxy & egress](docs/operators/proxy-and-egress.md).
 
 ## CVM image
 

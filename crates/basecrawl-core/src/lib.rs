@@ -9,6 +9,7 @@
 pub mod attestation;
 pub mod batch;
 pub mod canonical;
+pub mod captcha_solver;
 pub mod charset;
 pub mod content;
 pub mod crawl;
@@ -45,6 +46,9 @@ use url::Url;
 
 pub use basecrawl_proof::ScrapeProof;
 pub use basecrawl_render::{Action, ScrollDirection};
+pub use captcha_solver::{
+    CAPSOLVER_API_KEY_ENV, CAPSOLVER_HONESTY_HELP, CAPTCHA_SOLVER_ENV, SUPPORTED_CHALLENGE_CLASSES,
+};
 pub use error::Error;
 pub use error::ExtractRefuseReason;
 pub use extract::{
@@ -206,6 +210,16 @@ pub struct ScrapeOptions {
     /// fetch_path or residential class (VAL-UTLS-003/004). Applied only on rustls soft fetch;
     /// hard Chromium path ignores the soft TLS offer as residential seize evidence (VAL-UTLS-010).
     pub tls_impersonate: Option<String>,
+    /// Optional captcha solver provider name (`capsolver`). Soft CI and soft scrapes never require
+    /// this. When unset, [`captcha_solver::resolve_runtime`] still activates CapSolver when
+    /// `CAPSOLVER_API_KEY` / `BASECRAWL_CAPTCHA_SOLVER=capsolver` is present (VAL-SOLVE-001..003).
+    pub captcha_solver: Option<String>,
+    /// Optional miner-supplied CapSolver API key (equvalent to `CAPSOLVER_API_KEY` env). Never
+    /// logged, never Serialised into ScrapeProof (VAL-SOLVE-003/010). Preferred path for operators
+    /// remains mode-600 env injection, not CLI argv.
+    pub captcha_api_key: Option<String>,
+    /// Whole CapSolver createTask/getTaskResult budget in seconds (default 90).
+    pub captcha_solve_timeout_secs: Option<u64>,
 }
 
 impl Default for ScrapeOptions {
@@ -251,6 +265,9 @@ impl Default for ScrapeOptions {
             json_schema: None,
             json_prompt: None,
             tls_impersonate: None,
+            captcha_solver: None,
+            captcha_api_key: None,
+            captcha_solve_timeout_secs: None,
         }
     }
 }
@@ -579,14 +596,26 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
     let should_render_html = content_kind == ContentKind::Html
         && !body_str.trim().is_empty()
         && (hard_required || (options.render_enabled && needs_render));
+    // Optional CapSolver runtime (VAL-SOLVE-001..003). Soft CI never requires a key.
+    let captcha_runtime = captcha_solver::resolve_runtime(
+        options.captcha_solver.as_deref(),
+        options.captcha_api_key.as_deref(),
+        options.captcha_solve_timeout_secs,
+    )?;
+
     // Refuse hard-path silent success when the origin already returned a classic challenge page
-    // before Chromium rolls (VAL-STEALTH-016). Still fail closed if the rendered DOM is a block page.
+    // before Chromium rolls (VAL-STEALTH-016 / VAL-SOLVE-*). Optional CapSolver may create/poll a
+    // token when configured; content_success still requires a later applied token path and never
+    // forges unlock on auth/timeout/empty solution.
     if hard_required && stealth::looks_like_challenge_interstitial(&body_str, fetched.status_code) {
         sticky_profile_guard.wipe_now();
-        return Err(Error::ChallengeBlocked {
-            status_code: fetched.status_code,
-            detail: "hard path observed a bot-challenge / block response (VAL-STEALTH-016)".into(),
-        });
+        return Err(handle_challenge_with_optional_solver(
+            captcha_runtime.as_ref(),
+            page_base.as_str(),
+            &body_str,
+            fetched.status_code,
+            "hard path observed a bot-challenge / block response (VAL-STEALTH-016)",
+        ));
     }
     let mut chromium_used = false;
     let rendered_html: Option<String> = if should_render_html {
@@ -634,10 +663,13 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             && stealth::looks_like_challenge_interstitial(&rendered.html, fetched.status_code)
         {
             sticky_profile_guard.wipe_now();
-            return Err(Error::ChallengeBlocked {
-                status_code: fetched.status_code,
-                detail: "hard path observed a bot-challenge / block interstitial rather than the primary document (VAL-STEALTH-016)".into(),
-            });
+            return Err(handle_challenge_with_optional_solver(
+                captcha_runtime.as_ref(),
+                page_base.as_str(),
+                &rendered.html,
+                fetched.status_code,
+                "hard path observed a bot-challenge / block interstitial rather than the primary document (VAL-STEALTH-016)",
+            ));
         }
         chromium_used = true;
         Some(rendered.html)
@@ -647,11 +679,13 @@ pub fn scrape(raw_url: &str, options: &ScrapeOptions) -> Result<ScrapeProof, Err
             && stealth::looks_like_challenge_interstitial(&body_str, fetched.status_code)
         {
             sticky_profile_guard.wipe_now();
-            return Err(Error::ChallengeBlocked {
-                status_code: fetched.status_code,
-                detail: "hard path observed a bot-challenge / block response (VAL-STEALTH-016)"
-                    .into(),
-            });
+            return Err(handle_challenge_with_optional_solver(
+                captcha_runtime.as_ref(),
+                page_base.as_str(),
+                &body_str,
+                fetched.status_code,
+                "hard path observed a bot-challenge / block response (VAL-STEALTH-016)",
+            ));
         }
         None
     };
@@ -1072,6 +1106,56 @@ fn crawl_page(
     };
     let markdown = markdown::to_markdown(&source, &page_base);
     Ok((markdown, source, page_base))
+}
+
+/// Optional CapSolver attempt on a hard-path challenge (VAL-SOLVE-* / VAL-CROSS-HARD-*).
+///
+/// Without a runtime (no key): classic `challenge_blocked` detect-not-solve residual.
+/// With a runtime: createTask/getTaskResult when the class is supported; failures stay typed
+/// fail-closed. A returned token is **not** content_success — hardpath challenge application is
+/// required before any success claim, so this provider leaf still ends fail-closed
+/// (`solver_apply_pending` or residual) once create/poll completes.
+fn handle_challenge_with_optional_solver(
+    runtime: Option<&captcha_solver::CaptchaSolverRuntime>,
+    website_url: &str,
+    html: &str,
+    status_code: u16,
+    detect_detail: &str,
+) -> Error {
+    let Some(rt) = runtime else {
+        return Error::ChallengeBlocked {
+            status_code,
+            detail: detect_detail.to_string(),
+        };
+    };
+
+    // Soft residual: residential/class labels are unmodified here. Solver path never invents
+    // residential dial success (VAL-CROSS-HARD-003).
+    let http = captcha_solver::ReqwestCapSolverHttp::new(rt.config.solve_timeout);
+    match captcha_solver::attempt_optional_solve(Some(rt), website_url, html, status_code, &http) {
+        Ok(Some(solution)) => {
+            // Token received but this feature does not inject into CF completion flow.
+            // Fail closed without content_success so "solved without apply" forgeries are impossible
+            // (VAL-SOLVE-006/007). Digests of the token length only — never the token itself.
+            let _token_len = solution.token.len();
+            Error::Solver {
+                kind: "solver_apply_pending".into(),
+                detail: format!(
+                    "CapSolver returned a turnstile token (task_id={}, len={_token_len}) but \
+                     content_success requires the hard-path apply/inject leaf; refuse forge until \
+                     the token is submitted through the challenge completion flow \
+                     (not commercial Web Unlocker parity)",
+                    solution.task_id
+                ),
+                status_code: Some(status_code),
+            }
+        }
+        Ok(None) => Error::ChallengeBlocked {
+            status_code,
+            detail: detect_detail.to_string(),
+        },
+        Err(err) => err,
+    }
 }
 
 /// Adapt the core's typed robots policy to the renderer's dependency-neutral document hook.

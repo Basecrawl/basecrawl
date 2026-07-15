@@ -269,7 +269,8 @@ pub fn looks_like_challenge_interstitial(html: &str, status_code: u16) -> bool {
     }
     // 2xx / other: require multi-signal interstitial markers so ordinary content is not false-positive.
     // Captcha widget pages (Turnstile / reCAPTCHA shells) are never primary userdata success
-    // (VAL-UNLOCK-002). Marketplace solve is out of scope forever (VAL-UNLOCK-003).
+    // (VAL-UNLOCK-002). Default remains detect-not-solve; optional CapSolver is a gated provider
+    // module and still refuses forged content_success without applied tokens (VAL-SOLVE-*).
     let cf_challenge = (lower.contains("just a moment") && lower.contains("cloudflare"))
         || lower.contains("cf-browser-verification")
         || lower.contains("cf-challenge")

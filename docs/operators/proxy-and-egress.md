@@ -121,7 +121,26 @@ Soft JA3-family alignment is for bootstrap/success-rate on soft targets. Residen
 
 ### Challenge stance (not commercial Web Unlocker)
 
-Challenges and captcha pages are **detect-not-solve** (`challenge_blocked`). There is **no captcha marketplace** integration and **no** commercial Web Unlocker feature-parity claim (not Bright Data Web Unlocker / Oxylabs captcha-manage style "unlock any site"). Treat residual blocks as operational signal, not a defect in silence.
+Default challenges and captcha pages are **detect-not-solve** (`challenge_blocked`). Soft CI and soft open-web profiles **never** require a captcha marketplace key. There is **no** commercial Web Unlocker feature-parity claim (not Bright Data Web Unlocker / Oxylabs captcha-manage style "unlock any site"). Treat residual blocks as operational signal, not a defect in silence.
+
+### Optional CapSolver (operator/miner key; fail-closed)
+
+Operators and miners may optionally inject a CapSolver client key for supported Turnstile/CF classes:
+
+| Surface | Value |
+| --- | --- |
+| Env (preferred) | `CAPSOLVER_API_KEY` (also `BASECRAWL_CAPSOLVER_API_KEY`) in gitignored `basecrawl/.env` mode `600` |
+| Provider select | `BASECRAWL_CAPTCHA_SOLVER=capsolver` and/or CLI `--captcha-solver capsolver` |
+| Timeout | `--captcha-solve-timeout SECONDS` (default 90) |
+| Supported classes | Turnstile → CapSolver `AntiTurnstileTaskProxyLess` (`createTask` + `getTaskResult`) |
+
+**Without a key:** product stays detect-not-solve (`challenge_blocked`); no CapSolver network calls; soft CI green.
+
+**With a key:** createTask/getTaskResult may run for supported classes. HTTP 401 / invalid key / unpaid / timeout / empty token → typed fail-closed (`solver_auth_error` / `solver_timeout` / `solver_error`); **never** forge `content_success`. A returned token must still be applied through the hard-path challenge completion flow before any content_success claim.
+
+**Never** log, print, or commit the CapSolver API key (not in ScrapeProof, scoreboards, or host-visible stderr). Prefer env injection over CLI argv so keys never enter shell history.
+
+**Honesty residual:** optional CapSolver does **not** equal commercial Web Unlocker parity, "100%" unlock, or "undetectable" browsing. Soft dual-engine / default CI remain free of solver keys (VAL-HARD-015). Readiness `getBalance` probes that return HTTP 401 indicate key/account problems — remain fail-closed and fix the key format/account offline; never unlock content from a failed balance probe.
 
 ### Gated live residual smoke (identity/egress only)
 
@@ -146,7 +165,7 @@ Hard-shield note (2026-07-15): a taostats residential probe that failed with CON
 | Proxy ≠ anonymity | Exit IP, SNI (without ECH), and traffic shape remain visible to the upstream proxy and networks. Proxy is not anonymity. |
 | Headless residual | Headless is default (`--headless=new`). Such traits remain detectable; sticky profiles and residential egress only raise the bar. Do not advertise perfect headless cloaking. |
 | CDP Runtime residual | CDP/Runtime protocol use (including possible Runtime.enable side effects) is a residual channel even when trivial automation flags are patched. Documented in [SECURITY.md](../SECURITY.md). |
-| Challenge detect residual | Detect + fail-closed. Not a captcha solve and not commercial unlocker parity. |
+| Challenge detect residual | Default detect + fail-closed. Optional CapSolver may createTask/poll Turnstile with a miner key but is not commercial unlocker parity and never forges unlocked content on auth/timeout. |
 | Soft TLS residual | Soft impersonate is not Chromium wire; residual GREASE/ALPS/H2 setting fingerprints remain. Hard path only for residential. |
 | Chromium major residual | Pin is major **145** (`145.0.7632.46`). Detectors can track lag vs newer public Chrome; keep hard-path majors coherent when the pin moves. |
 | Plugins / mimeTypes | Multipass PDF plugin names + non-empty `mimeTypes` improve trivial bot ranks only. Not full plugin/PDF API fidelity. |

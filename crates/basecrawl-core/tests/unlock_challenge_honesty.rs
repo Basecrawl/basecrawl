@@ -237,7 +237,7 @@ fn val_unlock_002_captcha_interstitial_not_success_content() {
 }
 
 // ---------------------------------------------------------------------------
-// VAL-UNLOCK-003: no captcha marketplace integration surface
+// VAL-UNLOCK-003: no required captcha marketplace; optional CapSolver only
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -249,11 +249,12 @@ fn val_unlock_003_no_captcha_marketplace_surface() {
         String::from_utf8_lossy(&help.stderr)
     );
     let lower = help_text.to_ascii_lowercase();
+    // Unauthorized multi-vendor marketplaces remain banned. CapSolver is the sole optional
+    // operator-gated provider (M23 / VAL-SOLVE-*) and may appear with residual honesty language.
     for banned in [
         "2captcha",
         "anti-captcha",
         "anticaptcha",
-        "capsolver",
         "capmonster",
         "deathbycaptcha",
         "twocaptcha",
@@ -266,12 +267,19 @@ fn val_unlock_003_no_captcha_marketplace_surface() {
     }
     assert!(
         !lower.contains("auto-solve captcha")
-            && !lower.contains("captcha api key")
             && !lower.contains("--captcha-key")
-            && !lower.contains("--2captcha")
-            && !lower.contains("solver key"),
-        "CLI must not ship captcha marketplace solve flags"
+            && !lower.contains("--2captcha"),
+        "CLI must not ship unauthenticated multi-vendor marketplace solve flags"
     );
+    // Optional CapSolver surface residual honesty (not commercial unlocker parity).
+    if lower.contains("capsolver") {
+        assert!(
+            lower.contains("optional")
+                || lower.contains("not commercial")
+                || lower.contains("unlocker parity"),
+            "CapSolver in --help must carry optional residual honesty, not unlocker marketing"
+        );
+    }
 
     let mut cmd = Command::new(BIN);
     cmd.args(["--help"]);
@@ -283,15 +291,17 @@ fn val_unlock_003_no_captcha_marketplace_surface() {
         "{}\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    )
-    .to_ascii_lowercase();
+    );
+    let lower_c = combined.to_ascii_lowercase();
     assert!(!combined.contains("should-never-be-consumed"));
-    for banned in ["2captcha", "capsolver", "anticaptcha"] {
+    for banned in ["2captcha", "anticaptcha"] {
         assert!(
-            !combined.contains(banned),
+            !lower_c.contains(banned),
             "marketplace env must not invent product surface for {banned}"
         );
     }
+    // Key material itself (not vendor name) must never echo.
+    assert!(!combined.contains("should-never-be-consumed"));
 }
 
 // ---------------------------------------------------------------------------

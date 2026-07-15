@@ -30,7 +30,9 @@ use std::path::PathBuf;
 Cryptographically-anchored trust-but-audit model (not anonymity). \
 Residual: headless (default --headless=new), CDP/Runtime.enable side-channel risk remains, \
 Chromium product pin major 145 (detectors can track pin lag). \
-Challenge detect-not-solve (no captcha marketplace; not commercial Web Unlocker parity). \
+Challenge default detect-not-solve; optional CapSolver (`--captcha-solver capsolver` + \
+CAPSOLVER_API_KEY) may attempt createTask/getTaskResult for Turnstile. CapSolver does not equal \
+commercial Web Unlocker parity and must never advertise absolute unlock slogans. Soft CI never requires a solver key. \
 Soft --tls-impersonate is not native Chromium wire. Overt bot sensors still apply.",
     long_about = None
 )]
@@ -300,6 +302,20 @@ struct Cli {
     /// proxy. Hard/residential seize still requires real Chromium.
     #[arg(long = "tls-impersonate", value_name = "PROFILE")]
     tls_impersonate: Option<String>,
+
+    /// Optional captcha solver provider. Only `capsolver` is implemented. When set with
+    /// `CAPSOLVER_API_KEY` (or miner-supplied `BASECRAWL_CAPSOLVER_API_KEY` / options key),
+    /// basecrawl attempts createTask/getTaskResult for supported Turnstile classes on challenge pages.
+    /// Without a key the CLI stays detect-not-solve (`challenge_blocked`). Soft CI and soft open-web
+    /// scrapes never require this flag. Failures are typed fail-closed (auth/timeout/provider);
+    /// CapSolver is **not** commercial Web Unlocker parity and never forges content_success without
+    /// a real applied solution token. Never pass the API key on argv (use mode-600 env).
+    #[arg(long = "captcha-solver", value_name = "PROVIDER")]
+    captcha_solver: Option<String>,
+
+    /// CapSolver createTask/getTaskResult whole-solve timeout in seconds [default: 90].
+    #[arg(long = "captcha-solve-timeout", value_name = "SECONDS")]
+    captcha_solve_timeout: Option<u64>,
 }
 
 fn run(cli: Cli) -> Result<String, Error> {
@@ -435,6 +451,11 @@ fn run(cli: Cli) -> Result<String, Error> {
         json_schema,
         json_prompt,
         tls_impersonate: cli.tls_impersonate.clone(),
+        captcha_solver: cli.captcha_solver.clone(),
+        // Never accept API keys from CLI argv (hosts leak bash history). Miners inject via
+        // CAPSOLVER_API_KEY / BASECRAWL_CAPSOLVER_API_KEY only (VAL-SOLVE-002/003/010).
+        captcha_api_key: None,
+        captcha_solve_timeout_secs: cli.captcha_solve_timeout,
     };
 
     match mode.as_str() {

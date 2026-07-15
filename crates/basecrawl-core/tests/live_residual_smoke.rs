@@ -376,6 +376,15 @@ fn assert_no_marketplace_consumption(text: &str, surface: &str) {
             || lower.contains("does not ship a captcha marketplace")
             || lower.contains("must never")
             || lower.contains("forbidden")
+            // M23 optional CapSolver residual honesty (VAL-SOLVE-*) — vendor name allowed only
+            // when framed as optional / fail-closed / not unlocker parity.
+            || lower.contains("optional capsolver")
+            || lower.contains("optional captcha solver")
+            || (lower.contains("optional") && lower.contains("capsolver"))
+            || lower.contains("not commercial web unlocker")
+            || lower.contains("unlocker parity")
+            || lower.contains("detect-not-solve")
+            || lower.contains("detect not solve")
             || (lower.contains("no ") && lower.contains(vendor))
             || (lower.contains("without") && lower.contains(vendor))
             || (lower.contains("never") && lower.contains(vendor));
@@ -634,10 +643,21 @@ fn val_unlock_010_live_residual_never_requires_captcha_marketplace() {
         "VAL-UNLOCK-010: marketplace key material must not leak into CLI surface"
     );
     let lower2 = combined2.to_ascii_lowercase();
-    for banned in ["2captcha", "capsolver", "anticaptcha", "anti-captcha"] {
+    // Unauthorized multi-vendor marketplaces remain banned. Optional CapSolver may appear only
+    // with residual honesty language; dummy key material must never echo.
+    for banned in ["2captcha", "anticaptcha", "anti-captcha"] {
         assert!(
             !lower2.contains(banned),
             "VAL-UNLOCK-010: marketplace env must not invent product surface for {banned}"
+        );
+    }
+    if lower2.contains("capsolver") {
+        assert!(
+            lower2.contains("optional")
+                || lower2.contains("not commercial")
+                || lower2.contains("unlocker parity")
+                || lower2.contains("never require"),
+            "VAL-UNLOCK-010: CapSolver mention must remain optional residual honesty"
         );
     }
 
@@ -845,18 +865,21 @@ fn val_unlock_010_live_residual_works_without_marketplace_keys() {
     for needle in [
         "twocaptcha",
         "2captcha",
-        "capsolver",
         "anticaptcha",
         "anti-captcha",
         "captcha api key required",
         "captcha marketplace required",
         "solver key missing",
+        "missing capsolver",
+        "required capsolver",
     ] {
         assert!(
             !combined.contains(needle),
             "VAL-UNLOCK-010: residual live outcome must not depend on marketplace key '{needle}'"
         );
     }
+    // Optional CapSolver vendor name may only appear with residual honesty if residual surfaces
+    // mention it; require phrasing is already banned above.
 
     // Outcome may be success OR challenge_blocked / transport — both are valid residual paths
     // that do not require a captcha marketplace. Only "missing marketplace key" is forbidden.
