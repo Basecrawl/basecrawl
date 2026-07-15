@@ -1,14 +1,24 @@
 {
   "name": "@basecrawl/sdk",
   "version": "0.1.0",
-  "description": "Node.js SDK for the basecrawl ScrapeProof crawler",
+  "description": "Node.js linux-x64 SDK for the basecrawl ScrapeProof crawler (native addon; M25 ships linux-x64 only)",
   "license": "Apache-2.0",
   "main": "index.js",
   "types": "index.d.ts",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "files": [
     "index.js",
     "index.d.ts",
-    "basecrawl_sdk.node"
+    "basecrawl_sdk.node",
+    "README.md"
   ],
   "scripts": {
     "build": "cargo build --manifest-path Cargo.toml --release && cp ../../target/release/libbasecrawl_sdk.so basecrawl_sdk.node",
@@ -16,9 +26,26 @@
     "prepack": "pnpm run build",
     "pretest": "pnpm run build",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "smoke:linux": "node -e \"const s=require('./index.js'); const v=typeof s.version==='function'?s.version():s.version; if(!v) throw new Error('missing version'); if(typeof s.scrape!=='function') throw new Error('missing scrape'); console.log('linux smoke OK version='+v);\""
   },
   "devDependencies": {
     "typescript": "^5.7.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BaseIntelligence/basecrawl.git",
+    "directory": "bindings/node"
+  },
+  "homepage": "https://github.com/BaseIntelligence/basecrawl#readme",
+  "bugs": {
+    "url": "https://github.com/BaseIntelligence/basecrawl/issues"
+  },
+  "keywords": [
+    "basecrawl",
+    "scrapeproof",
+    "crawler",
+    "linux-x64",
+    "native"
+  ]
 }

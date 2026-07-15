@@ -381,24 +381,44 @@ jobs:
       - name: Install Node build deps
         run: pnpm install
 
-      - name: Build native addon (linux-x64 honesty)
-        # M25 ships the Linux CI host artifact only. Multi-OS napi matrix is out of scope.
-        # package.json / docs may further constrain os/cpu (see publish-npm-linux-sdk feature).
+      - name: Assert linux-x64 honesty metadata (package.json)
+        # VAL-NPM-003: single-arch ship must declare os/cpu; never multi-OS claim without artifacts.
         run: |
           set -euo pipefail
-          uname -m
-          pnpm run build
+          node -e "
+            const pkg = require('./package.json');
+            if (pkg.name !== '@basecrawl/sdk') {
+              throw new Error('package name must be @basecrawl/sdk, got ' + pkg.name);
+            }
+            const os = pkg.os || [];
+            const cpu = pkg.cpu || [];
+            if (!(Array.isArray(os) && os.length === 1 && os[0] === 'linux')) {
+              throw new Error('package.os must be [\"linux\"] for M25 single-arch honesty, got ' + JSON.stringify(os));
+            }
+            if (!(Array.isArray(cpu) && cpu.length === 1 && cpu[0] === 'x64')) {
+              throw new Error('package.cpu must be [\"x64\"] for M25 single-arch honesty, got ' + JSON.stringify(cpu));
+            }
+            console.log('linux-x64 honesty metadata OK:', pkg.name, 'os=', os, 'cpu=', cpu);
+          "
+
+      - name: Build native addon (linux-x64 honesty / prepack)
+        # M25 ships the Linux CI host artifact only. Multi-OS napi matrix is out of scope.
+        # package.json os/cpu + README residual constrain consumers to linux-x64.
+        run: |
+          set -euo pipefail
+          uname -sm
+          node -p "process.platform+'-'+process.arch"
+          # prepack is what npm pack / publish lifecycle runs; build produces basecrawl_sdk.node.
+          pnpm run prepack
           test -f basecrawl_sdk.node
           file basecrawl_sdk.node || true
 
       - name: Smoke require / version (linux host)
         run: |
           set -euo pipefail
+          pnpm run smoke:linux
           node -e "
             const sdk = require('./index.js');
-            if (typeof sdk.version !== 'function' && typeof sdk.version !== 'string') {
-              // native.version may be a string export
-            }
             const v = typeof sdk.version === 'function' ? sdk.version() : sdk.version;
             console.log('sdk.version=', v);
             if (!v) {
@@ -416,7 +436,15 @@ jobs:
           pnpm pack --pack-destination /tmp
           ls -la /tmp/*.tgz
           # List packing content for linux honesty audit (no secrets).
-          tar -tzf /tmp/basecrawl-sdk-*.tgz | head -50 || tar -tzf /tmp/*.tgz | head -50
+          listing="$(tar -tzf /tmp/basecrawl-sdk-*.tgz 2>/dev/null || tar -tzf /tmp/*.tgz)"
+          printf '%s\n' "${listing}" | sed -n '1,80p'
+          printf '%s\n' "${listing}" | grep -E 'basecrawl_sdk\.node$' >/dev/null
+          printf '%s\n' "${listing}" | grep -E 'README\.md$' >/dev/null
+          # Refuse multi-OS artifact names in the shipping tarball.
+          if printf '%s\n' "${listing}" | grep -Eiq 'darwin|win32|windows|msvc|apple-darwin'; then
+            echo "pack listing must not claim multi-OS native artifacts" >&2
+            exit 1
+          fi
 
       - name: Live npm publish --access public
         if: needs.version-check.outputs.dry_run != 'true'
