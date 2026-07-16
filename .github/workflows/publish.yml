@@ -11,6 +11,12 @@
 #   CARGO_REGISTRY_TOKEN — crates.io API token
 #   NPM_TOKEN            — npm access token for @basecrawl/sdk (NODE_AUTH_TOKEN)
 #
+# Day-0 multi-name crates.io uploads (hobby accounts):
+#   crates.io rate-limits *new crate names* (~10 minutes between names). The crates
+#   job adapts: retry/sleep on HTTP 429 ("too many new crates" / "try again after"),
+#   skips versions already live at the tag version (no forced republish unless bump),
+#   and continues the ordered chain on re-dispatch after partial uploads.
+#
 # Quality: this workflow re-runs CI parity (fmt / clippy / workspace tests).
 # Existing .github/workflows/ci.yml remains the continuous quality gate and is not modified.
 # image.yml remains the separate GHCR path.
@@ -231,8 +237,19 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           DRY_RUN: ${{ needs.version-check.outputs.dry_run }}
           PUBLISH_VERSION: ${{ needs.version-check.outputs.version }}
+          # Day-0 "new crate name" hobby rate limit is on the order of ~10 minutes.
+          # Overridable for tests/operators; defaults keep multi-name first uploads survivable.
+          NEW_CRATE_INDEX_PAUSE_SECS: "20"
+          NEW_CRATE_RATE_LIMIT_MAX_ATTEMPTS: "8"
+          NEW_CRATE_RATE_LIMIT_CAP_SECS: "720"
+          NEW_CRATE_RATE_LIMIT_BASE_SECS: "90"
         run: |
           set -euo pipefail
+
+          # shellcheck source=../../scripts/publish-crates-helpers.sh
+          # Day-0 helpers: 429 adaptive wait, already-live skip, already-uploaded continue.
+          # Shared with scripts/tests/test_publish_crates_helpers.sh (hermetic).
+          source "${GITHUB_WORKSPACE}/scripts/publish-crates-helpers.sh"
 
           is_dry="${DRY_RUN}"
           echo "Ordered crates publish for version=${PUBLISH_VERSION} dry_run=${is_dry}"
@@ -254,20 +271,29 @@ jobs:
           # Per-crate: dry-run/verify first, then live publish (VAL-CRATES-001/002).
           # Dependents convert dual path+version → version-only on package, so they can only
           # dry-run once prior crates in the chain exist on crates.io. Live path therefore
-          # interleaves: dry-run → publish → brief index pause → next crate.
+          # interleaves: dry-run → publish → index pause → next crate.
           #
           # Pure dry-run workflow_dispatch (no prior registry presence): leaf crates get full
           # `cargo publish --dry-run`; dependents missing unreleased workspace deps fall back to
           # local `cargo check -p` plus dual-version metadata assert (still refuse reverse order).
-          missing_registry_dep() {
-            printf '%s\n' "$1" | grep -Eqi 'no matching package named|failed to select a version for the requirement'
-          }
-          already_uploaded() {
-            printf '%s\n' "$1" | grep -Eqi 'already exists|already uploaded'
-          }
+          #
+          # Day-0 multi-name / re-dispatch:
+          # - versions already live for PUBLISH_VERSION skip cleanly (no forced republish)
+          # - HTTP 429 / "too many new crates" / "try again after <date>": adaptive sleep + retry
+          # - "already uploaded|already exists" from cargo: continue ordered chain
 
           for crate in ${PUBLISH_CRATES}; do
             echo "::group::${crate}"
+
+            # Live re-dispatch path: if this exact version is already on crates.io, skip cleanly.
+            # Never force-republish a live 0.1.0 (or any tag version) unless the package is bumped.
+            if [[ "${is_dry}" != "true" ]] && crate_version_already_on_crates_io "${crate}" "${PUBLISH_VERSION}"; then
+              echo "crate ${crate}@${PUBLISH_VERSION} already live on crates.io — skip publish (no forced republish)"
+              echo "pausing briefly so dependents can resolve the existing index entry"
+              sleep 5
+              echo "::endgroup::"
+              continue
+            fi
 
             dry_ok=0
             attempt=1
@@ -282,9 +308,15 @@ jobs:
                 dry_ok=1
                 break
               fi
+              # Already present on the registry can surface during dry-run packaging as well.
+              if already_uploaded "${dry_out}"; then
+                echo "crate ${crate} already on crates.io (dry-run signal) — skip live publish"
+                dry_ok=3
+                break
+              fi
               if missing_registry_dep "${dry_out}"; then
                 if [[ "${is_dry}" == "true" ]]; then
-                  echo "NOTE: ${crate} dry-run blocked on crates.io absence of an a prior workspace dep (expected pre-first-release)."
+                  echo "NOTE: ${crate} dry-run blocked on crates.io absence of a prior workspace dep (expected pre-first-release)."
                   echo "Fallback: local cargo check -p ${crate} + dual path+version metadata assert."
                   cargo check -p "${crate}"
                   # Ensure dual path+version remains for monorepo packaging (not path-only).
@@ -315,24 +347,57 @@ jobs:
               continue
             fi
 
-            # Live publish (token via CARGO_REGISTRY_TOKEN env; cargo never prints it).
-            set +e
-            live_out="$(cargo publish -p "${crate}" 2>&1)"
-            live_ec=$?
-            set -e
-            printf '%s\n' "${live_out}"
-            if [[ ${live_ec} -ne 0 ]]; then
-              if already_uploaded "${live_out}"; then
-                echo "crate ${crate} already on crates.io — continuing ordered chain"
-              else
-                echo "cargo publish -p ${crate} failed" >&2
-                exit ${live_ec}
-              fi
+            if [[ ${dry_ok} -eq 3 ]]; then
+              # already uploaded via dry-run signal
+              echo "::endgroup::"
+              continue
             fi
 
-            # Index pause between dependents so the next dry-run can resolve.
-            echo "published ${crate}; pausing for crates.io index"
-            sleep 12
+            # Live publish with adaptive 429 / new-crate rate-limit wait-retry.
+            # Token only via CARGO_REGISTRY_TOKEN env; never echo the raw secret.
+            live_ok=0
+            live_attempt=1
+            live_max="${NEW_CRATE_RATE_LIMIT_MAX_ATTEMPTS:-8}"
+            while [[ ${live_attempt} -le ${live_max} ]]; do
+              set +e
+              live_out="$(cargo publish -p "${crate}" 2>&1)"
+              live_ec=$?
+              set -e
+              # Echo cargo output (token values are masked by Actions if accidentally present).
+              printf '%s\n' "${live_out}"
+              if [[ ${live_ec} -eq 0 ]]; then
+                live_ok=1
+                echo "published ${crate}@${PUBLISH_VERSION}"
+                break
+              fi
+              if already_uploaded "${live_out}"; then
+                echo "crate ${crate} already on crates.io — continuing ordered chain"
+                live_ok=2
+                break
+              fi
+              if is_new_crate_rate_limited "${live_out}"; then
+                wait_secs="$(compute_live_retry_wait_secs "${live_out}" "${live_attempt}")"
+                echo "crates.io new-crate rate limit for ${crate} (HTTP 429 / too many new crates)"
+                echo "adaptive wait ${wait_secs}s then retry (attempt ${live_attempt}/${live_max})"
+                echo "re-dispatch of this workflow is also safe: already-live versions skip cleanly"
+                sleep "${wait_secs}"
+                live_attempt=$((live_attempt + 1))
+                continue
+              fi
+              echo "cargo publish -p ${crate} failed (non-retriable)" >&2
+              exit ${live_ec}
+            done
+
+            if [[ ${live_ok} -eq 0 ]]; then
+              echo "exhausted rate-limit retries for ${crate}; re-dispatch when crates.io allows new names" >&2
+              echo "already-uploaded crates in this tag version will skip on the next run" >&2
+              exit 1
+            fi
+
+            # Index pause between crates so the next dry-run can resolve published deps.
+            pause="${NEW_CRATE_INDEX_PAUSE_SECS:-20}"
+            echo "post-publish index pause ${pause}s after ${crate}"
+            sleep "${pause}"
             echo "::endgroup::"
           done
 
@@ -340,7 +405,7 @@ jobs:
             echo "dry_run complete: ordered topology walked; live publish skipped"
             echo "Cut tag v${PUBLISH_VERSION} (or workflow_dispatch dry_run=false) for live registry upload"
           else
-            echo "Live ordered crates.io publish chain complete"
+            echo "Live ordered crates.io publish chain complete (already-live versions were skipped; 429s retried adaptively)"
           fi
 
   # ---------------------------------------------------------------------------
