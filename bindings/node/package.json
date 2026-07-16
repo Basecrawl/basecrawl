@@ -26,7 +26,7 @@
     "prepack": "pnpm run build",
     "pretest": "pnpm run build",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
     "smoke:linux": "node -e \"const s=require('./index.js'); const v=typeof s.version==='function'?s.version():s.version; if(!v) throw new Error('missing version'); if(typeof s.scrape!=='function') throw new Error('missing scrape'); console.log('linux smoke OK version='+v);\""
   },
   "devDependencies": {
